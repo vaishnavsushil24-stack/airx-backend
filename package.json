@@ -1,0 +1,15 @@
+{
+  "name": "airx-backend",
+  "version": "1.0.0",
+  "description": "AIRX Ops backend - receives Meta (Facebook) Lead Ads leads via webhook, stores them, and serves them to the AIRX Ops dashboard.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "dotenv": "^16.4.5",
+    "node-fetch": "^2.7.0"
+  }
+}
