@@ -541,6 +541,69 @@ app.get("/api/diag/indiapost-proxy", async (req, res) => {
   res.json({ ms: Date.now() - start, proxyConfigured, dropletHost, hostOverride: !!hostOverride, probes, loginResult });
 });
 
+// Lower-level diagnostic: sends a raw HTTP CONNECT request straight to the
+// tinyproxy port and captures tinyproxy's own response line/headers, WITHOUT
+// attempting the TLS handshake afterwards. This tells us exactly what
+// tinyproxy says (200 = tunnel opened fine, 407 = auth rejected, 403 =
+// ConnectPort not allowed, connection reset = something else) instead of
+// just "TLS failed", which could be caused by several different problems.
+app.get("/api/diag/proxy-connect-test", async (req, res) => {
+  if (req.headers["x-diag-key"] !== "airx-diag-check-2026") {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  try {
+    if (!process.env.INDIAPOST_PROXY_URL) {
+      return res.status(400).json({ error: "INDIAPOST_PROXY_URL not set" });
+    }
+    const proxyUrl = new URL(process.env.INDIAPOST_PROXY_URL);
+    const target = req.query.target || "test.cept.gov.in:443";
+    const auth = proxyUrl.username
+      ? "Basic " + Buffer.from(`${decodeURIComponent(proxyUrl.username)}:${decodeURIComponent(proxyUrl.password)}`).toString("base64")
+      : null;
+
+    const result = await new Promise((resolve, reject) => {
+      const socket = net.connect(Number(proxyUrl.port), proxyUrl.hostname);
+      let data = "";
+      const timer = setTimeout(() => {
+        socket.destroy();
+        reject(new Error("timed out waiting for CONNECT response"));
+      }, 10000);
+      socket.on("connect", () => {
+        const lines = [
+          `CONNECT ${target} HTTP/1.1`,
+          `Host: ${target}`,
+          ...(auth ? [`Proxy-Authorization: ${auth}`] : []),
+          `Connection: close`,
+          "",
+          "",
+        ];
+        socket.write(lines.join("\r\n"));
+      });
+      socket.on("data", (chunk) => {
+        data += chunk.toString("utf8");
+        // We only need the response head; bail as soon as we see the blank
+        // line terminating the headers (or after a short grace period).
+        if (data.includes("\r\n\r\n")) {
+          clearTimeout(timer);
+          socket.destroy();
+          resolve(data);
+        }
+      });
+      socket.on("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+      socket.on("close", () => {
+        clearTimeout(timer);
+        resolve(data || "(connection closed with no data)");
+      });
+    });
+    res.json({ target, authSent: !!auth, rawResponseHead: result.slice(0, 1000) });
+  } catch (err) {
+    res.status(500).json({ error: String((err && err.message) || err) });
+  }
+});
+
 // UPU S10 check-digit algorithm - standard formula used on every India Post
 // / international tracking barcode (2 letters + 8 digits + check digit + "IN").
 function s10CheckDigit(eightDigits) {
