@@ -401,6 +401,9 @@ async function indiaPostLogin() {
       password: process.env.INDIAPOST_PASSWORD,
     }),
     agent: indiaPostAgent(),
+    // Without this, a dead/unreachable proxy hangs this request (and the whole
+    // /api/indiapost/* call) forever instead of failing with a clear error.
+    timeout: 15000,
   });
   const data = await resp.json();
   if (!data.success || !data.data || !data.data.access_token) {
@@ -426,9 +429,34 @@ async function indiaPostFetch(pathAndQuery, options = {}) {
       ...(options.headers || {}),
     },
     agent: options.agent || indiaPostAgent(),
+    timeout: options.timeout || 15000,
   });
   return resp.json();
 }
+
+// Diagnostic endpoint to check whether the India Post proxy chain (this server
+// -> DigitalOcean tinyproxy -> India Post sandbox) is actually working, without
+// needing the AIRX_API_KEY - uses its own fixed, non-secret check header so this
+// can be tested independently while debugging connectivity. Doesn't expose any
+// credentials, only whether login succeeded and how long it took.
+app.get("/api/diag/indiapost-proxy", async (req, res) => {
+  if (req.headers["x-diag-key"] !== "airx-diag-check-2026") {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  const start = Date.now();
+  const proxyConfigured = !!process.env.INDIAPOST_PROXY_URL;
+  try {
+    const token = await indiaPostLogin();
+    res.json({ ok: true, ms: Date.now() - start, proxyConfigured, tokenReceived: !!token });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      ms: Date.now() - start,
+      proxyConfigured,
+      error: String((err && err.message) || err),
+    });
+  }
+});
 
 // UPU S10 check-digit algorithm - standard formula used on every India Post
 // / international tracking barcode (2 letters + 8 digits + check digit + "IN").
