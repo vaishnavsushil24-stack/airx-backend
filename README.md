@@ -133,9 +133,51 @@ tracking barcode — no post-office counter needed.
      credentials still pending), it falls back to the old manual-tracking
      prompt so nothing breaks in the meantime.
 
-## 5. Next step (already planned)
+## 5. Inventory — stock tracking, auto-decrements on booking
 
-Once this is live, I'll wire the AIRX Ops dashboard to read `/api/leads`,
-`/api/orders`, and trigger `/api/shopify/*` from here instead of relying on
-manual paste — that gets rid of the browser-storage limitation AIRX Ops has
-today, and gives every device (you, staff, phone) the same live data.
+`GET/POST/PATCH/DELETE /api/inventory` (all need your `x-api-key` header).
+Add each product once (name should match how it appears on orders, e.g.
+"Pranvaayu churan 440g") with a starting stock count and a low-stock line.
+Every time an order is booked with India Post, stock quietly goes down by
+the quantity in that order — you'll see it live in the new **Inventory** tab
+in AIRX Ops, with anything below its low-stock line flagged in red.
+
+## 6. Staff performance
+
+The **Staff** tab in AIRX Ops now ranks your team by total sales handled
+(not just order count), with pending/booked/delivered breakdowns per
+person — same data as before, just now sorted so the top performer is
+obvious at a glance. No setup needed, it reads straight from the orders
+already in the board.
+
+## 7. WhatsApp automation (COD confirmation, tracking, follow-ups) — ready to activate
+
+The backend has three endpoints ready to go the moment you connect a
+WhatsApp Business Account:
+
+- `POST /api/whatsapp/confirm-cod` — ask the customer to confirm before you
+  book with India Post (cuts down fake/wrong COD orders and RTO losses).
+- `POST /api/whatsapp/tracking-update` — send the India Post barcode the
+  moment an order is booked.
+- `POST /api/whatsapp/delivery-followup` — nudge for a review or reorder
+  once delivered.
+
+**To turn this on:** same Meta Business Manager login as the Lead Ads setup
+above. Open **business.facebook.com** → WhatsApp → set up (or link) a
+WhatsApp Business number → API Setup tab gives you a **Phone number ID**
+and lets you generate a permanent **access token**. Put those in Render as
+`WHATSAPP_PHONE_ID` and `WHATSAPP_TOKEN`. Then, in the same WhatsApp
+Manager, create and submit for approval three message templates named
+exactly `cod_confirmation`, `tracking_update`, and `delivery_followup`
+(Meta typically approves simple templates within a few hours). Until both
+the env vars and templates exist, these endpoints just log quietly and skip
+sending — nothing breaks by leaving them unconfigured for now.
+
+## 8. Next step (already planned)
+
+Once WhatsApp is connected, the plan is: an AI agent that answers a lead's
+product questions automatically over WhatsApp the moment they come in
+(before/alongside a staff follow-up), and sends them their own booking
+link once they're ready to buy. AI voice calling is a later phase — it
+needs a telephony provider and costs per minute, so it's worth proving out
+the WhatsApp flow first.

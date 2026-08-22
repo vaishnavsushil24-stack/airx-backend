@@ -523,6 +523,13 @@ app.post("/api/indiapost/book", requireApiKey, async (req, res) => {
       }
     }
 
+    // Booking = committed shipment, so this is the right moment to draw down stock.
+    try {
+      decrementInventoryForOrder(order);
+    } catch (invErr) {
+      console.warn("Inventory decrement skipped (non-fatal):", invErr.message);
+    }
+
     res.json({ barcode, result });
   } catch (err) {
     console.error("India Post booking error:", err);
@@ -608,6 +615,197 @@ app.patch("/api/orders/:id", requireApiKey, (req, res) => {
   orders[idx] = { ...orders[idx], ...req.body };
   writeJson(ORDERS_FILE, orders);
   res.json(orders[idx]);
+});
+
+// =====================================================================
+// INVENTORY — stock tracking, auto-decrement on booking
+// =====================================================================
+
+const INVENTORY_FILE = path.join(__dirname, "data", "inventory.json");
+if (!fs.existsSync(INVENTORY_FILE)) {
+  fs.writeFileSync(INVENTORY_FILE, "[]");
+}
+// Each item: { sku, name, stock, lowStockThreshold }
+
+app.get("/api/inventory", requireApiKey, (req, res) => {
+  res.json(readJson(INVENTORY_FILE));
+});
+
+app.post("/api/inventory", requireApiKey, (req, res) => {
+  const items = readJson(INVENTORY_FILE);
+  const item = {
+    sku: req.body.sku || "sku" + Date.now(),
+    name: req.body.name || "",
+    stock: Number(req.body.stock) || 0,
+    lowStockThreshold: Number(req.body.lowStockThreshold) || 5,
+  };
+  items.push(item);
+  writeJson(INVENTORY_FILE, items);
+  res.json(item);
+});
+
+app.patch("/api/inventory/:sku", requireApiKey, (req, res) => {
+  const items = readJson(INVENTORY_FILE);
+  const idx = items.findIndex((i) => i.sku === req.params.sku);
+  if (idx === -1) return res.status(404).json({ error: "not found" });
+  items[idx] = { ...items[idx], ...req.body };
+  writeJson(INVENTORY_FILE, items);
+  res.json(items[idx]);
+});
+
+app.delete("/api/inventory/:sku", requireApiKey, (req, res) => {
+  const items = readJson(INVENTORY_FILE);
+  const filtered = items.filter((i) => i.sku !== req.params.sku);
+  writeJson(INVENTORY_FILE, filtered);
+  res.json({ deleted: items.length !== filtered.length });
+});
+
+// Called automatically when an order is booked (see /api/indiapost/book above).
+// Orders store product as free text like "Product A x2, Product B x1" (from
+// Shopify line items or WhatsApp paste), so we match by name substring rather
+// than a strict SKU - approximate but good enough to catch low-stock early.
+function decrementInventoryForOrder(order) {
+  const productText = order.product || "";
+  if (!productText) return;
+  const items = readJson(INVENTORY_FILE);
+  if (!items.length) return;
+  let changed = false;
+  productText.split(",").forEach((segment) => {
+    const trimmed = segment.trim();
+    const qtyMatch = trimmed.match(/x\s*(\d+)\s*$/i);
+    const qty = qtyMatch ? Number(qtyMatch[1]) : 1;
+    const nameOnly = trimmed.replace(/x\s*\d+\s*$/i, "").trim().toLowerCase();
+    if (!nameOnly) return;
+    items.forEach((item) => {
+      if (item.name && nameOnly.includes(item.name.toLowerCase())) {
+        item.stock = Math.max(0, (Number(item.stock) || 0) - qty);
+        changed = true;
+      }
+    });
+  });
+  if (changed) writeJson(INVENTORY_FILE, items);
+}
+
+// =====================================================================
+// STAFF PERFORMANCE — who booked what, so staff stays visible/accountable
+// =====================================================================
+
+app.get("/api/staff/summary", requireApiKey, (req, res) => {
+  const orders = readJson(ORDERS_FILE);
+  const byStaff = {};
+  orders.forEach((o) => {
+    const name = o.staff && o.staff.trim() ? o.staff.trim() : "Unassigned";
+    if (!byStaff[name]) {
+      byStaff[name] = { staff: name, orders: 0, totalSales: 0, delivered: 0, pending: 0, booked: 0 };
+    }
+    const bucket = byStaff[name];
+    bucket.orders += 1;
+    bucket.totalSales += Number(o.codAmount || o.cod || 0);
+    if (o.status === "delivered") bucket.delivered += 1;
+    else if (o.status === "booked") bucket.booked += 1;
+    else bucket.pending += 1;
+  });
+  res.json(Object.values(byStaff).sort((a, b) => b.totalSales - a.totalSales));
+});
+
+// =====================================================================
+// WHATSAPP AUTOMATION — scaffolding, activates once WHATSAPP_TOKEN is set
+// =====================================================================
+//
+// Uses Meta's WhatsApp Cloud API directly (same Meta Business Manager as the
+// Lead Ads webhook above - one Meta login covers both). Needs, once you have
+// a WhatsApp Business Account (WABA) set up in Meta Business Manager:
+//   WHATSAPP_TOKEN       - a permanent access token for the WABA
+//   WHATSAPP_PHONE_ID    - the "Phone number ID" of your WhatsApp Business number
+// Until these are set, sendWhatsApp() just logs and skips - nothing breaks.
+//
+// IMPORTANT: WhatsApp only allows free-form messages within 24h of the
+// customer messaging you first. Outside that window (e.g. proactively
+// telling someone their order shipped) requires a pre-approved "template"
+// message - approved once in Meta Business Manager, then reused by name.
+// sendWhatsApp() supports both: pass `template` for outside-24h messages,
+// omit it for a plain text reply inside an active conversation.
+
+async function sendWhatsApp(toPhone, { text, template, templateParams } = {}) {
+  const token = process.env.WHATSAPP_TOKEN;
+  const phoneId = process.env.WHATSAPP_PHONE_ID;
+  if (!token || !phoneId) {
+    console.log(`[WhatsApp not configured yet] Would message ${toPhone}:`, text || template);
+    return { skipped: true };
+  }
+  const cleanPhone = String(toPhone).replace(/\D/g, "");
+  const body = template
+    ? {
+        messaging_product: "whatsapp",
+        to: cleanPhone,
+        type: "template",
+        template: {
+          name: template,
+          language: { code: "en" },
+          components: templateParams
+            ? [{ type: "body", parameters: templateParams.map((p) => ({ type: "text", text: String(p) })) }]
+            : undefined,
+        },
+      }
+    : {
+        messaging_product: "whatsapp",
+        to: cleanPhone,
+        type: "text",
+        text: { body: text },
+      };
+  const resp = await fetchFn(`https://graph.facebook.com/v21.0/${phoneId}/messages`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return resp.json();
+}
+
+// Send a COD confirmation request before booking (reduces RTO / fake orders).
+// Template name is a placeholder - create+approve one in Meta Business
+// Manager named "cod_confirmation" (or change the name below to match).
+app.post("/api/whatsapp/confirm-cod", requireApiKey, async (req, res) => {
+  try {
+    const { mobile, name, product, codAmount } = req.body;
+    if (!mobile) return res.status(400).json({ error: "mobile required" });
+    const result = await sendWhatsApp(mobile, {
+      template: "cod_confirmation",
+      templateParams: [name || "", product || "", codAmount || ""],
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Send tracking info once booked - reuses whatever India Post barcode exists.
+app.post("/api/whatsapp/tracking-update", requireApiKey, async (req, res) => {
+  try {
+    const { mobile, name, barcode } = req.body;
+    if (!mobile || !barcode) return res.status(400).json({ error: "mobile and barcode required" });
+    const result = await sendWhatsApp(mobile, {
+      template: "tracking_update",
+      templateParams: [name || "", barcode],
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Send a post-delivery follow-up (review / reorder nudge).
+app.post("/api/whatsapp/delivery-followup", requireApiKey, async (req, res) => {
+  try {
+    const { mobile, name } = req.body;
+    if (!mobile) return res.status(400).json({ error: "mobile required" });
+    const result = await sendWhatsApp(mobile, {
+      template: "delivery_followup",
+      templateParams: [name || ""],
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get("/health", (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
