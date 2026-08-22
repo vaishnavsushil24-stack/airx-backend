@@ -11,6 +11,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const net = require("net");
+const tls = require("tls");
 require("dotenv").config();
 
 let fetchFn = global.fetch;
@@ -599,6 +600,101 @@ app.get("/api/diag/proxy-connect-test", async (req, res) => {
       });
     });
     res.json({ target, authSent: !!auth, rawResponseHead: result.slice(0, 1000) });
+  } catch (err) {
+    res.status(500).json({ error: String((err && err.message) || err) });
+  }
+});
+
+// Goes one step further than /api/diag/proxy-connect-test: after tinyproxy
+// confirms "200 Connection established", attempts the actual TLS handshake
+// over that same raw tunnel (using Node's tls module directly, bypassing
+// node-fetch/https-proxy-agent entirely) so we can tell whether the problem
+// is generic to any TLS-through-this-tunnel, or specific to the
+// node-fetch/https-proxy-agent code path used by the real login call.
+app.get("/api/diag/proxy-tls-test", async (req, res) => {
+  if (req.headers["x-diag-key"] !== "airx-diag-check-2026") {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  try {
+    if (!process.env.INDIAPOST_PROXY_URL) {
+      return res.status(400).json({ error: "INDIAPOST_PROXY_URL not set" });
+    }
+    const proxyUrl = new URL(process.env.INDIAPOST_PROXY_URL);
+    const targetHost = req.query.target || "test.cept.gov.in";
+    const targetPort = 443;
+    const auth = proxyUrl.username
+      ? "Basic " + Buffer.from(`${decodeURIComponent(proxyUrl.username)}:${decodeURIComponent(proxyUrl.password)}`).toString("base64")
+      : null;
+
+    const result = await new Promise((resolve, reject) => {
+      const socket = net.connect(Number(proxyUrl.port), proxyUrl.hostname);
+      let head = "";
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        reject(new Error("timed out waiting for CONNECT response"));
+      }, 10000);
+
+      socket.on("connect", () => {
+        const lines = [
+          `CONNECT ${targetHost}:${targetPort} HTTP/1.1`,
+          `Host: ${targetHost}:${targetPort}`,
+          ...(auth ? [`Proxy-Authorization: ${auth}`] : []),
+          `Connection: keep-alive`,
+          "",
+          "",
+        ];
+        socket.write(lines.join("\r\n"));
+      });
+
+      socket.on("data", function onData(chunk) {
+        head += chunk.toString("utf8");
+        if (head.includes("\r\n\r\n")) {
+          socket.removeListener("data", onData);
+          if (settled) return;
+          if (!/^HTTP\/1\.[01] 200/.test(head)) {
+            settled = true;
+            clearTimeout(timer);
+            socket.destroy();
+            return resolve({ stage: "connect", ok: false, head });
+          }
+          // Tunnel is open - now attempt a real TLS handshake over it.
+          const tlsSocket = tls.connect(
+            { socket, servername: targetHost, timeout: 10000 },
+            () => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(timer);
+              const cert = tlsSocket.getPeerCertificate();
+              tlsSocket.destroy();
+              resolve({
+                stage: "tls",
+                ok: true,
+                protocol: tlsSocket.getProtocol(),
+                subject: cert && cert.subject,
+              });
+            }
+          );
+          tlsSocket.on("error", (err) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve({ stage: "tls", ok: false, error: String((err && err.message) || err) });
+          });
+        }
+      });
+
+      socket.on("error", (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+
+    res.json({ target: `${targetHost}:${targetPort}`, ...result });
   } catch (err) {
     res.status(500).json({ error: String((err && err.message) || err) });
   }
