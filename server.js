@@ -460,6 +460,48 @@ function tcpProbe(host, port, timeoutMs = 5000) {
   });
 }
 
+// Where the droplet's cloud-init script "phones home" with tinyproxy's status
+// (systemctl is-active, ss -tlnp output, journal tail) so we can see what
+// happened at boot without ever needing SSH access to the droplet itself.
+const PROXY_STATUS_FILE = path.join(__dirname, "data", "proxy-status-reports.json");
+if (!fs.existsSync(PROXY_STATUS_FILE)) {
+  fs.writeFileSync(PROXY_STATUS_FILE, "[]");
+}
+
+app.post(
+  "/api/diag/proxy-status-report",
+  express.text({ type: "*/*", limit: "200kb" }),
+  (req, res) => {
+    if (req.headers["x-diag-key"] !== "airx-diag-check-2026") {
+      return res.status(401).json({ error: "unauthorized" });
+    }
+    let reports = [];
+    try {
+      reports = readJson(PROXY_STATUS_FILE);
+      if (!Array.isArray(reports)) reports = [];
+    } catch {
+      reports = [];
+    }
+    reports.push({ receivedAt: new Date().toISOString(), body: String(req.body || "").slice(0, 8000) });
+    writeJson(PROXY_STATUS_FILE, reports.slice(-20));
+    res.json({ ok: true });
+  }
+);
+
+app.get("/api/diag/proxy-status-report", (req, res) => {
+  if (req.headers["x-diag-key"] !== "airx-diag-check-2026") {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  let reports = [];
+  try {
+    reports = readJson(PROXY_STATUS_FILE);
+    if (!Array.isArray(reports)) reports = [];
+  } catch {
+    reports = [];
+  }
+  res.json(reports);
+});
+
 // Diagnostic endpoint to check whether the India Post proxy chain (this server
 // -> DigitalOcean tinyproxy -> India Post sandbox) is actually working, without
 // needing the AIRX_API_KEY - uses its own fixed, non-secret check header so this
