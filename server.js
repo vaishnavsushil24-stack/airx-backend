@@ -327,6 +327,252 @@ app.post("/api/shopify/fulfill", requireApiKey, async (req, res) => {
 });
 
 // =====================================================================
+// INDIA POST — real Bulk Customer API (booking, tracking, events)
+// =====================================================================
+//
+// This is the actual official India Post integration from the approach
+// document Sushil received. Two modes, picked by INDIAPOST_BASE_URL:
+//   Sandbox (default): https://test.cept.gov.in  - safe to test against,
+//     uses India Post's own published shared test values below.
+//   Production: whatever URL India Post gives after UAT sign-off.
+//
+// Credentials (INDIAPOST_USERNAME / INDIAPOST_PASSWORD) go straight into
+// Render's environment variables - never typed here, never seen by Claude -
+// same pattern as SHOPIFY_API_SECRET.
+
+const INDIAPOST_FILE = path.join(__dirname, "data", "indiapost.json");
+if (!fs.existsSync(INDIAPOST_FILE)) {
+  fs.writeFileSync(
+    INDIAPOST_FILE,
+    JSON.stringify({ accessToken: null, refreshToken: null, expiresAt: 0, barcodeSeq: null }, null, 2)
+  );
+}
+
+function indiaPostBase() {
+  return process.env.INDIAPOST_BASE_URL || "https://test.cept.gov.in";
+}
+
+// Non-secret shared UAT reference values from the approach doc (customer ID
+// range identifiers, not credentials). The actual login (INDIAPOST_USERNAME /
+// INDIAPOST_PASSWORD) is REQUIRED as env vars - no default, no fallback, so
+// nothing resembling a real credential ever lives in this file.
+const INDIAPOST_DEFAULTS = {
+  bulkCustomerId: "3000064781",
+  contractId: "41585456", // maps to SP_INLAND_DOC / SP_INLAND_PARCEL
+  barcodePrefix: "ET",
+  barcodeRangeStart: 21433001,
+  barcodeRangeEnd: 21434000,
+};
+
+async function indiaPostLogin() {
+  const state = readJson(INDIAPOST_FILE);
+  if (state.accessToken && state.expiresAt > Date.now() + 30000) {
+    return state.accessToken;
+  }
+  if (!process.env.INDIAPOST_USERNAME || !process.env.INDIAPOST_PASSWORD) {
+    throw new Error(
+      "INDIAPOST_USERNAME and INDIAPOST_PASSWORD env vars are not set. Add them in Render (the sandbox login India Post gave you), then retry."
+    );
+  }
+  const resp = await fetchFn(`${indiaPostBase()}/beextcustomer/v1/access/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: process.env.INDIAPOST_USERNAME,
+      password: process.env.INDIAPOST_PASSWORD,
+    }),
+  });
+  const data = await resp.json();
+  if (!data.success || !data.data || !data.data.access_token) {
+    throw new Error("India Post login failed: " + JSON.stringify(data));
+  }
+  const newState = {
+    ...state,
+    accessToken: data.data.access_token,
+    refreshToken: data.data.refresh_token,
+    expiresAt: Date.now() + (data.data.expires_in || 300) * 1000,
+  };
+  writeJson(INDIAPOST_FILE, newState);
+  return newState.accessToken;
+}
+
+async function indiaPostFetch(pathAndQuery, options = {}) {
+  const token = await indiaPostLogin();
+  const resp = await fetchFn(`${indiaPostBase()}${pathAndQuery}`, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+  });
+  return resp.json();
+}
+
+// UPU S10 check-digit algorithm - standard formula used on every India Post
+// / international tracking barcode (2 letters + 8 digits + check digit + "IN").
+function s10CheckDigit(eightDigits) {
+  const weights = [8, 6, 4, 2, 3, 5, 9, 7];
+  const sum = eightDigits.split("").reduce((s, d, i) => s + Number(d) * weights[i], 0);
+  const rem = sum % 11;
+  if (rem === 1) return 0;
+  if (rem === 0) return 5;
+  return 11 - rem;
+}
+
+function nextBarcode() {
+  const state = readJson(INDIAPOST_FILE);
+  const prefix = process.env.INDIAPOST_BARCODE_PREFIX || INDIAPOST_DEFAULTS.barcodePrefix;
+  const start = Number(process.env.INDIAPOST_BARCODE_START || INDIAPOST_DEFAULTS.barcodeRangeStart);
+  const end = Number(process.env.INDIAPOST_BARCODE_END || INDIAPOST_DEFAULTS.barcodeRangeEnd);
+  let seq = state.barcodeSeq || start;
+  if (seq > end) throw new Error("India Post barcode range exhausted - ask India Post for a new range.");
+  const eightDigits = String(seq).padStart(8, "0");
+  const check = s10CheckDigit(eightDigits);
+  const barcode = `${prefix}${eightDigits}${check}IN`;
+  writeJson(INDIAPOST_FILE, { ...state, barcodeSeq: seq + 1 });
+  return barcode;
+}
+
+// Looks up a delivery post office for a PIN code - used to resolve the
+// customer's own PIN to a specific office_id where needed.
+app.get("/api/indiapost/pincode/:pincode", requireApiKey, async (req, res) => {
+  try {
+    const data = await indiaPostFetch(
+      `/bemasterdata/v1/offices/limited-details?pincode=${req.params.pincode}&limit=50&office-type=post`
+    );
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Books one order with India Post - the real thing, no browser typing.
+// Body: { orderId } to pull from our own orders.json, OR pass the order
+// fields directly: { name, address, city, state, pincode, mobile, product,
+// weightGrams, codAmount }.
+app.post("/api/indiapost/book", requireApiKey, async (req, res) => {
+  try {
+    let order = req.body;
+    if (req.body.orderId) {
+      const orders = readJson(ORDERS_FILE);
+      order = orders.find((o) => o.id === req.body.orderId);
+      if (!order) return res.status(404).json({ error: "orderId not found in orders.json" });
+    }
+
+    const weight = Number(order.weightGrams) || Number(process.env.INDIAPOST_DEFAULT_WEIGHT_GRAMS) || 300;
+    const articleType = weight > 500 ? "SP_INLAND_PARCEL" : "SP_INLAND_DOC";
+    const barcode = nextBarcode();
+
+    const dropoffOfficeId = process.env.INDIAPOST_DROPOFF_OFFICE_ID;
+    if (!dropoffOfficeId) {
+      return res.status(500).json({
+        error:
+          "INDIAPOST_DROPOFF_OFFICE_ID not set. Look it up once via GET /api/indiapost/pincode/<your PIN> and put the office_id (where delivery_office_flag is true) into Render's env vars.",
+      });
+    }
+
+    const article = {
+      bulk_customer_id: process.env.INDIAPOST_BULK_CUSTOMER_ID || INDIAPOST_DEFAULTS.bulkCustomerId,
+      contract_id: process.env.INDIAPOST_CONTRACT_ID || INDIAPOST_DEFAULTS.contractId,
+      barcode_no: barcode,
+      pickup_or_dropoff: "dropoff",
+      pickup_dropoff_office_id: Number(dropoffOfficeId),
+      article_type: articleType,
+      physical_weight: weight,
+      shape_of_article: "NROL",
+      length: "10",
+      breadth_diameter: "10",
+      height: "5",
+      sender_name: process.env.INDIAPOST_SENDER_NAME || "AIRX Plus Healthcare Pvt Ltd",
+      sender_company: process.env.INDIAPOST_SENDER_NAME || "AIRX Plus Healthcare Pvt Ltd",
+      sender_add_line_1: process.env.INDIAPOST_SENDER_ADDRESS || "Nimbahera",
+      sender_city: process.env.INDIAPOST_SENDER_CITY || "Nimbahera",
+      sender_state: process.env.INDIAPOST_SENDER_STATE || "Rajasthan",
+      sender_pincode: process.env.INDIAPOST_SENDER_PINCODE || "",
+      sender_mobile_no: process.env.INDIAPOST_SENDER_MOBILE || "",
+      receiver_name: order.name || "",
+      receiver_company: order.name || "",
+      receiver_add_line_1: (order.address || order.dest || "").slice(0, 80),
+      receiver_city: order.city || "",
+      receiver_state: order.state || "",
+      receiver_pincode: String(order.pincode || order.pin || "").slice(0, 6),
+      receiver_mobile_no: String(order.mobile || "").replace(/\D/g, "").slice(0, 10),
+      alt_address_flag: "FALSE",
+      pickup_address_flag: "FALSE",
+      codr_cod: order.codAmount || order.cod ? "COD" : "",
+      value_for_codr_cod: order.codAmount || order.cod || 0,
+      ack: "FALSE",
+      reg: "FALSE",
+      otp: "FALSE",
+    };
+
+    const result = await indiaPostFetch(
+      `/beextcustomer/process-articles/${process.env.INDIAPOST_BULK_CUSTOMER_ID || INDIAPOST_DEFAULTS.bulkCustomerId}`,
+      { method: "POST", body: JSON.stringify({ articles: [article] }) }
+    );
+
+    // If this order came from our own orders.json, save the barcode + mark ready-to-advance.
+    if (req.body.orderId) {
+      const orders = readJson(ORDERS_FILE);
+      const idx = orders.findIndex((o) => o.id === req.body.orderId);
+      if (idx !== -1) {
+        orders[idx].indiaPostBarcode = barcode;
+        orders[idx].indiaPostResult = result;
+        writeJson(ORDERS_FILE, orders);
+      }
+    }
+
+    res.json({ barcode, result });
+  } catch (err) {
+    console.error("India Post booking error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Tracking for up to 500 barcodes at once.
+app.post("/api/indiapost/track", requireApiKey, async (req, res) => {
+  try {
+    const barcodes = req.body.barcodes;
+    if (!Array.isArray(barcodes) || !barcodes.length) {
+      return res.status(400).json({ error: "body must be { barcodes: [\"EB...IN\", ...] }" });
+    }
+    const data = await indiaPostFetch("/beextcustomer/v1/tracking/bulk", {
+      method: "POST",
+      body: JSON.stringify({ bulk: barcodes }),
+    });
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Real-time event webhook - India Post pushes tracking updates here once
+// they whitelist this server's outbound IP (ask integrations.cept@indiapost.gov.in
+// for the whitelisting step once you're in production). No signature scheme
+// was specified in the approach doc, so this just logs + stores by barcode.
+app.post("/webhook/indiapost/event", (req, res) => {
+  try {
+    const event = req.body;
+    const orders = readJson(ORDERS_FILE);
+    const idx = orders.findIndex((o) => o.indiaPostBarcode === event.article_number);
+    if (idx !== -1) {
+      orders[idx].indiaPostEvents = orders[idx].indiaPostEvents || [];
+      orders[idx].indiaPostEvents.push(event);
+      if (event.event_code === "ITEM_DELIVERED" || event.event_description === "Item Delivered") {
+        orders[idx].status = "delivered";
+      }
+      writeJson(ORDERS_FILE, orders);
+      console.log("India Post event for", event.article_number, ":", event.event_description);
+    }
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("India Post webhook error:", err);
+    res.sendStatus(200); // still 200 so India Post doesn't keep retrying a bad payload
+  }
+});
+
+// =====================================================================
 // SIMPLE API for the AIRX Ops dashboard (leads + orders)
 // =====================================================================
 
