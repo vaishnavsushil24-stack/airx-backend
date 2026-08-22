@@ -17,6 +17,12 @@ if (!fetchFn) {
   fetchFn = require("node-fetch");
 }
 
+// node-fetch is used explicitly (not the global/undici fetch) for any request
+// that needs to go through a proxy, since only node-fetch accepts a plain
+// Node http(s).Agent - the global fetch (undici) does not.
+const nodeFetch = require("node-fetch");
+const { HttpsProxyAgent } = require("https-proxy-agent");
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 const LEADS_FILE = path.join(__dirname, "data", "leads.json");
@@ -352,6 +358,19 @@ function indiaPostBase() {
   return process.env.INDIAPOST_BASE_URL || "https://test.cept.gov.in";
 }
 
+// India Post's sandbox only accepts calls from IPs you've whitelisted on
+// their Customer Self Service Portal (Settings -> Whitelist my IP Address).
+// Render's free tier doesn't have one fixed outbound IP, so all India Post
+// calls are routed through a small $4/mo proxy server (a DigitalOcean
+// droplet) that DOES have one fixed IP - that's the IP that's whitelisted.
+// Set INDIAPOST_PROXY_URL (e.g. http://user:pass@1.2.3.4:8888) in Render to
+// enable this. Leave it unset and calls go out directly (will keep failing
+// with "fetch failed" until either this proxy or a whitelisted IP exists).
+function indiaPostAgent() {
+  if (!process.env.INDIAPOST_PROXY_URL) return undefined;
+  return new HttpsProxyAgent(process.env.INDIAPOST_PROXY_URL);
+}
+
 // Non-secret shared UAT reference values from the approach doc (customer ID
 // range identifiers, not credentials). The actual login (INDIAPOST_USERNAME /
 // INDIAPOST_PASSWORD) is REQUIRED as env vars - no default, no fallback, so
@@ -374,13 +393,14 @@ async function indiaPostLogin() {
       "INDIAPOST_USERNAME and INDIAPOST_PASSWORD env vars are not set. Add them in Render (the sandbox login India Post gave you), then retry."
     );
   }
-  const resp = await fetchFn(`${indiaPostBase()}/beextcustomer/v1/access/login`, {
+  const resp = await nodeFetch(`${indiaPostBase()}/beextcustomer/v1/access/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       username: process.env.INDIAPOST_USERNAME,
       password: process.env.INDIAPOST_PASSWORD,
     }),
+    agent: indiaPostAgent(),
   });
   const data = await resp.json();
   if (!data.success || !data.data || !data.data.access_token) {
@@ -398,13 +418,14 @@ async function indiaPostLogin() {
 
 async function indiaPostFetch(pathAndQuery, options = {}) {
   const token = await indiaPostLogin();
-  const resp = await fetchFn(`${indiaPostBase()}${pathAndQuery}`, {
+  const resp = await nodeFetch(`${indiaPostBase()}${pathAndQuery}`, {
     ...options,
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
       ...(options.headers || {}),
     },
+    agent: options.agent || indiaPostAgent(),
   });
   return resp.json();
 }
