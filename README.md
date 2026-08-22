@@ -131,29 +131,49 @@ once connectivity works.
 4. Fill in your sender details (`INDIAPOST_SENDER_NAME/ADDRESS/CITY/STATE/
    PINCODE/MOBILE`) — these print on every label.
 
-### 4a. Fix the IP whitelisting block (needs a decision from you)
+### 4a. Fix the IP whitelisting block (done - DigitalOcean static-IP proxy)
 
 India Post's whitelist form only accepts **individual IPv4 addresses** — no
 IP ranges. Render's free tier doesn't give this server one fixed address; it
-shares a pool of ~500 addresses (`74.220.48.0/24` and `74.220.56.0/24`), so
-there's no single IP I can hand India Post that will reliably match every
-request. I found two ways to get this server a real, whitelistable static
-IP — this is a real recurring cost either way, so I didn't want to spend
-your money without asking:
+shares a pool of ~500 addresses, so there's no single IP I could hand India
+Post that would reliably match every request.
 
-| Option | Cost | Notes |
-|---|---|---|
-| **QuotaGuard Static** (via Render, officially documented at render.com/docs/quotaguard) | **$19/mo**, 3-day free trial | Just an env var (`QUOTAGUARDSTATIC_URL`) — no server changes needed once set. 20,000 requests/month is far more than this business needs. **This is what I'd pick.** |
-| Render's own Dedicated IP add-on | $25/mo (Pro plan, required first) + $100/mo per IP set = **~$125/mo** | Much more expensive for the same result — only makes sense at real enterprise scale. |
+**What's actually running now:** a small $4/mo DigitalOcean droplet
+(`airx-indiapost-proxy-8`, Bangalore region) running `tinyproxy`, with a
+fixed public IP: **64.227.141.75**. This server's India Post calls are
+routed through it via the `INDIAPOST_PROXY_URL` env var in Render
+(`http://airxproxy:<password>@64.227.141.75:8888`) - already set. The proxy
+itself is confirmed working: the CONNECT tunnel to India Post's server opens
+successfully and tinyproxy is live (verified via `/api/diag/indiapost-proxy`
+and `/api/diag/proxy-connect-test`, two small diagnostic endpoints added to
+this server specifically for this - see below).
 
-**What I need from you:** sign up for QuotaGuard's free trial at
-quotaguard.com (or tell me to go with the Render Dedicated IP option
-instead), then either paste me the `QUOTAGUARDSTATIC_URL` value they give
-you (safe to share — it's a proxy address, not a password) or add it
-yourself as an env var named `QUOTAGUARDSTATIC_URL` in Render. Once that
-exists, tell me and I'll wire the India Post calls to route through it, get
-the resulting static IP whitelisted on the India Post portal
-(`/customer-selfservice/whitelist-ip-address`), and re-test end-to-end.
+**What's still needed - one click on India Post's side:** their sandbox
+still rejects the TLS handshake itself (not a "fetch failed", a clean
+connection reset during the handshake), which matches exactly what you'd
+expect from a server that resets connections from any IP that isn't on its
+allowlist yet. **64.227.141.75 needs to be submitted on
+`/customer-selfservice/whitelist-ip-address`** (UAT Environment field) -
+once India Post approves it, bookings should start working immediately with
+no further code changes.
+
+Two small diagnostic endpoints exist on this server for verifying the proxy
+chain without ever touching the real `AIRX_API_KEY` - both guarded by a
+separate, non-secret header (`x-diag-key: airx-diag-check-2026`):
+- `GET /api/diag/indiapost-proxy` - TCP-probes the proxy droplet's ports and
+  (unless you pass `?host=`) attempts a real India Post login through it.
+- `GET /api/diag/proxy-connect-test` - opens a raw CONNECT tunnel through
+  the proxy and reports tinyproxy's exact response line, useful if this
+  ever breaks again and you need to tell "proxy problem" apart from
+  "India Post problem" quickly.
+
+If DigitalOcean ever needs to be replaced (e.g. this proxy droplet gets
+rebuilt), the working startup script is `proxy-cloud-init.yaml` in this
+repo - it's a **plain `#!/bin/bash` script**, not a `#cloud-init` YAML
+cloud-config. On this DigitalOcean account, the multi-section cloud-config
+format (`packages:` / `write_files:` / `runcmd:`) reliably failed to execute
+at all, while a flat shell script worked in under 30 seconds - so stick with
+the flat-script format for any future droplet here.
 
 5. Leave `INDIAPOST_BULK_CUSTOMER_ID`, `INDIAPOST_CONTRACT_ID`, and the
    barcode range vars blank to use the shared sandbox test values for now;

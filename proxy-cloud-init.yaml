@@ -1,0 +1,71 @@
+#!/bin/bash
+# NOTE: This is a PLAIN shebang script, deliberately NOT using the "#cloud-init"
+# YAML format (packages: / write_files: / runcmd:). We proved on this DigitalOcean
+# account that a bare #!/bin/bash script (test droplet "airx-diag-test-6") executes
+# reliably within ~60-90s of boot, while THREE separate #cloud-init YAML attempts
+# (airx-indiapost-proxy-2, -3, -7) never even reached their first runcmd line after
+# 5-7+ minutes. So this version does everything inline in one flat script instead of
+# relying on cloud-init's packages:/write_files:/runcmd: modules.
+set -x
+exec > /root/setup-proxy.log 2>&1
+
+report() {
+  MSG="$1"
+  PYSCRIPT=/root/report.py
+  echo 'import urllib.request, sys' > "$PYSCRIPT"
+  echo 'data = sys.argv[1].encode()' >> "$PYSCRIPT"
+  echo "req = urllib.request.Request('https://airx-backend-z8pb.onrender.com/api/diag/proxy-status-report', data=data, headers={'x-diag-key':'airx-diag-check-2026','Content-Type':'text/plain'})" >> "$PYSCRIPT"
+  echo 'urllib.request.urlopen(req, timeout=15)' >> "$PYSCRIPT"
+  python3 "$PYSCRIPT" "$MSG" || true
+}
+
+report "SCRIPT-STARTED-proxy8-plain-script"
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+report "APT-UPDATE-DONE-proxy8"
+
+apt-get install -y tinyproxy ufw
+report "APT-INSTALL-DONE-proxy8 exit=$?"
+
+mkdir -p /run/tinyproxy /var/log/tinyproxy
+chown tinyproxy:tinyproxy /run/tinyproxy /var/log/tinyproxy || true
+
+CONF=/etc/tinyproxy/tinyproxy.conf
+echo 'User tinyproxy' > "$CONF"
+echo 'Group tinyproxy' >> "$CONF"
+echo 'Port 8888' >> "$CONF"
+echo 'Listen 0.0.0.0' >> "$CONF"
+echo 'Timeout 600' >> "$CONF"
+echo 'DefaultErrorFile "/usr/share/tinyproxy/default.html"' >> "$CONF"
+echo 'StatFile "/usr/share/tinyproxy/stats.html"' >> "$CONF"
+echo 'LogFile "/var/log/tinyproxy/tinyproxy.log"' >> "$CONF"
+echo 'LogLevel Info' >> "$CONF"
+echo 'PidFile "/run/tinyproxy/tinyproxy.pid"' >> "$CONF"
+echo 'MaxClients 30' >> "$CONF"
+echo 'MinSpareServers 2' >> "$CONF"
+echo 'MaxSpareServers 5' >> "$CONF"
+echo 'StartServers 3' >> "$CONF"
+echo 'MaxRequestsPerChild 0' >> "$CONF"
+echo 'BasicAuth airxproxy DZPOTB6p3LZhvfpjHwSncpAo' >> "$CONF"
+echo 'ConnectPort 443' >> "$CONF"
+echo 'ConnectPort 563' >> "$CONF"
+echo 'ViaProxyName "tinyproxy"' >> "$CONF"
+
+report "CONF-WRITTEN-proxy8"
+
+systemctl enable tinyproxy
+systemctl restart tinyproxy
+sleep 2
+
+ufw allow OpenSSH
+ufw allow 8888/tcp
+ufw --force enable
+
+STATUS=$(systemctl is-active tinyproxy 2>&1)
+ENABLED=$(systemctl is-enabled tinyproxy 2>&1)
+LISTEN=$(ss -tlnp 2>&1 | grep 8888 || echo NOT-LISTENING)
+
+report "FINAL-proxy8 is-active=$STATUS is-enabled=$ENABLED listen=$LISTEN"
+
+echo done > /root/proxy-setup-done.txt
