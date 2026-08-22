@@ -461,7 +461,6 @@ app.post("/api/indiapost/book", requireApiKey, async (req, res) => {
     }
 
     const weight = Number(order.weightGrams) || Number(process.env.INDIAPOST_DEFAULT_WEIGHT_GRAMS) || 300;
-    const articleType = weight > 500 ? "SP_INLAND_PARCEL" : "SP_INLAND_DOC";
     const barcode = nextBarcode();
 
     const dropoffOfficeId = process.env.INDIAPOST_DROPOFF_OFFICE_ID;
@@ -472,18 +471,23 @@ app.post("/api/indiapost/book", requireApiKey, async (req, res) => {
       });
     }
 
+    // Field names/types/enum values here match the official schema published
+    // in the Customer Self Service Portal's API documentation (found Aug 2026,
+    // supersedes the older approach-doc guesses this was originally built from).
     const article = {
-      bulk_customer_id: process.env.INDIAPOST_BULK_CUSTOMER_ID || INDIAPOST_DEFAULTS.bulkCustomerId,
-      contract_id: process.env.INDIAPOST_CONTRACT_ID || INDIAPOST_DEFAULTS.contractId,
+      bulk_customer_id: Number(process.env.INDIAPOST_BULK_CUSTOMER_ID || INDIAPOST_DEFAULTS.bulkCustomerId),
+      contract_id: Number(process.env.INDIAPOST_CONTRACT_ID || INDIAPOST_DEFAULTS.contractId),
       barcode_no: barcode,
-      pickup_or_dropoff: "dropoff",
+      pickup_or_dropoff: "DROPOFF",
       pickup_dropoff_office_id: Number(dropoffOfficeId),
-      article_type: articleType,
+      article_type: "SP", // allowed values are just "SP" (Speed Post) or "BP" (Bulk Parcel)
       physical_weight: weight,
       shape_of_article: "NROL",
-      length: "10",
-      breadth_diameter: "10",
-      height: "5",
+      length: 10,
+      breadth_diameter: 10,
+      height: 5,
+      drop_off_pincode: process.env.INDIAPOST_SENDER_PINCODE || "",
+      bulk_reference: String(order.id || req.body.orderId || `AIRX-${Date.now()}`),
       sender_name: process.env.INDIAPOST_SENDER_NAME || "AIRX Plus Healthcare Pvt Ltd",
       sender_company: process.env.INDIAPOST_SENDER_NAME || "AIRX Plus Healthcare Pvt Ltd",
       sender_add_line_1: process.env.INDIAPOST_SENDER_ADDRESS || "Nimbahera",
@@ -498,17 +502,17 @@ app.post("/api/indiapost/book", requireApiKey, async (req, res) => {
       receiver_state: order.state || "",
       receiver_pincode: String(order.pincode || order.pin || "").slice(0, 6),
       receiver_mobile_no: String(order.mobile || "").replace(/\D/g, "").slice(0, 10),
-      alt_address_flag: "FALSE",
-      pickup_address_flag: "FALSE",
-      codr_cod: order.codAmount || order.cod ? "COD" : "",
-      value_for_codr_cod: order.codAmount || order.cod || 0,
-      ack: "FALSE",
-      reg: "FALSE",
-      otp: "FALSE",
+      alt_address_flag: false,
+      pickup_address_flag: false,
+      codr_cod: "COD", // required field; this business is COD-first, so default to COD
+      value_for_codr_cod: Number(order.codAmount || order.cod || 0),
+      ack: false,
+      reg: false,
+      otp: false,
     };
 
     const result = await indiaPostFetch(
-      `/beextcustomer/process-articles/${process.env.INDIAPOST_BULK_CUSTOMER_ID || INDIAPOST_DEFAULTS.bulkCustomerId}`,
+      `/beextcustomer/process-articles-file/${process.env.INDIAPOST_BULK_CUSTOMER_ID || INDIAPOST_DEFAULTS.bulkCustomerId}`,
       { method: "POST", body: JSON.stringify({ articles: [article] }) }
     );
 
