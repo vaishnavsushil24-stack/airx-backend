@@ -10,6 +10,7 @@ const express = require("express");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const net = require("net");
 require("dotenv").config();
 
 let fetchFn = global.fetch;
@@ -434,28 +435,61 @@ async function indiaPostFetch(pathAndQuery, options = {}) {
   return resp.json();
 }
 
+// Raw TCP connect probe - tells us whether something is actually listening on
+// a given host:port, from Render's own network (which has normal, unrestricted
+// outbound access, unlike a sandboxed dev environment). "open" = something
+// accepted the connection, "refused-or-error" = the host answered but nothing
+// is listening on that port (or actively rejected it), "timeout" = no answer
+// at all (host down, or a firewall silently dropping the packets).
+function tcpProbe(host, port, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const socket = new net.Socket();
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      socket.destroy();
+      resolve({ port, ms: Date.now() - start, ...result });
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => finish({ status: "open" }));
+    socket.once("timeout", () => finish({ status: "timeout" }));
+    socket.once("error", (err) => finish({ status: "refused-or-error", error: err.code || String(err) }));
+    socket.connect(port, host);
+  });
+}
+
 // Diagnostic endpoint to check whether the India Post proxy chain (this server
 // -> DigitalOcean tinyproxy -> India Post sandbox) is actually working, without
 // needing the AIRX_API_KEY - uses its own fixed, non-secret check header so this
 // can be tested independently while debugging connectivity. Doesn't expose any
-// credentials, only whether login succeeded and how long it took.
+// credentials - only port-open/closed status and whether login succeeded.
 app.get("/api/diag/indiapost-proxy", async (req, res) => {
   if (req.headers["x-diag-key"] !== "airx-diag-check-2026") {
     return res.status(401).json({ error: "unauthorized" });
   }
   const start = Date.now();
   const proxyConfigured = !!process.env.INDIAPOST_PROXY_URL;
+  let dropletHost;
+  try {
+    dropletHost = process.env.INDIAPOST_PROXY_URL
+      ? new URL(process.env.INDIAPOST_PROXY_URL).hostname
+      : null;
+  } catch {
+    dropletHost = null;
+  }
+  const probes = dropletHost
+    ? await Promise.all([22, 80, 8888].map((p) => tcpProbe(dropletHost, p)))
+    : [];
+  let loginResult;
   try {
     const token = await indiaPostLogin();
-    res.json({ ok: true, ms: Date.now() - start, proxyConfigured, tokenReceived: !!token });
+    loginResult = { ok: true, tokenReceived: !!token };
   } catch (err) {
-    res.status(500).json({
-      ok: false,
-      ms: Date.now() - start,
-      proxyConfigured,
-      error: String((err && err.message) || err),
-    });
+    loginResult = { ok: false, error: String((err && err.message) || err) };
   }
+  res.json({ ms: Date.now() - start, proxyConfigured, dropletHost, probes, loginResult });
 });
 
 // UPU S10 check-digit algorithm - standard formula used on every India Post
