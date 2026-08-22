@@ -513,25 +513,32 @@ app.get("/api/diag/indiapost-proxy", async (req, res) => {
   }
   const start = Date.now();
   const proxyConfigured = !!process.env.INDIAPOST_PROXY_URL;
-  let dropletHost;
-  try {
-    dropletHost = process.env.INDIAPOST_PROXY_URL
-      ? new URL(process.env.INDIAPOST_PROXY_URL).hostname
-      : null;
-  } catch {
-    dropletHost = null;
+  // ?host=1.2.3.4 lets us probe a candidate droplet (e.g. one not wired into
+  // INDIAPOST_PROXY_URL yet) before ever pointing production traffic at it.
+  const hostOverride = typeof req.query.host === "string" && req.query.host ? req.query.host : null;
+  let dropletHost = hostOverride;
+  if (!dropletHost) {
+    try {
+      dropletHost = process.env.INDIAPOST_PROXY_URL
+        ? new URL(process.env.INDIAPOST_PROXY_URL).hostname
+        : null;
+    } catch {
+      dropletHost = null;
+    }
   }
   const probes = dropletHost
     ? await Promise.all([22, 80, 8888].map((p) => tcpProbe(dropletHost, p)))
     : [];
-  let loginResult;
-  try {
-    const token = await indiaPostLogin();
-    loginResult = { ok: true, tokenReceived: !!token };
-  } catch (err) {
-    loginResult = { ok: false, error: String((err && err.message) || err) };
+  let loginResult = null;
+  if (!hostOverride) {
+    try {
+      const token = await indiaPostLogin();
+      loginResult = { ok: true, tokenReceived: !!token };
+    } catch (err) {
+      loginResult = { ok: false, error: String((err && err.message) || err) };
+    }
   }
-  res.json({ ms: Date.now() - start, proxyConfigured, dropletHost, probes, loginResult });
+  res.json({ ms: Date.now() - start, proxyConfigured, dropletHost, hostOverride: !!hostOverride, probes, loginResult });
 });
 
 // UPU S10 check-digit algorithm - standard formula used on every India Post
