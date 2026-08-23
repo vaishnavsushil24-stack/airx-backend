@@ -1401,9 +1401,21 @@ app.get("/api/members/:code/tree", requireApiKey, (req, res) => {
   res.json(buildNode(root, 0, new Set()));
 });
 
+// Mirrors admin.airxplus.com's own member-ID structure — "AIRX" + 6
+// digits (e.g. AIRX849817, seen live on membersearch.aspx). Per the
+// business owner's instruction, this just reproduces that same
+// structure with no extra validation beyond DB uniqueness.
+function generateMemberCode() {
+  for (let i = 0; i < 20; i++) {
+    const candidate = "AIRX" + String(Math.floor(100000 + Math.random() * 900000));
+    const exists = db.prepare("SELECT 1 FROM members WHERE member_code = ?").get(candidate);
+    if (!exists) return candidate;
+  }
+  throw new Error("could not generate a unique member_code — try again");
+}
+
 app.post("/api/members", requireApiKey, (req, res) => {
   const {
-    member_code,
     name,
     sponsor_code,
     placement_leg,
@@ -1416,8 +1428,15 @@ app.post("/api/members", requireApiKey, (req, res) => {
     kyc_status,
     status,
   } = req.body;
-  if (!member_code || !name) {
-    return res.status(400).json({ error: "member_code and name are required" });
+  let { member_code } = req.body;
+  if (!name) {
+    return res.status(400).json({ error: "name is required" });
+  }
+  // member_code is optional — if the caller doesn't supply one (e.g. a
+  // signup form that doesn't ask), auto-generate one in the same AIRX+6-
+  // digit structure admin.airxplus.com uses.
+  if (!member_code) {
+    member_code = generateMemberCode();
   }
   if (sponsor_code) {
     const sponsor = db.prepare("SELECT member_code FROM members WHERE member_code = ?").get(sponsor_code);
@@ -1500,12 +1519,238 @@ app.delete("/api/members/:code", requireApiKey, (req, res) => {
 });
 
 // =====================================================================
+// PHASE 3 — COMPENSATION ENGINE (binary plan: Left/Right PV matching)
+// See MLM_INTEGRATION_PLAN.md and the long comment in db.js next to
+// commission_settings for the full story. Short version: admin.airxplus.com
+// does not store its real matching-bonus formula anywhere in its UI, and
+// the developer who built it wanted extra payment to hand it over. The
+// business owner decided: build an ADMIN-CONFIGURABLE engine here instead
+// of blocking on that. Only pair_value_pv (500) and admin_charge_percent
+// (5) are confirmed from admin.airxplus.com itself — everything else is a
+// clearly labeled provisional default, changeable any time via
+// PUT /api/settings/commission with no code change or redeploy.
+//
+// Matching logic: every member sits under a sponsor on either the Left or
+// Right leg (members.placement_leg). Each run totals PV purchased inside
+// a member's whole Left subtree and whole Right subtree (plus whatever
+// carried forward from earlier runs), matches pairs = floor(min(left,
+// right) / pair_value_pv), pays payout_per_pair_amount per pair minus
+// admin_charge_percent and tds_percent, and carries the PV remainder
+// forward — mirroring the "BF / New / Total / Paid / CF" columns seen on
+// admin.airxplus.com's weeklypointcf.aspx.
+//
+// Every run is PREVIEW first (GET /api/payouts/preview — read-only,
+// changes nothing), then COMMIT (POST /api/payouts/commit — real money,
+// writes payouts + wallet_transactions, updates carry-forward, marks the
+// PV consumed). Always preview before committing.
+// =====================================================================
+
+function round2(n) {
+  return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+
+function getCommissionSettings() {
+  const rows = db.prepare("SELECT setting_key, setting_value FROM commission_settings").all();
+  const s = {};
+  for (const r of rows) s[r.setting_key] = r.setting_value;
+  return s;
+}
+
+// Computes matched-pair totals for every member from whatever pv_ledger
+// rows haven't been consumed by an earlier committed run yet. Pure
+// calculation, writes nothing — both /preview and /commit call this so
+// they can never disagree with each other.
+function computeMatching(periodLabel) {
+  const settings = getCommissionSettings();
+  const pairValue = settings.pair_value_pv || 500;
+  const payoutPerPair = settings.payout_per_pair_amount || pairValue;
+  const adminChargePct = settings.admin_charge_percent || 0;
+  const tdsPct = settings.tds_percent || 0;
+  const maxPairs = settings.max_pairs_per_period || 0;
+
+  const members = db.prepare("SELECT member_code, sponsor_code, placement_leg FROM members").all();
+  const children = {};
+  for (const m of members) {
+    if (!m.sponsor_code) continue;
+    (children[m.sponsor_code] = children[m.sponsor_code] || []).push(m);
+  }
+
+  const ledgerRows = db
+    .prepare(
+      `SELECT member_code, COALESCE(SUM(pv),0) AS pv, COALESCE(SUM(bv),0) AS bv
+       FROM pv_ledger WHERE consumed_in_period IS NULL GROUP BY member_code`
+    )
+    .all();
+  const ownPv = {};
+  let totalIncomingBv = 0;
+  for (const r of ledgerRows) {
+    ownPv[r.member_code] = r.pv;
+    totalIncomingBv += r.bv;
+  }
+
+  const balances = {};
+  for (const b of db.prepare("SELECT * FROM pv_balance").all()) balances[b.member_code] = b;
+
+  // Post-order subtree PV sum, memoised — same MAX_DEPTH + seen-set cycle
+  // guard used by /api/members/:code/tree elsewhere in this file, so a
+  // corrupt sponsor_code chain can never recurse forever.
+  const MAX_DEPTH = 50;
+  const subtreePv = {};
+  function subtreeSum(code, depth, seen) {
+    if (subtreePv[code] !== undefined) return subtreePv[code];
+    if (depth > MAX_DEPTH || seen.has(code)) return 0;
+    seen.add(code);
+    let sum = ownPv[code] || 0;
+    for (const child of children[code] || []) sum += subtreeSum(child.member_code, depth + 1, seen);
+    subtreePv[code] = sum;
+    return sum;
+  }
+  for (const m of members) subtreeSum(m.member_code, 0, new Set());
+
+  const results = [];
+  for (const m of members) {
+    const kids = children[m.member_code] || [];
+    const bf = balances[m.member_code] || { left_carry_forward: 0, right_carry_forward: 0 };
+    if (kids.length === 0 && bf.left_carry_forward === 0 && bf.right_carry_forward === 0) continue;
+
+    let leftNew = 0;
+    let rightNew = 0;
+    for (const child of kids) {
+      const val = subtreePv[child.member_code] || 0;
+      if (child.placement_leg === "Left") leftNew += val;
+      else if (child.placement_leg === "Right") rightNew += val;
+      // No/blank placement_leg on a child doesn't count toward either
+      // leg — mirrors admin.airxplus.com requiring an explicit Left/Right
+      // choice at join time.
+    }
+
+    const leftTotal = bf.left_carry_forward + leftNew;
+    const rightTotal = bf.right_carry_forward + rightNew;
+    let matchedPairs = Math.floor(Math.min(leftTotal, rightTotal) / pairValue);
+    if (maxPairs > 0) matchedPairs = Math.min(matchedPairs, maxPairs);
+
+    const grossAmount = matchedPairs * payoutPerPair;
+    const adminCharge = round2((grossAmount * adminChargePct) / 100);
+    const tds = round2((grossAmount * tdsPct) / 100);
+    const netAmount = round2(grossAmount - adminCharge - tds);
+    const usedPv = matchedPairs * pairValue;
+
+    results.push({
+      member_code: m.member_code,
+      left_total: round2(leftTotal),
+      right_total: round2(rightTotal),
+      matched_pairs: matchedPairs,
+      gross_amount: round2(grossAmount),
+      admin_charge: adminCharge,
+      tds_amount: tds,
+      net_amount: netAmount,
+      left_carry_forward: round2(leftTotal - usedPv),
+      right_carry_forward: round2(rightTotal - usedPv),
+    });
+  }
+
+  const totalOutgoingNet = round2(results.reduce((sum, r) => sum + r.net_amount, 0));
+  const payoutRatioPercent = totalIncomingBv > 0 ? round2((totalOutgoingNet / totalIncomingBv) * 100) : 0;
+
+  return {
+    period_label: periodLabel,
+    settings_used: settings,
+    total_incoming_bv: round2(totalIncomingBv),
+    total_outgoing_net: totalOutgoingNet,
+    payout_ratio_percent: payoutRatioPercent,
+    ledger_rows_included: ledgerRows.length,
+    members: results,
+  };
+}
+
+// ---------- Commission settings (this IS the "admin manages the plan" screen) ----------
+
+app.get("/api/settings/commission", requireApiKey, (req, res) => {
+  res.json(db.prepare("SELECT * FROM commission_settings ORDER BY setting_key").all());
+});
+
+app.put("/api/settings/commission", requireApiKey, (req, res) => {
+  const updates = req.body || {};
+  const stmt = db.prepare(
+    `INSERT INTO commission_settings (setting_key, setting_value, label)
+     VALUES (?, ?, COALESCE((SELECT label FROM commission_settings WHERE setting_key = ?), ?))
+     ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value, updated_at = datetime('now')`
+  );
+  for (const [key, value] of Object.entries(updates)) {
+    if (typeof value !== "number" || Number.isNaN(value)) continue;
+    stmt.run(key, value, key, key);
+  }
+  res.json(db.prepare("SELECT * FROM commission_settings ORDER BY setting_key").all());
+});
+
+// ---------- Weekly matching payout run (preview, read-only, then commit) ----------
+
+app.get("/api/payouts/preview", requireApiKey, (req, res) => {
+  const periodLabel = req.query.period || `PREVIEW-${new Date().toISOString().slice(0, 10)}`;
+  res.json(computeMatching(periodLabel));
+});
+
+app.post("/api/payouts/commit", requireApiKey, (req, res) => {
+  const { period_label } = req.body;
+  if (!period_label) return res.status(400).json({ error: "period_label is required" });
+  const already = db.prepare("SELECT id FROM payout_runs WHERE period_label = ?").get(period_label);
+  if (already) return res.status(409).json({ error: `period_label "${period_label}" was already committed` });
+
+  const result = computeMatching(period_label);
+
+  const insertPayout = db.prepare(
+    `INSERT INTO payouts (member_code, period_label, gross_amount, tds_amount, admin_charge, net_amount, status)
+     VALUES (?, ?, ?, ?, ?, ?, 'Pending')`
+  );
+  const insertWallet = db.prepare(
+    `INSERT INTO wallet_transactions (member_code, wallet_type, txn_type, amount, reason)
+     VALUES (?, 'Weekly', 'credit', ?, ?)`
+  );
+  const upsertBalance = db.prepare(
+    `INSERT INTO pv_balance (member_code, left_carry_forward, right_carry_forward, updated_at)
+     VALUES (?, ?, ?, datetime('now'))
+     ON CONFLICT(member_code) DO UPDATE SET left_carry_forward = excluded.left_carry_forward,
+       right_carry_forward = excluded.right_carry_forward, updated_at = datetime('now')`
+  );
+  const insertRun = db.prepare(
+    `INSERT INTO payout_runs (period_label, status, total_incoming_bv, total_outgoing_net, payout_ratio_percent, committed_at)
+     VALUES (?, 'Committed', ?, ?, ?, datetime('now'))`
+  );
+
+  for (const m of result.members) {
+    if (m.matched_pairs > 0) {
+      insertPayout.run(m.member_code, period_label, m.gross_amount, m.tds_amount, m.admin_charge, m.net_amount);
+      insertWallet.run(m.member_code, m.net_amount, `Weekly matching payout — ${period_label}`);
+    }
+    upsertBalance.run(m.member_code, m.left_carry_forward, m.right_carry_forward);
+  }
+  db.prepare("UPDATE pv_ledger SET consumed_in_period = ? WHERE consumed_in_period IS NULL").run(period_label);
+  insertRun.run(period_label, result.total_incoming_bv, result.total_outgoing_net, result.payout_ratio_percent);
+
+  res.json({ committed: true, ...result });
+});
+
+app.get("/api/payouts/runs", requireApiKey, (req, res) => {
+  res.json(db.prepare("SELECT * FROM payout_runs ORDER BY id DESC").all());
+});
+
+// ---------- Incoming vs outgoing — the business-health check the owner asked for ----------
+// "commission mein kitna % distribute ho raha hai, incoming (BV) ke against outgoing (net payout) kitna hai"
+app.get("/api/reports/payout-health", requireApiKey, (req, res) => {
+  const runs = db.prepare("SELECT * FROM payout_runs ORDER BY id").all();
+  const totalIncoming = round2(runs.reduce((s, r) => s + r.total_incoming_bv, 0));
+  const totalOutgoing = round2(runs.reduce((s, r) => s + r.total_outgoing_net, 0));
+  res.json({
+    runs,
+    total_incoming_bv: totalIncoming,
+    total_outgoing_net: totalOutgoing,
+    overall_payout_ratio_percent: totalIncoming > 0 ? round2((totalOutgoing / totalIncoming) * 100) : 0,
+  });
+});
+
+// =====================================================================
 // PHASE 4 — REWARDS & REPORTING (mirrors admin.airxplus.com "Reward"/"Reports")
-// See MLM_INTEGRATION_PLAN.md. Note: the reports below just aggregate
-// whatever pv_ledger / wallet_transactions rows already exist — Phase 3
-// (which actually WRITES those rows, i.e. the real compensation-plan
-// calculation) is still pending AIRX's compensation plan document, so
-// these reports will show zeros until that's built.
+// See MLM_INTEGRATION_PLAN.md.
 // =====================================================================
 
 // ---------- Rewards master ----------

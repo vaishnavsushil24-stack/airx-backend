@@ -288,7 +288,13 @@ Member section:
 - `GET/POST /api/members`, `GET/PATCH/DELETE /api/members/:code` — member
   profile (sponsor_code, placement_leg, mobile, email, PAN, bank details,
   kyc_status, status). `GET /api/members?status=Active` and
-  `?sponsor_code=X` filter the list.
+  `?sponsor_code=X` filter the list. `member_code` in the POST body is
+  optional — leave it out and the server auto-generates one in
+  admin.airxplus.com's own structure, `AIRX` + 6 digits (e.g.
+  `AIRX849817`), the same format seen live on that system's
+  membersearch.aspx. No extra validation is applied beyond DB
+  uniqueness, per the business owner's instruction to just reuse that
+  same ID structure as-is.
 - `GET /api/members/:code/downline` — direct (one-level) downline, mirrors
   "Downline Members".
 - `GET /api/members/:code/tree` — full recursive downline tree, mirrors
@@ -313,20 +319,68 @@ Reward and Reports sections:
 - `GET /api/reports/rank-achievers` — every reward achieved, most recent
   first, mirrors "Rank Achivers List".
 
-**Important caveat:** these reports aggregate whatever rows already exist
-in `pv_ledger` / `wallet_transactions` — nothing writes to those tables
-yet, because that's Phase 3 (see below), so today these reports return
-zeros. The reporting *shape* is ready; the data will start flowing once
-Phase 3 is built.
+**Note:** `/api/reports/member-balance` and `/api/reports/downline-pv`
+aggregate whatever rows exist in `pv_ledger` / `wallet_transactions` —
+those tables start filling in once Phase 3 (below) commits payout runs.
 
-**Phase 3 — PV/BV + weekly payout + TDS engine (NOT STARTED — blocked).**
-This is the one phase Claude will not build from guesswork: the real
-compensation-plan math (level-income %, direct bonus, matching bonus
-rules, how the global auto pool is funded/split, repurchase bonus, rank
-bonus criteria) has to come from AIRX's actual compensation plan
-document, since getting it wrong misallocates real distributor money.
-Waiting on that document (or a decision to reverse-engineer it from
-admin.airxplus.com's historical payout records instead, which is slower
-and less reliable) before this phase starts.
+**Phase 3 — PV/BV + weekly matching payout + TDS engine (done, admin-configurable).**
 
-**Phase 5 (cutover)** — after Phase 3 is validated, see the plan doc.
+admin.airxplus.com does not store its real compensation-plan formula
+anywhere reachable in its own UI — Reward Master and Manual Rank are
+both empty, TDS Report shows zero records for any date range, and
+PayoutAnaysisReport only shows an observed historical ratio, not a
+configured rule. The developer who originally built that system wanted
+extra payment to hand over the real spec. Rather than stay blocked on
+that, the business owner (2026-08-23) asked for an **admin-configurable**
+commission engine instead: build the calculation with whatever numbers
+are actually confirmed, expose every other number as something the
+owner can tune from the API with no code change, and surface
+incoming-vs-outgoing so the owner can see whether payouts are
+sustainable against sales.
+
+What's confirmed vs provisional (see `commission_settings` table /
+`GET /api/settings/commission` for the live values and labels):
+
+| setting | value | source |
+|---|---|---|
+| `pair_value_pv` | 500 | **Confirmed** — admin.airxplus.com KitMaster.aspx, "ACTIVE" package |
+| `admin_charge_percent` | 5 | **Confirmed** — admin.airxplus.com dashboard Income Summary |
+| `payout_per_pair_amount` | 500 | Provisional — defaulted equal to `pair_value_pv`; edit via `PUT /api/settings/commission` the moment the real ₹-per-pair figure is known |
+| `tds_percent` | 5 | Provisional — confirm the correct statutory rate for direct-selling commission with a CA/accountant |
+| `max_pairs_per_period` | 0 (unlimited) | Provisional — a per-run pair cap, if the business wants one |
+
+How it works (binary plan, Left/Right matching — confirmed structurally
+from admin.airxplus.com's ManualPowerBinery.aspx and weeklypointcf.aspx
+field labels): each run totals PV purchased across a member's whole
+Left subtree and whole Right subtree (via `members.placement_leg`),
+adds carry-forward from previous runs (`pv_balance`), matches pairs =
+`floor(min(left, right) / pair_value_pv)`, pays `payout_per_pair_amount`
+per pair minus `admin_charge_percent` and `tds_percent`, and carries the
+PV remainder forward — mirroring the "BF / New / Total / Paid / CF"
+columns on admin.airxplus.com's weeklypointcf.aspx.
+
+Endpoints:
+
+- `GET/PUT /api/settings/commission` — the admin screen for the plan
+  itself. `PUT` takes any subset of numeric settings, e.g.
+  `{"payout_per_pair_amount": 75, "tds_percent": 5}`.
+- `GET /api/payouts/preview?period=WEEK-35` — **read-only**, computes
+  what a run would pay without writing anything. Always call this
+  before committing.
+- `POST /api/payouts/commit` with `{"period_label": "WEEK-35"}` — real
+  money: writes `payouts` + `wallet_transactions` rows, updates
+  `pv_balance` carry-forward, marks the consumed `pv_ledger` rows so the
+  next run never double-counts them. A `period_label` can only be
+  committed once.
+- `GET /api/payouts/runs` — history of committed runs.
+- `GET /api/reports/payout-health` — **the incoming-vs-outgoing check the
+  owner asked for**: total BV brought in vs total net commission paid
+  out, and the payout ratio (%) across all committed runs, so it's easy
+  to see if the plan is paying out more than the business is taking in.
+
+A functional test of the matching math (`test_phase3.js`, run with
+`node test_phase3.js`) verifies the Left/Right subtree totals, matched
+pairs, gross/admin-charge/TDS/net split, and carry-forward math against
+a small hand-checked binary tree.
+
+**Phase 5 (cutover)** — after Phase 3 is validated in production, see the plan doc.

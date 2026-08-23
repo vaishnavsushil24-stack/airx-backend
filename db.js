@@ -92,11 +92,6 @@ CREATE TABLE IF NOT EXISTS members (
 );
 
 -- Phase 3: Compensation engine (PV/BV, payout, TDS, wallet)
--- NOTE: these tables are storage/ledger scaffolding only. The actual
--- compensation-plan MATH (level %, matching bonus rules, global auto pool,
--- repurchase bonus, rank bonus formulas) is NOT implemented yet — those
--- numbers come from AIRX's compensation plan document, which Claude has not
--- been given. See MLM_INTEGRATION_PLAN.md Phase 3 note.
 CREATE TABLE IF NOT EXISTS pv_ledger (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   member_code TEXT NOT NULL,
@@ -151,5 +146,73 @@ CREATE TABLE IF NOT EXISTS reward_achievers (
   FOREIGN KEY (reward_id) REFERENCES rewards(id)
 );
 `);
+
+// ---------------------------------------------------------------------
+// Migration: pv_ledger needs a column marking which payout run already
+// consumed a row, so the matching engine (server.js computeMatching)
+// never double-counts the same PV/BV across two weekly runs. Added
+// defensively via PRAGMA table_info since pv_ledger already existed
+// (empty, but with this exact shape) in the Phase 0 deploy.
+// ---------------------------------------------------------------------
+const pvLedgerCols = db.prepare("PRAGMA table_info(pv_ledger)").all().map((c) => c.name);
+if (!pvLedgerCols.includes("consumed_in_period")) {
+  db.exec("ALTER TABLE pv_ledger ADD COLUMN consumed_in_period TEXT");
+}
+
+// ---------------------------------------------------------------------
+// Phase 3 continued — compensation engine tables added once the business
+// owner decided how to proceed (2026-08-23): admin.airxplus.com does not
+// store its matching-bonus formula anywhere accessible (Reward Master,
+// Manual Rank and TDS Report are all empty there), and the developer who
+// built it wanted extra payment to hand over the real spec. So instead of
+// leaving Phase 3 blocked, the owner asked for an ADMIN-CONFIGURABLE
+// commission engine: only two numbers below are actually confirmed from
+// admin.airxplus.com (pair_value_pv = 500 from KitMaster.aspx "ACTIVE"
+// package, admin_charge_percent = 5 from the dashboard Income Summary);
+// everything else is a clearly-labeled provisional default that can be
+// corrected any time via PUT /api/settings/commission — no code change or
+// redeploy needed.
+// ---------------------------------------------------------------------
+db.exec(`
+CREATE TABLE IF NOT EXISTS commission_settings (
+  setting_key TEXT PRIMARY KEY,
+  setting_value REAL NOT NULL,
+  label TEXT,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS pv_balance (
+  member_code TEXT PRIMARY KEY,
+  left_carry_forward REAL NOT NULL DEFAULT 0,
+  right_carry_forward REAL NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (member_code) REFERENCES members(member_code)
+);
+
+CREATE TABLE IF NOT EXISTS payout_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  period_label TEXT UNIQUE NOT NULL,
+  status TEXT NOT NULL DEFAULT 'Draft',
+  total_incoming_bv REAL NOT NULL DEFAULT 0,
+  total_outgoing_net REAL NOT NULL DEFAULT 0,
+  payout_ratio_percent REAL NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  committed_at TEXT
+);
+`);
+
+const defaultCommissionSettings = [
+  ["pair_value_pv", 500, "CONFIRMED (admin.airxplus.com KitMaster.aspx, ACTIVE package) — PV required on each leg to form one matched pair"],
+  ["payout_per_pair_amount", 500, "PROVISIONAL — rupees paid out per matched pair; defaulted equal to pair_value_pv until the real figure is known"],
+  ["admin_charge_percent", 5, "CONFIRMED (admin.airxplus.com dashboard Income Summary) — admin/maintenance charge deducted from gross payout"],
+  ["tds_percent", 5, "PROVISIONAL — confirm the correct statutory TDS rate for direct-selling commission with your CA/accountant"],
+  ["max_pairs_per_period", 0, "PROVISIONAL — cap on matched pairs counted per run; 0 = unlimited"],
+];
+const insertCommissionSetting = db.prepare(
+  "INSERT OR IGNORE INTO commission_settings (setting_key, setting_value, label) VALUES (?, ?, ?)"
+);
+for (const [key, value, label] of defaultCommissionSettings) {
+  insertCommissionSetting.run(key, value, label);
+}
 
 module.exports = { db };
