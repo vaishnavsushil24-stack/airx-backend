@@ -160,6 +160,27 @@ if (!pvLedgerCols.includes("consumed_in_period")) {
 }
 
 // ---------------------------------------------------------------------
+// Migration: extra members columns for the legacy data import (Phase 5).
+// legacy_package keeps admin.airxplus.com's original "Package" label
+// (ACTIVE / FREE USER / etc) since our own status field is a simplified
+// Active/Inactive mapping of it. likely_dummy + dummy_reason record the
+// bulk-test-data heuristic (see POST /api/members/flag-dummies) so
+// imported rows can be filtered without deleting anything.
+// ---------------------------------------------------------------------
+const memberCols = db.prepare("PRAGMA table_info(members)").all().map((c) => c.name);
+const memberMigrations = [
+  ["legacy_package", "TEXT"],
+  ["likely_dummy", "INTEGER NOT NULL DEFAULT 0"],
+  ["dummy_reason", "TEXT"],
+  ["data_source", "TEXT NOT NULL DEFAULT 'manual'"],
+];
+for (const [col, type] of memberMigrations) {
+  if (!memberCols.includes(col)) {
+    db.exec(`ALTER TABLE members ADD COLUMN ${col} ${type}`);
+  }
+}
+
+// ---------------------------------------------------------------------
 // Phase 3 continued — compensation engine tables added once the business
 // owner decided how to proceed (2026-08-23): admin.airxplus.com does not
 // store its matching-bonus formula anywhere accessible (Reward Master,

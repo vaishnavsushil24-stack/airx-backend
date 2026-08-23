@@ -36,6 +36,20 @@ const LEADS_FILE = path.join(__dirname, "data", "leads.json");
 const ORDERS_FILE = path.join(__dirname, "data", "orders.json");
 const SHOP_FILE = path.join(__dirname, "data", "shopify.json");
 
+// CORS — needed so the legacy-data migration (Phase 5) can run fetch()
+// calls directly from admin.airxplus.com's own page context straight into
+// this API (still guarded by requireApiKey below; CORS only controls which
+// browser origins are allowed to READ the response, not who can guess the
+// key). No new dependency — plain Express headers, since npm installs
+// aren't available in the build environment this was developed in.
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Headers", "Content-Type, x-api-key");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 // Keep the raw body around (needed to verify Meta's signature) while still parsing JSON.
 app.use(
   express.json({
@@ -1469,6 +1483,187 @@ app.post("/api/members", requireApiKey, (req, res) => {
     return res.status(500).json({ error: err.message });
   }
   res.json(db.prepare("SELECT * FROM members WHERE member_code = ?").get(member_code));
+});
+
+// =====================================================================
+// LEGACY DATA MIGRATION (Phase 5 prep) — bulk-import members straight from
+// admin.airxplus.com's membersearch.aspx export, plus a dummy/test-data
+// classifier. See MLM_INTEGRATION_PLAN.md and the 2026-08-23 conversation:
+// most of the 2,437 legacy member rows are bulk test data (sequential
+// "Airx1".."Airx151", "Mahadev N", "Pranvayu N" names sharing one mobile/
+// PAN, all "FREE USER"), mixed with genuine distributors throughout —
+// there's no clean cutoff, so nothing is dropped on import. Everything
+// comes in; likely_dummy + dummy_reason flag what looks fake so it can be
+// filtered in reports/UI without permanently losing any legacy record.
+// =====================================================================
+
+function parseLegacyDate(s) {
+  // "30-Apr-2026" -> "2026-04-30". Falls back to the raw string (never
+  // throws) so a single malformed date can't fail the whole batch.
+  if (!s) return null;
+  const months = {
+    jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
+    jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12",
+  };
+  const m = String(s).trim().match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/);
+  if (!m) return s;
+  const mon = months[m[2].toLowerCase()];
+  if (!mon) return s;
+  return `${m[3]}-${mon}-${m[1].padStart(2, "0")}`;
+}
+
+// Body: { rows: [{ idNo, name, father, confDate, pkg, mobile, pan, refId, uplineId }, ...] }
+// Two passes so row order never matters: pass 1 upserts every member with
+// sponsor_code left NULL (always satisfies the FK), pass 2 wires up
+// sponsor_code now that every member_code in the batch is guaranteed to
+// exist — avoids "child imported before parent" failures entirely.
+app.post("/api/members/bulk-import", requireApiKey, (req, res) => {
+  const rows = Array.isArray(req.body?.rows) ? req.body.rows : null;
+  if (!rows) return res.status(400).json({ error: "body must be { rows: [...] }" });
+
+  const upsert = db.prepare(`
+    INSERT INTO members
+      (member_code, name, mobile, pan_number, kyc_status, status, legacy_package, joined_at, data_source)
+    VALUES (?, ?, ?, ?, 'Pending', ?, ?, ?, 'legacy_import')
+    ON CONFLICT(member_code) DO UPDATE SET
+      name = excluded.name,
+      mobile = excluded.mobile,
+      pan_number = excluded.pan_number,
+      status = excluded.status,
+      legacy_package = excluded.legacy_package,
+      joined_at = excluded.joined_at,
+      data_source = 'legacy_import',
+      updated_at = datetime('now')
+  `);
+  const setSponsor = db.prepare(
+    "UPDATE members SET sponsor_code = ? WHERE member_code = ? AND (sponsor_code IS NULL OR data_source = 'legacy_import')"
+  );
+  const existsStmt = db.prepare("SELECT 1 FROM members WHERE member_code = ?");
+
+  let imported = 0;
+  let sponsorLinked = 0;
+  let orphanedSponsor = 0;
+  const errors = [];
+
+  const batchCodes = new Set(rows.map((r) => String(r.idNo || "").trim()).filter(Boolean));
+
+  // node:sqlite's DatabaseSync has no better-sqlite3-style .transaction()
+  // helper, so BEGIN/COMMIT/ROLLBACK are managed by hand here.
+  db.exec("BEGIN");
+  try {
+    for (const r of rows) {
+      const memberCode = String(r.idNo || "").trim();
+      const name = String(r.name || "").trim();
+      if (!memberCode || !name) {
+        errors.push({ idNo: r.idNo, error: "missing idNo or name" });
+        continue;
+      }
+      const pkg = String(r.pkg || "").trim();
+      const status = pkg.toUpperCase() === "ACTIVE" ? "Active" : "Inactive";
+      try {
+        upsert.run(
+          memberCode,
+          name,
+          String(r.mobile || "").trim() || null,
+          String(r.pan || "").trim() || null,
+          status,
+          pkg || null,
+          parseLegacyDate(r.confDate)
+        );
+        imported++;
+      } catch (err) {
+        errors.push({ idNo: memberCode, error: err.message });
+      }
+    }
+    // Pass 2: sponsor_code, now that every code in this batch definitely exists.
+    for (const r of rows) {
+      const memberCode = String(r.idNo || "").trim();
+      const uplineId = String(r.uplineId || "").trim();
+      if (!memberCode || !uplineId || uplineId === memberCode) continue;
+      const target = existsStmt.get(uplineId) || (batchCodes.has(uplineId) ? true : null);
+      if (target) {
+        setSponsor.run(uplineId, memberCode);
+        sponsorLinked++;
+      } else {
+        orphanedSponsor++;
+      }
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    return res.status(500).json({ error: err.message });
+  }
+
+  res.json({ imported, sponsor_linked: sponsorLinked, orphaned_sponsor: orphanedSponsor, errors });
+});
+
+// Re-scans every member (not just the just-imported batch, so this is
+// safe to re-run any time as more data comes in) and flags rows that
+// match the bulk-test-data pattern found in admin.airxplus.com's export:
+// sequential placeholder names, or a mobile/PAN shared by several
+// "different" people. Never deletes anything — only sets likely_dummy +
+// dummy_reason so reports/UI can filter.
+app.post("/api/members/flag-dummies", requireApiKey, (req, res) => {
+  const namePattern = /^(mr|mrs|ms)?\.?\s*(airx|mahadev|pranvayu|test|demo|dummy|sample)\s*\d+$/i;
+
+  const mobileDupes = db
+    .prepare(
+      `SELECT mobile, COUNT(*) AS n FROM members
+       WHERE mobile IS NOT NULL AND mobile != '' GROUP BY mobile HAVING n > 2`
+    )
+    .all();
+  const panDupes = db
+    .prepare(
+      `SELECT pan_number, COUNT(*) AS n FROM members
+       WHERE pan_number IS NOT NULL AND pan_number != '' GROUP BY pan_number HAVING n > 2`
+    )
+    .all();
+  const dupeMobiles = new Set(mobileDupes.map((r) => r.mobile));
+  const dupePans = new Set(panDupes.map((r) => r.pan_number));
+
+  const all = db.prepare("SELECT member_code, name, mobile, pan_number FROM members").all();
+  const clearFlag = db.prepare(
+    "UPDATE members SET likely_dummy = 0, dummy_reason = NULL WHERE member_code = ?"
+  );
+  const setFlag = db.prepare(
+    "UPDATE members SET likely_dummy = 1, dummy_reason = ? WHERE member_code = ?"
+  );
+
+  let flagged = 0;
+  db.exec("BEGIN");
+  try {
+    for (const m of all) {
+      const reasons = [];
+      if (namePattern.test((m.name || "").trim())) reasons.push("sequential placeholder name");
+      if (m.mobile && dupeMobiles.has(m.mobile)) reasons.push(`mobile shared by ${mobileDupes.find((r) => r.mobile === m.mobile).n} members`);
+      if (m.pan_number && dupePans.has(m.pan_number)) reasons.push(`PAN shared by ${panDupes.find((r) => r.pan_number === m.pan_number).n} members`);
+
+      if (reasons.length) {
+        setFlag.run(reasons.join("; "), m.member_code);
+        flagged++;
+      } else {
+        clearFlag.run(m.member_code);
+      }
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    return res.status(500).json({ error: err.message });
+  }
+
+  res.json({ total_members: all.length, flagged_dummy: flagged, clean: all.length - flagged });
+});
+
+app.get("/api/reports/dummy-summary", requireApiKey, (req, res) => {
+  const total = db.prepare("SELECT COUNT(*) AS n FROM members").get().n;
+  const dummy = db.prepare("SELECT COUNT(*) AS n FROM members WHERE likely_dummy = 1").get().n;
+  const bySource = db.prepare("SELECT data_source, COUNT(*) AS n FROM members GROUP BY data_source").all();
+  res.json({
+    total_members: total,
+    likely_dummy: dummy,
+    likely_real: total - dummy,
+    by_data_source: bySource,
+  });
 });
 
 app.patch("/api/members/:code", requireApiKey, (req, res) => {
