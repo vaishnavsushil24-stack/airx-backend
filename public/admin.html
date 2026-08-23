@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AIRX Ops — Admin</title>
+<style>
+  :root {
+    --bg: #0f1720;
+    --panel: #17212c;
+    --panel-2: #1e2b38;
+    --border: #2a3947;
+    --text: #e8edf2;
+    --text-dim: #9fb0bf;
+    --accent: #2f9e6e;
+    --accent-2: #3b82f6;
+    --warn: #d97706;
+    --danger: #dc2626;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+  a { color: var(--accent-2); }
+  #loginScreen {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 20px;
+  }
+  #loginBox {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 32px;
+    width: 100%;
+    max-width: 380px;
+  }
+  #loginBox h1 { font-size: 20px; margin: 0 0 4px; }
+  #loginBox p { color: var(--text-dim); font-size: 13px; margin: 0 0 20px; }
+  input, select, textarea {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 9px 11px;
+    font-size: 14px;
+    width: 100%;
+    font-family: inherit;
+  }
+  input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent-2); }
+  button {
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    padding: 9px 16px;
+    font-size: 14px;
+    cursor: pointer;
+    font-weight: 500;
+  }
+  button:hover { filter: brightness(1.1); }
+  button.secondary { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+  button.danger { background: var(--danger); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #errBanner {
+    background: rgba(220,38,38,0.15);
+    border: 1px solid var(--danger);
+    color: #fca5a5;
+    padding: 8px 12px;
+    border-radius: 8px;
+    font-size: 13px;
+    margin-top: 12px;
+    display: none;
+  }
+  #app { display: none; }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .sub { color: var(--text-dim); font-size: 12px; }
+  nav {
+    display: flex;
+    gap: 4px;
+    padding: 10px 24px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+  }
+  nav button {
+    background: transparent;
+    color: var(--text-dim);
+    border-radius: 8px;
+    padding: 7px 14px;
+    font-size: 13px;
+    white-space: nowrap;
+  }
+  nav button.active { background: var(--panel-2); color: var(--text); }
+  main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+  .tab { display: none; }
+  .tab.active { display: block; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+  }
+  .card .label { font-size: 12px; color: var(--text-dim); margin-bottom: 6px; }
+  .card .value { font-size: 24px; font-weight: 600; }
+  .card .value.accent { color: var(--accent); }
+  .card .value.warn { color: var(--warn); }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px; margin-bottom: 20px; }
+  .panel h2 { font-size: 15px; margin: 0 0 14px; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--text-dim); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em; }
+  tr:hover td { background: var(--panel-2); cursor: pointer; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+  .badge.active { background: rgba(47,158,110,0.2); color: #4ade80; }
+  .badge.inactive { background: rgba(159,176,191,0.15); color: var(--text-dim); }
+  .badge.blocked { background: rgba(220,38,38,0.2); color: #fca5a5; }
+  .badge.dummy { background: rgba(217,119,6,0.2); color: #fbbf24; }
+  .badge.real { background: rgba(59,130,246,0.2); color: #93c5fd; }
+  .badge.confirmed { background: rgba(47,158,110,0.2); color: #4ade80; }
+  .badge.provisional { background: rgba(217,119,6,0.2); color: #fbbf24; }
+  .empty { color: var(--text-dim); font-size: 13px; padding: 20px; text-align: center; }
+  .field { margin-bottom: 12px; }
+  .field label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 5px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+  .muted { color: var(--text-dim); font-size: 12px; }
+  .toast {
+    position: fixed; bottom: 20px; right: 20px;
+    background: var(--panel-2); border: 1px solid var(--border);
+    padding: 12px 18px; border-radius: 8px; font-size: 13px;
+    max-width: 400px; z-index: 100; display: none;
+  }
+  .toast.success { border-color: var(--accent); }
+  .toast.error { border-color: var(--danger); }
+  .close-btn { float: right; cursor: pointer; color: var(--text-dim); background: none; border: none; padding: 0; font-size: 16px; }
+  .detail-overlay {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+    align-items: flex-start; justify-content: center; z-index: 50; padding: 40px 20px; overflow-y: auto;
+  }
+  .detail-box { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; max-width: 560px; width: 100%; }
+  .detail-box h3 { margin: 0 0 16px; }
+  .search-input { max-width: 320px; }
+</style>
+</head>
+<body>
+
+<div id="loginScreen">
+  <div id="loginBox">
+    <h1>AIRX Ops — Admin</h1>
+    <p>Enter your API key (AIRX_API_KEY) to continue. It's stored only in this browser (localStorage), never sent anywhere except this API.</p>
+    <div class="field">
+      <label>API Key</label>
+      <input type="password" id="apiKeyInput" placeholder="x-api-key" />
+    </div>
+    <button id="loginBtn" style="width:100%">Connect</button>
+    <div id="errBanner"></div>
+  </div>
+</div>
+
+<div id="app">
+  <header>
+    <div>
+      <h1>AIRX Ops</h1>
+      <div class="sub">AIRX PLUS HEALTHCARE PRIVATE LIMITED — internal admin</div>
+    </div>
+    <button class="secondary" id="logoutBtn">Disconnect</button>
+  </header>
+  <nav id="nav"></nav>
+  <main>
+    <div class="tab" id="tab-dashboard"></div>
+    <div class="tab" id="tab-members"></div>
+    <div class="tab" id="tab-commission"></div>
+    <div class="tab" id="tab-payouts"></div>
+    <div class="tab" id="tab-products"></div>
+    <div class="tab" id="tab-franchises"></div>
+    <div class="tab" id="tab-rewards"></div>
+  </main>
+</div>
+
+<div class="detail-overlay" id="memberDetailOverlay">
+  <div class="detail-box" id="memberDetailBox"></div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API_BASE = window.location.origin;
+let API_KEY = localStorage.getItem('airx_api_key') || '';
+
+const TABS = [
+  { id: 'dashboard', label: 'Dashboard' },
+  { id: 'members', label: 'Members' },
+  { id: 'commission', label: 'Commission Settings' },
+  { id: 'payouts', label: 'Payouts' },
+  { id: 'products', label: 'Products' },
+  { id: 'franchises', label: 'Franchises' },
+  { id: 'rewards', label: 'Rewards' },
+];
+
+function toast(msg, type) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast ' + (type || '');
+  t.style.display = 'block';
+  setTimeout(() => { t.style.display = 'none'; }, 4000);
+}
+
+async function api(path, opts) {
+  opts = opts || {};
+  const headers = Object.assign({ 'x-api-key': API_KEY }, opts.body ? { 'Content-Type': 'application/json' } : {}, opts.headers || {});
+  const res = await fetch(API_BASE + path, Object.assign({}, opts, { headers }));
+  let body;
+  try { body = await res.json(); } catch (e) { body = null; }
+  if (!res.ok) {
+    const msg = (body && body.error) || ('HTTP ' + res.status);
+    throw new Error(msg);
+  }
+  return body;
+}
+
+// ---------- Login ----------
+function showApp() {
+  document.getElementById('loginScreen').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+  renderNav();
+  switchTab('dashboard');
+}
+function showLogin(err) {
+  document.getElementById('loginScreen').style.display = 'flex';
+  document.getElementById('app').style.display = 'none';
+  const banner = document.getElementById('errBanner');
+  if (err) { banner.textContent = err; banner.style.display = 'block'; }
+  else { banner.style.display = 'none'; }
+}
+
+document.getElementById('loginBtn').addEventListener('click', async () => {
+  const key = document.getElementById('apiKeyInput').value.trim();
+  if (!key) return;
+  API_KEY = key;
+  try {
+    await api('/api/settings/commission');
+    localStorage.setItem('airx_api_key', key);
+    showApp();
+  } catch (e) {
+    showLogin('Could not connect — check the API key. (' + e.message + ')');
+  }
+});
+document.getElementById('apiKeyInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') document.getElementById('loginBtn').click();
+});
+document.getElementById('logoutBtn').addEventListener('click', () => {
+  localStorage.removeItem('airx_api_key');
+  API_KEY = '';
+  showLogin();
+});
+
+// ---------- Nav ----------
+function renderNav() {
+  const nav = document.getElementById('nav');
+  nav.innerHTML = '';
+  TABS.forEach(t => {
+    const btn = document.createElement('button');
+    btn.textContent = t.label;
+    btn.dataset.tab = t.id;
+    btn.addEventListener('click', () => switchTab(t.id));
+    nav.appendChild(btn);
+  });
+}
+function switchTab(id) {
+  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === id));
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.id === 'tab-' + id));
+  const loaders = { dashboard: loadDashboard, members: loadMembers, commission: loadCommission, payouts: loadPayouts, products: loadProducts, franchises: loadFranchises, rewards: loadRewards };
+  if (loaders[id]) loaders[id]();
+}
+
+function esc(s) {
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ---------- Dashboard ----------
+async function loadDashboard() {
+  const el = document.getElementById('tab-dashboard');
+  el.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const [dummySummary, health] = await Promise.all([
+      api('/api/reports/dummy-summary'),
+      api('/api/reports/payout-health'),
+    ]);
+    el.innerHTML = `
+      <div class="cards">
+        <div class="card"><div class="label">Total Members</div><div class="value">${dummySummary.total_members}</div></div>
+        <div class="card"><div class="label">Likely Real</div><div class="value accent">${dummySummary.likely_real}</div></div>
+        <div class="card"><div class="label">Likely Dummy / Test</div><div class="value warn">${dummySummary.likely_dummy}</div></div>
+        <div class="card"><div class="label">Total Incoming BV</div><div class="value">₹${health.total_incoming_bv.toLocaleString('en-IN')}</div></div>
+        <div class="card"><div class="label">Total Outgoing (Net Payouts)</div><div class="value">₹${health.total_outgoing_net.toLocaleString('en-IN')}</div></div>
+        <div class="card"><div class="label">Payout Ratio</div><div class="value">${health.overall_payout_ratio_percent}%</div></div>
+      </div>
+      <div class="panel">
+        <h2>Committed payout runs</h2>
+        ${health.runs.length ? `<table><thead><tr><th>Period</th><th>Incoming BV</th><th>Outgoing Net</th><th>Ratio</th><th>Committed</th></tr></thead><tbody>
+          ${health.runs.map(r => `<tr><td>${esc(r.period_label)}</td><td>₹${r.total_incoming_bv.toLocaleString('en-IN')}</td><td>₹${r.total_outgoing_net.toLocaleString('en-IN')}</td><td>${r.payout_ratio_percent}%</td><td>${esc(r.committed_at)}</td></tr>`).join('')}
+        </tbody></table>` : '<div class="empty">No payout runs committed yet — see the Payouts tab.</div>'}
+      </div>
+      <div class="panel">
+        <p class="muted">Reminder: this dashboard reflects AIRX Ops' own database, migrated from admin.airxplus.com's member roster (verified: Active count and Total count match exactly). Historical PV/BV/payout data could not be recovered from the legacy system — it isn't stored anywhere accessible there — so incoming/outgoing above reflects only activity recorded going forward in this system.</p>
+      </div>
+    `;
+  } catch (e) {
+    el.innerHTML = `<div class="empty">Failed to load: ${esc(e.message)}</div>`;
+  }
+}
+
+// ---------- Members ----------
+let membersCache = [];
+async function loadMembers() {
+  const el = document.getElementById('tab-members');
+  el.innerHTML = `
+    <div class="panel">
+      <div class="row">
+        <input class="search-input" id="memberSearch" placeholder="Search by name or member code…" />
+        <select id="memberStatusFilter">
+          <option value="">All statuses</option>
+          <option value="Active">Active</option>
+          <option value="Inactive">Inactive</option>
+          <option value="Blocked">Blocked</option>
+        </select>
+        <select id="memberDummyFilter">
+          <option value="">All (real + dummy)</option>
+          <option value="real">Likely real only</option>
+          <option value="dummy">Likely dummy only</option>
+        </select>
+        <button class="secondary" id="addMemberBtn">+ Add member</button>
+      </div>
+      <div id="membersTableWrap"><div class="empty">Loading…</div></div>
+    </div>
+  `;
+  try {
+    membersCache = await api('/api/members');
+    renderMembersTable();
+  } catch (e) {
+    document.getElementById('membersTableWrap').innerHTML = `<div class="empty">Failed to load: ${esc(e.message)}</div>`;
+  }
+  document.getElementById('memberSearch').addEventListener('input', renderMembersTable);
+  document.getElementById('memberStatusFilter').addEventListener('change', renderMembersTable);
+  document.getElementById('memberDummyFilter').addEventListener('change', renderMembersTable);
+  document.getElementById('addMemberBtn').addEventListener('click', () => openMemberDetail(null));
+}
+
+function renderMembersTable() {
+  const q = (document.getElementById('memberSearch').value || '').toLowerCase();
+  const statusF = document.getElementById('memberStatusFilter').value;
+  const dummyF = document.getElementById('memberDummyFilter').value;
+  let rows = membersCache.filter(m => {
+    if (q && !(m.name || '').toLowerCase().includes(q) && !(m.member_code || '').toLowerCase().includes(q)) return false;
+    if (statusF && m.status !== statusF) return false;
+    if (dummyF === 'real' && m.likely_dummy) return false;
+    if (dummyF === 'dummy' && !m.likely_dummy) return false;
+    return true;
+  }).slice(0, 300);
+  const wrap = document.getElementById('membersTableWrap');
+  if (!rows.length) { wrap.innerHTML = '<div class="empty">No members match.</div>'; return; }
+  wrap.innerHTML = `
+    <table><thead><tr><th>Code</th><th>Name</th><th>Sponsor</th><th>Status</th><th>Flag</th><th>Mobile</th></tr></thead>
+    <tbody>${rows.map(m => `
+      <tr data-code="${esc(m.member_code)}">
+        <td>${esc(m.member_code)}</td>
+        <td>${esc(m.name)}</td>
+        <td>${esc(m.sponsor_code) || '—'}</td>
+        <td><span class="badge ${m.status === 'Active' ? 'active' : m.status === 'Blocked' ? 'blocked' : 'inactive'}">${esc(m.status)}</span></td>
+        <td>${m.likely_dummy ? '<span class="badge dummy">dummy</span>' : '<span class="badge real">real</span>'}</td>
+        <td>${esc(m.mobile) || '—'}</td>
+      </tr>`).join('')}
+    </tbody></table>
+    <p class="muted">Showing ${rows.length}${rows.length === 300 ? ' (capped — refine your search)' : ''} of ${membersCache.length} total.</p>
+  `;
+  wrap.querySelectorAll('tr[data-code]').forEach(tr => {
+    tr.addEventListener('click', () => openMemberDetail(tr.dataset.code));
+  });
+}
+
+async function openMemberDetail(code) {
+  const overlay = document.getElementById('memberDetailOverlay');
+  const box = document.getElementById('memberDetailBox');
+  overlay.style.display = 'flex';
+  if (!code) {
+    box.innerHTML = `
+      <h3>Add member</h3>
+      <div class="field"><label>Member code (leave blank to auto-generate AIRX + 6 digits)</label><input id="f_member_code" /></div>
+      <div class="field"><label>Name *</label><input id="f_name" /></div>
+      <div class="field"><label>Sponsor code</label><input id="f_sponsor_code" /></div>
+      <div class="field"><label>Placement leg</label><select id="f_placement_leg"><option value="">—</option><option value="Left">Left</option><option value="Right">Right</option></select></div>
+      <div class="field"><label>Mobile</label><input id="f_mobile" /></div>
+      <div class="row"><button id="saveMemberBtn">Create</button><button class="secondary" id="closeDetailBtn">Cancel</button></div>
+    `;
+    document.getElementById('saveMemberBtn').addEventListener('click', async () => {
+      try {
+        await api('/api/members', { method: 'POST', body: JSON.stringify({
+          member_code: document.getElementById('f_member_code').value.trim() || undefined,
+          name: document.getElementById('f_name').value.trim(),
+          sponsor_code: document.getElementById('f_sponsor_code').value.trim() || undefined,
+          placement_leg: document.getElementById('f_placement_leg').value || undefined,
+          mobile: document.getElementById('f_mobile').value.trim() || undefined,
+        })});
+        toast('Member created', 'success');
+        overlay.style.display = 'none';
+        loadMembers();
+      } catch (e) { toast('Failed: ' + e.message, 'error'); }
+    });
+    document.getElementById('closeDetailBtn').addEventListener('click', () => overlay.style.display = 'none');
+    return;
+  }
+
+  box.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const [m, balance] = await Promise.all([
+      api('/api/members/' + encodeURIComponent(code)),
+      api('/api/reports/member-balance/' + encodeURIComponent(code)).catch(() => null),
+    ]);
+    box.innerHTML = `
+      <h3>${esc(m.name)} <span class="muted">(${esc(m.member_code)})</span></h3>
+      ${m.likely_dummy ? `<p class="muted">⚠ Flagged likely dummy: ${esc(m.dummy_reason || '')}</p>` : ''}
+      <div class="grid2">
+        <div class="field"><label>Status</label><select id="f_status"><option ${m.status==='Active'?'selected':''}>Active</option><option ${m.status==='Inactive'?'selected':''}>Inactive</option><option ${m.status==='Blocked'?'selected':''}>Blocked</option></select></div>
+        <div class="field"><label>Placement leg</label><select id="f_placement_leg"><option value="" ${!m.placement_leg?'selected':''}>—</option><option value="Left" ${m.placement_leg==='Left'?'selected':''}>Left</option><option value="Right" ${m.placement_leg==='Right'?'selected':''}>Right</option></select></div>
+        <div class="field"><label>Sponsor code</label><input id="f_sponsor_code" value="${esc(m.sponsor_code)}" /></div>
+        <div class="field"><label>Mobile</label><input id="f_mobile" value="${esc(m.mobile)}" /></div>
+      </div>
+      <p class="muted">Legacy package: ${esc(m.legacy_package) || '—'} · Joined: ${esc(m.joined_at) || '—'} · Source: ${esc(m.data_source)}</p>
+      ${balance ? `<p class="muted">Wallet balance: ₹${balance.balance.toLocaleString('en-IN')} (credit ₹${balance.total_credit.toLocaleString('en-IN')} / debit ₹${balance.total_debit.toLocaleString('en-IN')})</p>` : ''}
+      <div class="row">
+        <button id="saveMemberBtn">Save</button>
+        ${m.status === 'Blocked' ? '<button class="secondary" id="unblockBtn">Unblock</button>' : '<button class="danger" id="blockBtn">Block</button>'}
+        <button class="secondary" id="closeDetailBtn">Close</button>
+      </div>
+    `;
+    document.getElementById('saveMemberBtn').addEventListener('click', async () => {
+      try {
+        await api('/api/members/' + encodeURIComponent(code), { method: 'PATCH', body: JSON.stringify({
+          status: document.getElementById('f_status').value,
+          placement_leg: document.getElementById('f_placement_leg').value || null,
+          sponsor_code: document.getElementById('f_sponsor_code').value.trim() || null,
+          mobile: document.getElementById('f_mobile').value.trim() || null,
+        })});
+        toast('Saved', 'success');
+        overlay.style.display = 'none';
+        loadMembers();
+      } catch (e) { toast('Failed: ' + e.message, 'error'); }
+    });
+    const blockBtn = document.getElementById('blockBtn');
+    if (blockBtn) blockBtn.addEventListener('click', async () => {
+      await api('/api/members/' + encodeURIComponent(code) + '/block', { method: 'POST' });
+      toast('Blocked', 'success'); overlay.style.display = 'none'; loadMembers();
+    });
+    const unblockBtn = document.getElementById('unblockBtn');
+    if (unblockBtn) unblockBtn.addEventListener('click', async () => {
+      await api('/api/members/' + encodeURIComponent(code) + '/unblock', { method: 'POST' });
+      toast('Unblocked', 'success'); overlay.style.display = 'none'; loadMembers();
+    });
+    document.getElementById('closeDetailBtn').addEventListener('click', () => overlay.style.display = 'none');
+  } catch (e) {
+    box.innerHTML = `<div class="empty">Failed to load: ${esc(e.message)}</div><button class="secondary" id="closeDetailBtn">Close</button>`;
+    document.getElementById('closeDetailBtn').addEventListener('click', () => overlay.style.display = 'none');
+  }
+}
+document.getElementById('memberDetailOverlay').addEventListener('click', (e) => {
+  if (e.target.id === 'memberDetailOverlay') e.target.style.display = 'none';
+});
+
+// ---------- Commission settings ----------
+async function loadCommission() {
+  const el = document.getElementById('tab-commission');
+  el.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const settings = await api('/api/settings/commission');
+    el.innerHTML = `
+      <div class="panel">
+        <h2>Commission plan — admin-configurable</h2>
+        <p class="muted">Only pair_value_pv and admin_charge_percent are confirmed from admin.airxplus.com. Everything else is a provisional default — edit and save any time, no redeploy needed.</p>
+        ${settings.map(s => `
+          <div class="row">
+            <div style="flex:1">
+              <div style="font-weight:500">${esc(s.setting_key)} ${/CONFIRMED/.test(s.label) ? '<span class="badge confirmed">confirmed</span>' : '<span class="badge provisional">provisional</span>'}</div>
+              <div class="muted">${esc(s.label)}</div>
+            </div>
+            <input type="number" step="any" style="max-width:140px" data-key="${esc(s.setting_key)}" value="${s.setting_value}" />
+          </div>
+        `).join('')}
+        <button id="saveSettingsBtn" style="margin-top:8px">Save changes</button>
+      </div>
+    `;
+    document.getElementById('saveSettingsBtn').addEventListener('click', async () => {
+      const updates = {};
+      el.querySelectorAll('input[data-key]').forEach(inp => { updates[inp.dataset.key] = Number(inp.value); });
+      try {
+        await api('/api/settings/commission', { method: 'PUT', body: JSON.stringify(updates) });
+        toast('Settings saved', 'success');
+      } catch (e) { toast('Failed: ' + e.message, 'error'); }
+    });
+  } catch (e) {
+    el.innerHTML = `<div class="empty">Failed to load: ${esc(e.message)}</div>`;
+  }
+}
+
+// ---------- Payouts ----------
+async function loadPayouts() {
+  const el = document.getElementById('tab-payouts');
+  el.innerHTML = `
+    <div class="panel">
+      <h2>Run a payout period</h2>
+      <p class="muted">Always Preview first — it changes nothing. Commit is real money: it writes payouts, updates wallets, and can't be undone for that period_label.</p>
+      <div class="row">
+        <input id="periodLabel" placeholder="Period label, e.g. WEEK-35-2026" style="max-width:260px" />
+        <button id="previewBtn" class="secondary">Preview (read-only)</button>
+        <button id="commitBtn" class="danger" disabled>Commit</button>
+      </div>
+      <div id="previewResult"></div>
+    </div>
+    <div class="panel">
+      <h2>Committed run history</h2>
+      <div id="runsHistory"><div class="empty">Loading…</div></div>
+    </div>
+  `;
+  let lastPreviewPeriod = null;
+  document.getElementById('previewBtn').addEventListener('click', async () => {
+    const period = document.getElementById('periodLabel').value.trim();
+    if (!period) { toast('Enter a period label first', 'error'); return; }
+    try {
+      const result = await api('/api/payouts/preview?period=' + encodeURIComponent(period));
+      lastPreviewPeriod = period;
+      document.getElementById('commitBtn').disabled = false;
+      const matched = result.members.filter(m => m.matched_pairs > 0);
+      document.getElementById('previewResult').innerHTML = `
+        <div class="cards" style="margin-top:12px">
+          <div class="card"><div class="label">Incoming BV</div><div class="value">₹${result.total_incoming_bv.toLocaleString('en-IN')}</div></div>
+          <div class="card"><div class="label">Outgoing Net</div><div class="value">₹${result.total_outgoing_net.toLocaleString('en-IN')}</div></div>
+          <div class="card"><div class="label">Payout Ratio</div><div class="value">${result.payout_ratio_percent}%</div></div>
+          <div class="card"><div class="label">Members Matched</div><div class="value">${matched.length}</div></div>
+        </div>
+        ${matched.length ? `<table><thead><tr><th>Member</th><th>Left</th><th>Right</th><th>Pairs</th><th>Net</th></tr></thead><tbody>
+          ${matched.slice(0,100).map(m => `<tr><td>${esc(m.member_code)}</td><td>${m.left_total}</td><td>${m.right_total}</td><td>${m.matched_pairs}</td><td>₹${m.net_amount.toLocaleString('en-IN')}</td></tr>`).join('')}
+        </tbody></table>` : '<div class="empty">No matched pairs this period.</div>'}
+      `;
+    } catch (e) { toast('Preview failed: ' + e.message, 'error'); }
+  });
+  document.getElementById('commitBtn').addEventListener('click', async () => {
+    if (!lastPreviewPeriod) return;
+    if (!confirm('Commit payout run "' + lastPreviewPeriod + '"? This writes real payouts and cannot be undone for this period.')) return;
+    try {
+      await api('/api/payouts/commit', { method: 'POST', body: JSON.stringify({ period_label: lastPreviewPeriod }) });
+      toast('Committed', 'success');
+      document.getElementById('commitBtn').disabled = true;
+      loadPayouts();
+    } catch (e) { toast('Commit failed: ' + e.message, 'error'); }
+  });
+  try {
+    const runs = await api('/api/payouts/runs');
+    document.getElementById('runsHistory').innerHTML = runs.length
+      ? `<table><thead><tr><th>Period</th><th>Status</th><th>Incoming</th><th>Outgoing</th><th>Ratio</th></tr></thead><tbody>
+          ${runs.map(r => `<tr><td>${esc(r.period_label)}</td><td>${esc(r.status)}</td><td>₹${r.total_incoming_bv.toLocaleString('en-IN')}</td><td>₹${r.total_outgoing_net.toLocaleString('en-IN')}</td><td>${r.payout_ratio_percent}%</td></tr>`).join('')}
+        </tbody></table>`
+      : '<div class="empty">No runs committed yet.</div>';
+  } catch (e) {
+    document.getElementById('runsHistory').innerHTML = `<div class="empty">Failed to load: ${esc(e.message)}</div>`;
+  }
+}
+
+// ---------- Products ----------
+async function loadProducts() {
+  const el = document.getElementById('tab-products');
+  el.innerHTML = `<div class="panel"><h2>Products</h2>
+    <div class="row">
+      <input id="p_sku" placeholder="SKU" style="max-width:120px" />
+      <input id="p_name" placeholder="Name" />
+      <input id="p_dp" placeholder="DP price" type="number" style="max-width:110px" />
+      <input id="p_mrp" placeholder="MRP" type="number" style="max-width:110px" />
+      <input id="p_pv" placeholder="PV" type="number" style="max-width:90px" />
+      <input id="p_bv" placeholder="BV" type="number" style="max-width:90px" />
+      <button id="addProductBtn">+ Add</button>
+    </div>
+    <div id="productsTable"><div class="empty">Loading…</div></div>
+  </div>`;
+  async function refresh() {
+    const products = await api('/api/products');
+    document.getElementById('productsTable').innerHTML = products.length
+      ? `<table><thead><tr><th>SKU</th><th>Name</th><th>DP</th><th>MRP</th><th>PV</th><th>BV</th><th>Status</th></tr></thead><tbody>
+          ${products.map(p => `<tr><td>${esc(p.sku)}</td><td>${esc(p.name)}</td><td>₹${p.dp_price}</td><td>₹${p.mrp_price}</td><td>${p.pv}</td><td>${p.bv}</td><td>${esc(p.status)}</td></tr>`).join('')}
+        </tbody></table>`
+      : '<div class="empty">No products yet.</div>';
+  }
+  document.getElementById('addProductBtn').addEventListener('click', async () => {
+    try {
+      await api('/api/products', { method: 'POST', body: JSON.stringify({
+        sku: document.getElementById('p_sku').value.trim(),
+        name: document.getElementById('p_name').value.trim(),
+        dp_price: Number(document.getElementById('p_dp').value) || 0,
+        mrp_price: Number(document.getElementById('p_mrp').value) || 0,
+        pv: Number(document.getElementById('p_pv').value) || 0,
+        bv: Number(document.getElementById('p_bv').value) || 0,
+      })});
+      toast('Product added', 'success'); refresh();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+  refresh().catch(e => { document.getElementById('productsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+}
+
+// ---------- Franchises ----------
+async function loadFranchises() {
+  const el = document.getElementById('tab-franchises');
+  el.innerHTML = `<div class="panel"><h2>Franchises</h2>
+    <div class="row">
+      <input id="fr_code" placeholder="Franchise code" style="max-width:140px" />
+      <input id="fr_name" placeholder="Name" />
+      <input id="fr_state" placeholder="State" style="max-width:140px" />
+      <button id="addFranchiseBtn">+ Add</button>
+    </div>
+    <div id="franchisesTable"><div class="empty">Loading…</div></div>
+  </div>`;
+  async function refresh() {
+    const franchises = await api('/api/franchises');
+    document.getElementById('franchisesTable').innerHTML = franchises.length
+      ? `<table><thead><tr><th>Code</th><th>Name</th><th>State</th><th>Status</th></tr></thead><tbody>
+          ${franchises.map(f => `<tr><td>${esc(f.franchise_code)}</td><td>${esc(f.franchise_name)}</td><td>${esc(f.state)}</td><td>${esc(f.status)}</td></tr>`).join('')}
+        </tbody></table>`
+      : '<div class="empty">No franchises yet.</div>';
+  }
+  document.getElementById('addFranchiseBtn').addEventListener('click', async () => {
+    try {
+      await api('/api/franchises', { method: 'POST', body: JSON.stringify({
+        franchise_code: document.getElementById('fr_code').value.trim(),
+        franchise_name: document.getElementById('fr_name').value.trim(),
+        state: document.getElementById('fr_state').value.trim(),
+      })});
+      toast('Franchise added', 'success'); refresh();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+  refresh().catch(e => { document.getElementById('franchisesTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+}
+
+// ---------- Rewards ----------
+async function loadRewards() {
+  const el = document.getElementById('tab-rewards');
+  el.innerHTML = `<div class="panel"><h2>Rewards</h2>
+    <div class="row">
+      <input id="rw_name" placeholder="Reward name" />
+      <input id="rw_pv" placeholder="Criteria PV" type="number" style="max-width:120px" />
+      <input id="rw_value" placeholder="Reward value" style="max-width:160px" />
+      <button id="addRewardBtn">+ Add</button>
+    </div>
+    <div id="rewardsTable"><div class="empty">Loading…</div></div>
+  </div>`;
+  async function refresh() {
+    const rewards = await api('/api/rewards');
+    document.getElementById('rewardsTable').innerHTML = rewards.length
+      ? `<table><thead><tr><th>Name</th><th>Criteria PV</th><th>Value</th></tr></thead><tbody>
+          ${rewards.map(r => `<tr><td>${esc(r.reward_name)}</td><td>${r.criteria_pv}</td><td>${esc(r.reward_value)}</td></tr>`).join('')}
+        </tbody></table>`
+      : '<div class="empty">No rewards defined yet.</div>';
+  }
+  document.getElementById('addRewardBtn').addEventListener('click', async () => {
+    try {
+      await api('/api/rewards', { method: 'POST', body: JSON.stringify({
+        reward_name: document.getElementById('rw_name').value.trim(),
+        criteria_pv: Number(document.getElementById('rw_pv').value) || 0,
+        reward_value: document.getElementById('rw_value').value.trim(),
+      })});
+      toast('Reward added', 'success'); refresh();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+  refresh().catch(e => { document.getElementById('rewardsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+}
+
+// ---------- Boot ----------
+if (API_KEY) {
+  api('/api/settings/commission').then(showApp).catch(() => showLogin('Saved key no longer works — enter it again.'));
+} else {
+  showLogin();
+}
+</script>
+</body>
+</html>
