@@ -25,6 +25,11 @@ if (!fetchFn) {
 const nodeFetch = require("node-fetch");
 const { HttpsProxyAgent } = require("https-proxy-agent");
 
+// Phase 0 of the store.airxplus.com / admin.airxplus.com integration —
+// see MLM_INTEGRATION_PLAN.md. Products/franchises/members/etc. live in a
+// real SQLite database (db.js) rather than flat JSON files.
+const { db } = require("./db.js");
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 const LEADS_FILE = path.join(__dirname, "data", "leads.json");
@@ -1101,6 +1106,549 @@ app.post("/api/whatsapp/delivery-followup", requireApiKey, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// =====================================================================
+// PHASE 1 — PRODUCT & FRANCHISE MASTER (mirrors store.airxplus.com)
+// See MLM_INTEGRATION_PLAN.md. Backed by SQLite (db.js), not JSON files.
+// =====================================================================
+
+// ---------- Products ----------
+
+app.get("/api/products", requireApiKey, (req, res) => {
+  const rows = db.prepare("SELECT * FROM products ORDER BY name").all();
+  res.json(rows);
+});
+
+app.get("/api/products/:sku", requireApiKey, (req, res) => {
+  const row = db.prepare("SELECT * FROM products WHERE sku = ?").get(req.params.sku);
+  if (!row) return res.status(404).json({ error: "not found" });
+  res.json(row);
+});
+
+app.post("/api/products", requireApiKey, (req, res) => {
+  const { sku, name, category, dp_price, mrp_price, pv, bv, status } = req.body;
+  if (!sku || !name) return res.status(400).json({ error: "sku and name are required" });
+  try {
+    db.prepare(
+      `INSERT INTO products (sku, name, category, dp_price, mrp_price, pv, bv, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      sku,
+      name,
+      category || null,
+      Number(dp_price) || 0,
+      Number(mrp_price) || 0,
+      Number(pv) || 0,
+      Number(bv) || 0,
+      status || "Active"
+    );
+  } catch (err) {
+    if (String(err.message).includes("UNIQUE")) {
+      return res.status(409).json({ error: `sku "${sku}" already exists` });
+    }
+    return res.status(500).json({ error: err.message });
+  }
+  const row = db.prepare("SELECT * FROM products WHERE sku = ?").get(sku);
+  res.json(row);
+});
+
+app.patch("/api/products/:sku", requireApiKey, (req, res) => {
+  const existing = db.prepare("SELECT * FROM products WHERE sku = ?").get(req.params.sku);
+  if (!existing) return res.status(404).json({ error: "not found" });
+  const merged = { ...existing, ...req.body };
+  db.prepare(
+    `UPDATE products SET name=?, category=?, dp_price=?, mrp_price=?, pv=?, bv=?, status=?,
+     updated_at=datetime('now') WHERE sku=?`
+  ).run(
+    merged.name,
+    merged.category,
+    Number(merged.dp_price) || 0,
+    Number(merged.mrp_price) || 0,
+    Number(merged.pv) || 0,
+    Number(merged.bv) || 0,
+    merged.status,
+    req.params.sku
+  );
+  const row = db.prepare("SELECT * FROM products WHERE sku = ?").get(req.params.sku);
+  res.json(row);
+});
+
+app.delete("/api/products/:sku", requireApiKey, (req, res) => {
+  const result = db.prepare("DELETE FROM products WHERE sku = ?").run(req.params.sku);
+  res.json({ deleted: result.changes > 0 });
+});
+
+// ---------- Franchises ----------
+
+app.get("/api/franchises", requireApiKey, (req, res) => {
+  const rows = db.prepare("SELECT * FROM franchises ORDER BY franchise_name").all();
+  res.json(rows);
+});
+
+app.get("/api/franchises/:code", requireApiKey, (req, res) => {
+  const row = db
+    .prepare("SELECT * FROM franchises WHERE franchise_code = ?")
+    .get(req.params.code);
+  if (!row) return res.status(404).json({ error: "not found" });
+  res.json(row);
+});
+
+// Direct children of a franchise (one level) — building block for the
+// full "Distributor Tree" / "Franchise Details" view later.
+app.get("/api/franchises/:code/children", requireApiKey, (req, res) => {
+  const rows = db
+    .prepare("SELECT * FROM franchises WHERE parent_franchise_code = ? ORDER BY franchise_name")
+    .all(req.params.code);
+  res.json(rows);
+});
+
+app.post("/api/franchises", requireApiKey, (req, res) => {
+  const {
+    franchise_code,
+    franchise_name,
+    parent_franchise_code,
+    contact_name,
+    contact_mobile,
+    address,
+    state,
+    status,
+  } = req.body;
+  if (!franchise_code || !franchise_name) {
+    return res.status(400).json({ error: "franchise_code and franchise_name are required" });
+  }
+  if (parent_franchise_code) {
+    const parent = db
+      .prepare("SELECT franchise_code FROM franchises WHERE franchise_code = ?")
+      .get(parent_franchise_code);
+    if (!parent) {
+      return res.status(400).json({ error: `parent_franchise_code "${parent_franchise_code}" does not exist` });
+    }
+  }
+  try {
+    db.prepare(
+      `INSERT INTO franchises
+       (franchise_code, franchise_name, parent_franchise_code, contact_name, contact_mobile, address, state, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      franchise_code,
+      franchise_name,
+      parent_franchise_code || null,
+      contact_name || null,
+      contact_mobile || null,
+      address || null,
+      state || null,
+      status || "Active"
+    );
+  } catch (err) {
+    if (String(err.message).includes("UNIQUE")) {
+      return res.status(409).json({ error: `franchise_code "${franchise_code}" already exists` });
+    }
+    return res.status(500).json({ error: err.message });
+  }
+  const row = db.prepare("SELECT * FROM franchises WHERE franchise_code = ?").get(franchise_code);
+  res.json(row);
+});
+
+app.patch("/api/franchises/:code", requireApiKey, (req, res) => {
+  const existing = db
+    .prepare("SELECT * FROM franchises WHERE franchise_code = ?")
+    .get(req.params.code);
+  if (!existing) return res.status(404).json({ error: "not found" });
+  const merged = { ...existing, ...req.body };
+  db.prepare(
+    `UPDATE franchises SET franchise_name=?, parent_franchise_code=?, contact_name=?,
+     contact_mobile=?, address=?, state=?, status=?, updated_at=datetime('now')
+     WHERE franchise_code=?`
+  ).run(
+    merged.franchise_name,
+    merged.parent_franchise_code,
+    merged.contact_name,
+    merged.contact_mobile,
+    merged.address,
+    merged.state,
+    merged.status,
+    req.params.code
+  );
+  const row = db
+    .prepare("SELECT * FROM franchises WHERE franchise_code = ?")
+    .get(req.params.code);
+  res.json(row);
+});
+
+app.delete("/api/franchises/:code", requireApiKey, (req, res) => {
+  const result = db.prepare("DELETE FROM franchises WHERE franchise_code = ?").run(req.params.code);
+  res.json({ deleted: result.changes > 0 });
+});
+
+// ---------- Franchise warehouse stock ----------
+// (separate from the existing /api/inventory JSON store, which tracks
+// sellable stock used by the India Post booking auto-decrement — this
+// tracks stock PER FRANCHISE WAREHOUSE, matching store.airxplus.com's
+// warehouseView.aspx / warehouse.aspx.)
+
+app.get("/api/franchise-stock", requireApiKey, (req, res) => {
+  const { franchise_code } = req.query;
+  const rows = franchise_code
+    ? db
+        .prepare("SELECT * FROM franchise_stock WHERE franchise_code = ? ORDER BY sku")
+        .all(franchise_code)
+    : db.prepare("SELECT * FROM franchise_stock ORDER BY franchise_code, sku").all();
+  res.json(rows);
+});
+
+app.post("/api/franchise-stock", requireApiKey, (req, res) => {
+  const { franchise_code, sku, quantity } = req.body;
+  if (!franchise_code || !sku) {
+    return res.status(400).json({ error: "franchise_code and sku are required" });
+  }
+  const franchise = db
+    .prepare("SELECT franchise_code FROM franchises WHERE franchise_code = ?")
+    .get(franchise_code);
+  if (!franchise) return res.status(400).json({ error: `unknown franchise_code "${franchise_code}"` });
+  const product = db.prepare("SELECT sku FROM products WHERE sku = ?").get(sku);
+  if (!product) return res.status(400).json({ error: `unknown sku "${sku}"` });
+
+  db.prepare(
+    `INSERT INTO franchise_stock (franchise_code, sku, quantity)
+     VALUES (?, ?, ?)
+     ON CONFLICT(franchise_code, sku) DO UPDATE SET
+       quantity = excluded.quantity, updated_at = datetime('now')`
+  ).run(franchise_code, sku, Number(quantity) || 0);
+
+  const row = db
+    .prepare("SELECT * FROM franchise_stock WHERE franchise_code = ? AND sku = ?")
+    .get(franchise_code, sku);
+  res.json(row);
+});
+
+// Adjust stock by a delta (positive = stock in, negative = stock out) —
+// convenient for "dispatch N units to franchise X" style calls later.
+app.patch("/api/franchise-stock/:franchise_code/:sku", requireApiKey, (req, res) => {
+  const { franchise_code, sku } = req.params;
+  const existing = db
+    .prepare("SELECT * FROM franchise_stock WHERE franchise_code = ? AND sku = ?")
+    .get(franchise_code, sku);
+  if (!existing) return res.status(404).json({ error: "not found" });
+  const delta = Number(req.body.delta) || 0;
+  const newQty = existing.quantity + delta;
+  if (newQty < 0) return res.status(400).json({ error: "resulting quantity would be negative" });
+  db.prepare(
+    "UPDATE franchise_stock SET quantity = ?, updated_at = datetime('now') WHERE franchise_code = ? AND sku = ?"
+  ).run(newQty, franchise_code, sku);
+  const row = db
+    .prepare("SELECT * FROM franchise_stock WHERE franchise_code = ? AND sku = ?")
+    .get(franchise_code, sku);
+  res.json(row);
+});
+
+// =====================================================================
+// PHASE 2 — DISTRIBUTOR / MEMBER MASTER (mirrors admin.airxplus.com "Member")
+// See MLM_INTEGRATION_PLAN.md.
+// =====================================================================
+
+app.get("/api/members", requireApiKey, (req, res) => {
+  const { status, sponsor_code } = req.query;
+  let sql = "SELECT * FROM members";
+  const clauses = [];
+  const params = [];
+  if (status) {
+    clauses.push("status = ?");
+    params.push(status);
+  }
+  if (sponsor_code) {
+    clauses.push("sponsor_code = ?");
+    params.push(sponsor_code);
+  }
+  if (clauses.length) sql += " WHERE " + clauses.join(" AND ");
+  sql += " ORDER BY name";
+  res.json(db.prepare(sql).all(...params));
+});
+
+app.get("/api/members/:code", requireApiKey, (req, res) => {
+  const row = db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code);
+  if (!row) return res.status(404).json({ error: "not found" });
+  res.json(row);
+});
+
+// Direct downline only (one level) — mirrors "Downline Members".
+app.get("/api/members/:code/downline", requireApiKey, (req, res) => {
+  const rows = db
+    .prepare("SELECT * FROM members WHERE sponsor_code = ? ORDER BY joined_at")
+    .all(req.params.code);
+  res.json(rows);
+});
+
+// Full recursive downline tree — mirrors "Leg Structure" / "Distributor Tree".
+// Walked in JS (not a SQL recursive CTE) with a depth guard, so a bad/cyclic
+// sponsor_code in the data can never spin this into an infinite loop.
+app.get("/api/members/:code/tree", requireApiKey, (req, res) => {
+  const root = db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code);
+  if (!root) return res.status(404).json({ error: "not found" });
+
+  const MAX_DEPTH = 50;
+  function buildNode(member, depth, seen) {
+    if (depth > MAX_DEPTH || seen.has(member.member_code)) {
+      return { ...member, children: [], truncated: true };
+    }
+    seen.add(member.member_code);
+    const children = db
+      .prepare("SELECT * FROM members WHERE sponsor_code = ? ORDER BY joined_at")
+      .all(member.member_code)
+      .map((child) => buildNode(child, depth + 1, seen));
+    return { ...member, children };
+  }
+  res.json(buildNode(root, 0, new Set()));
+});
+
+app.post("/api/members", requireApiKey, (req, res) => {
+  const {
+    member_code,
+    name,
+    sponsor_code,
+    placement_leg,
+    mobile,
+    email,
+    pan_number,
+    bank_account_number,
+    bank_ifsc,
+    bank_name,
+    kyc_status,
+    status,
+  } = req.body;
+  if (!member_code || !name) {
+    return res.status(400).json({ error: "member_code and name are required" });
+  }
+  if (sponsor_code) {
+    const sponsor = db.prepare("SELECT member_code FROM members WHERE member_code = ?").get(sponsor_code);
+    if (!sponsor) return res.status(400).json({ error: `unknown sponsor_code "${sponsor_code}"` });
+  }
+  try {
+    db.prepare(
+      `INSERT INTO members
+       (member_code, name, sponsor_code, placement_leg, mobile, email, pan_number,
+        bank_account_number, bank_ifsc, bank_name, kyc_status, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      member_code,
+      name,
+      sponsor_code || null,
+      placement_leg || null,
+      mobile || null,
+      email || null,
+      pan_number || null,
+      bank_account_number || null,
+      bank_ifsc || null,
+      bank_name || null,
+      kyc_status || "Pending",
+      status || "Active"
+    );
+  } catch (err) {
+    if (String(err.message).includes("UNIQUE")) {
+      return res.status(409).json({ error: `member_code "${member_code}" already exists` });
+    }
+    return res.status(500).json({ error: err.message });
+  }
+  res.json(db.prepare("SELECT * FROM members WHERE member_code = ?").get(member_code));
+});
+
+app.patch("/api/members/:code", requireApiKey, (req, res) => {
+  const existing = db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code);
+  if (!existing) return res.status(404).json({ error: "not found" });
+  const merged = { ...existing, ...req.body };
+  db.prepare(
+    `UPDATE members SET name=?, sponsor_code=?, placement_leg=?, mobile=?, email=?,
+     pan_number=?, bank_account_number=?, bank_ifsc=?, bank_name=?, kyc_status=?, status=?,
+     updated_at=datetime('now') WHERE member_code=?`
+  ).run(
+    merged.name,
+    merged.sponsor_code,
+    merged.placement_leg,
+    merged.mobile,
+    merged.email,
+    merged.pan_number,
+    merged.bank_account_number,
+    merged.bank_ifsc,
+    merged.bank_name,
+    merged.kyc_status,
+    merged.status,
+    req.params.code
+  );
+  res.json(db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code));
+});
+
+// Convenience endpoints mirroring admin.airxplus.com's "Block Id" / "Unblock Id" /
+// "Manual Active" — same PATCH under the hood, just named for what the ops team
+// actually does day to day.
+app.post("/api/members/:code/block", requireApiKey, (req, res) => {
+  const existing = db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code);
+  if (!existing) return res.status(404).json({ error: "not found" });
+  db.prepare("UPDATE members SET status='Blocked', updated_at=datetime('now') WHERE member_code=?").run(req.params.code);
+  res.json(db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code));
+});
+
+app.post("/api/members/:code/unblock", requireApiKey, (req, res) => {
+  const existing = db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code);
+  if (!existing) return res.status(404).json({ error: "not found" });
+  db.prepare("UPDATE members SET status='Active', updated_at=datetime('now') WHERE member_code=?").run(req.params.code);
+  res.json(db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code));
+});
+
+app.delete("/api/members/:code", requireApiKey, (req, res) => {
+  const result = db.prepare("DELETE FROM members WHERE member_code = ?").run(req.params.code);
+  res.json({ deleted: result.changes > 0 });
+});
+
+// =====================================================================
+// PHASE 4 — REWARDS & REPORTING (mirrors admin.airxplus.com "Reward"/"Reports")
+// See MLM_INTEGRATION_PLAN.md. Note: the reports below just aggregate
+// whatever pv_ledger / wallet_transactions rows already exist — Phase 3
+// (which actually WRITES those rows, i.e. the real compensation-plan
+// calculation) is still pending AIRX's compensation plan document, so
+// these reports will show zeros until that's built.
+// =====================================================================
+
+// ---------- Rewards master ----------
+
+app.get("/api/rewards", requireApiKey, (req, res) => {
+  res.json(db.prepare("SELECT * FROM rewards ORDER BY criteria_pv").all());
+});
+
+app.post("/api/rewards", requireApiKey, (req, res) => {
+  const { reward_name, criteria_pv, reward_value, session_label } = req.body;
+  if (!reward_name) return res.status(400).json({ error: "reward_name is required" });
+  const result = db
+    .prepare(
+      "INSERT INTO rewards (reward_name, criteria_pv, reward_value, session_label) VALUES (?, ?, ?, ?)"
+    )
+    .run(reward_name, Number(criteria_pv) || 0, reward_value || null, session_label || null);
+  res.json(db.prepare("SELECT * FROM rewards WHERE id = ?").get(result.lastInsertRowid));
+});
+
+app.patch("/api/rewards/:id", requireApiKey, (req, res) => {
+  const existing = db.prepare("SELECT * FROM rewards WHERE id = ?").get(req.params.id);
+  if (!existing) return res.status(404).json({ error: "not found" });
+  const merged = { ...existing, ...req.body };
+  db.prepare(
+    "UPDATE rewards SET reward_name=?, criteria_pv=?, reward_value=?, session_label=? WHERE id=?"
+  ).run(merged.reward_name, Number(merged.criteria_pv) || 0, merged.reward_value, merged.session_label, req.params.id);
+  res.json(db.prepare("SELECT * FROM rewards WHERE id = ?").get(req.params.id));
+});
+
+app.delete("/api/rewards/:id", requireApiKey, (req, res) => {
+  const result = db.prepare("DELETE FROM rewards WHERE id = ?").run(req.params.id);
+  res.json({ deleted: result.changes > 0 });
+});
+
+// ---------- Reward achievers (mirrors "Reward Details" / "Rank Achivers List") ----------
+
+app.get("/api/reward-achievers", requireApiKey, (req, res) => {
+  const { member_code, reward_id } = req.query;
+  let sql = `SELECT reward_achievers.*, rewards.reward_name, rewards.reward_value, members.name AS member_name
+             FROM reward_achievers
+             JOIN rewards ON rewards.id = reward_achievers.reward_id
+             JOIN members ON members.member_code = reward_achievers.member_code`;
+  const clauses = [];
+  const params = [];
+  if (member_code) {
+    clauses.push("reward_achievers.member_code = ?");
+    params.push(member_code);
+  }
+  if (reward_id) {
+    clauses.push("reward_achievers.reward_id = ?");
+    params.push(reward_id);
+  }
+  if (clauses.length) sql += " WHERE " + clauses.join(" AND ");
+  sql += " ORDER BY reward_achievers.achieved_at DESC";
+  res.json(db.prepare(sql).all(...params));
+});
+
+app.post("/api/reward-achievers", requireApiKey, (req, res) => {
+  const { member_code, reward_id } = req.body;
+  if (!member_code || !reward_id) {
+    return res.status(400).json({ error: "member_code and reward_id are required" });
+  }
+  const member = db.prepare("SELECT member_code FROM members WHERE member_code = ?").get(member_code);
+  if (!member) return res.status(400).json({ error: `unknown member_code "${member_code}"` });
+  const reward = db.prepare("SELECT id FROM rewards WHERE id = ?").get(reward_id);
+  if (!reward) return res.status(400).json({ error: `unknown reward_id "${reward_id}"` });
+  const result = db
+    .prepare("INSERT INTO reward_achievers (member_code, reward_id) VALUES (?, ?)")
+    .run(member_code, reward_id);
+  res.json(db.prepare("SELECT * FROM reward_achievers WHERE id = ?").get(result.lastInsertRowid));
+});
+
+app.delete("/api/reward-achievers/:id", requireApiKey, (req, res) => {
+  const result = db.prepare("DELETE FROM reward_achievers WHERE id = ?").run(req.params.id);
+  res.json({ deleted: result.changes > 0 });
+});
+
+// ---------- Reports ----------
+
+// "Member Balance" — nets every wallet_transactions row for one member.
+app.get("/api/reports/member-balance/:code", requireApiKey, (req, res) => {
+  const member = db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code);
+  if (!member) return res.status(404).json({ error: "not found" });
+  const row = db
+    .prepare(
+      `SELECT
+         COALESCE(SUM(CASE WHEN txn_type = 'credit' THEN amount ELSE 0 END), 0) AS total_credit,
+         COALESCE(SUM(CASE WHEN txn_type = 'debit' THEN amount ELSE 0 END), 0) AS total_debit
+       FROM wallet_transactions WHERE member_code = ?`
+    )
+    .get(req.params.code);
+  res.json({
+    member_code: req.params.code,
+    total_credit: row.total_credit,
+    total_debit: row.total_debit,
+    balance: row.total_credit - row.total_debit,
+  });
+});
+
+// "Downline PV Detail" — this member's own PV plus every downline member's PV,
+// walked the same cycle-safe way as /api/members/:code/tree.
+app.get("/api/reports/downline-pv/:code", requireApiKey, (req, res) => {
+  const root = db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code);
+  if (!root) return res.status(404).json({ error: "not found" });
+
+  const pvStmt = db.prepare(
+    `SELECT COALESCE(SUM(pv), 0) AS pv, COALESCE(SUM(bv), 0) AS bv FROM pv_ledger WHERE member_code = ?`
+  );
+  const childrenStmt = db.prepare("SELECT member_code FROM members WHERE sponsor_code = ?");
+
+  const MAX_DEPTH = 50;
+  const seen = new Set();
+  let totalPv = 0;
+  let totalBv = 0;
+  const perMember = [];
+
+  function walk(code, depth) {
+    if (depth > MAX_DEPTH || seen.has(code)) return;
+    seen.add(code);
+    const { pv, bv } = pvStmt.get(code);
+    totalPv += pv;
+    totalBv += bv;
+    perMember.push({ member_code: code, pv, bv });
+    for (const child of childrenStmt.all(code)) walk(child.member_code, depth + 1);
+  }
+  walk(req.params.code, 0);
+
+  res.json({ member_code: req.params.code, total_pv: totalPv, total_bv: totalBv, members: perMember });
+});
+
+// "Rank Achivers List" — every reward achieved, most recent first.
+app.get("/api/reports/rank-achievers", requireApiKey, (req, res) => {
+  res.json(
+    db
+      .prepare(
+        `SELECT reward_achievers.*, rewards.reward_name, members.name AS member_name
+         FROM reward_achievers
+         JOIN rewards ON rewards.id = reward_achievers.reward_id
+         JOIN members ON members.member_code = reward_achievers.member_code
+         ORDER BY reward_achievers.achieved_at DESC`
+      )
+      .all()
+  );
 });
 
 app.get("/health", (req, res) => res.json({ ok: true, time: new Date().toISOString() }));

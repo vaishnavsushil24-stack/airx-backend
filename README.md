@@ -242,3 +242,91 @@ product questions automatically over WhatsApp the moment they come in
 link once they're ready to buy. AI voice calling is a later phase — it
 needs a telephony provider and costs per minute, so it's worth proving out
 the WhatsApp flow first.
+
+## 9. MLM integration (replacing store.airxplus.com + admin.airxplus.com)
+
+Full plan and phase breakdown: see `MLM_INTEGRATION_PLAN.md` in this repo.
+Short version: those two legacy sites are being folded into AIRX Ops —
+`store.airxplus.com` is the (currently empty) product/franchise ERP,
+`admin.airxplus.com` is the live MLM distributor/commission engine
+(members, downline, PV/BV, weekly payout, TDS, rewards). Both get rebuilt
+here, phase by phase, so they can eventually be retired.
+
+**Phase 0 — database (done).** Added `db.js`, backed by Node's built-in
+`node:sqlite` module (no `better-sqlite3`/native compile needed — just
+plain Node 22.5+). The database file lives at `data/airx.db`, next to the
+existing `leads.json`/`orders.json`, so it gets whatever disk persistence
+Render already gives that folder. **Important:** this repo now requires
+**Node ≥ 22.5** (`package.json` "engines" + `.node-version` pin it, and
+`.npmrc` has `engine-strict=true` so the Render build fails loudly instead
+of crashing at runtime if the wrong Node version is selected). If the
+Render service's Node version setting is older, update it in the Render
+dashboard (Settings → Environment → Node Version, or set a `NODE_VERSION`
+env var) before this deploy will boot.
+
+**Phase 1 — Product & Franchise Master (done).** Mirrors
+store.airxplus.com's Master/Product and Franchise sections. All endpoints
+need the `x-api-key` header like the rest of the API:
+
+- `GET/POST /api/products`, `GET/PATCH/DELETE /api/products/:sku` — product
+  catalog (sku, name, category, dp_price, mrp_price, pv, bv, status). Note:
+  this is separate from the existing `/api/inventory` JSON store, which
+  only tracks sellable stock for the India Post auto-decrement — `products`
+  is the fuller catalog (pricing tiers, PV/BV point values for the
+  compensation engine later).
+- `GET/POST /api/franchises`, `GET/PATCH/DELETE /api/franchises/:code`,
+  `GET /api/franchises/:code/children` — franchise master with
+  parent-child hierarchy (`parent_franchise_code`).
+- `GET/POST /api/franchise-stock`, `PATCH /api/franchise-stock/:code/:sku`
+  — per-franchise warehouse stock (PATCH takes `{ "delta": ±N }` to
+  add/remove stock rather than needing the caller to know the current
+  quantity).
+
+**Phase 2 — Distributor / Member Master (done).** Mirrors admin.airxplus.com's
+Member section:
+
+- `GET/POST /api/members`, `GET/PATCH/DELETE /api/members/:code` — member
+  profile (sponsor_code, placement_leg, mobile, email, PAN, bank details,
+  kyc_status, status). `GET /api/members?status=Active` and
+  `?sponsor_code=X` filter the list.
+- `GET /api/members/:code/downline` — direct (one-level) downline, mirrors
+  "Downline Members".
+- `GET /api/members/:code/tree` — full recursive downline tree, mirrors
+  "Leg Structure" / "Distributor Tree" (depth-capped at 50 and cycle-safe,
+  so bad sponsor data can't cause an infinite loop).
+- `POST /api/members/:code/block` / `.../unblock` — mirrors "Block Id" /
+  "Unblock Id" / "Manual Active".
+
+**Phase 4 — Rewards & Reporting (done).** Mirrors admin.airxplus.com's
+Reward and Reports sections:
+
+- `GET/POST /api/rewards`, `PATCH/DELETE /api/rewards/:id` — reward master
+  (name, PV criteria, reward value, session label), mirrors "Reward
+  Master"/"Reward Session".
+- `GET/POST/DELETE /api/reward-achievers` (filter with `?member_code=` or
+  `?reward_id=`) — who's earned what, mirrors "Reward Details".
+- `GET /api/reports/member-balance/:code` — nets wallet_transactions into
+  a credit/debit/balance, mirrors "Member Balance".
+- `GET /api/reports/downline-pv/:code` — this member's PV/BV plus every
+  downline member's, mirrors "Downline PV Detail" (same cycle-safe walk as
+  the Phase 2 tree endpoint).
+- `GET /api/reports/rank-achievers` — every reward achieved, most recent
+  first, mirrors "Rank Achivers List".
+
+**Important caveat:** these reports aggregate whatever rows already exist
+in `pv_ledger` / `wallet_transactions` — nothing writes to those tables
+yet, because that's Phase 3 (see below), so today these reports return
+zeros. The reporting *shape* is ready; the data will start flowing once
+Phase 3 is built.
+
+**Phase 3 — PV/BV + weekly payout + TDS engine (NOT STARTED — blocked).**
+This is the one phase Claude will not build from guesswork: the real
+compensation-plan math (level-income %, direct bonus, matching bonus
+rules, how the global auto pool is funded/split, repurchase bonus, rank
+bonus criteria) has to come from AIRX's actual compensation plan
+document, since getting it wrong misallocates real distributor money.
+Waiting on that document (or a decision to reverse-engineer it from
+admin.airxplus.com's historical payout records instead, which is slower
+and less reliable) before this phase starts.
+
+**Phase 5 (cutover)** — after Phase 3 is validated, see the plan doc.
