@@ -59,6 +59,15 @@ app.use(
   })
 );
 
+// Admin dashboard (public/admin.html) — a small same-origin single-page
+// app covering Phases 1-4 (members, commission settings, payout runs,
+// products, franchises, rewards). Same-origin means it can call the API
+// directly with no CORS involved; the API key the admin enters is stored
+// only in that browser's localStorage. Reachable at /admin or /.
+app.use(express.static(path.join(__dirname, "public")));
+app.get("/", (req, res) => res.redirect("/admin.html"));
+app.get("/admin", (req, res) => res.redirect("/admin.html"));
+
 // ---------- tiny file-based storage ----------
 function ensureDataFiles() {
   const dir = path.join(__dirname, "data");
