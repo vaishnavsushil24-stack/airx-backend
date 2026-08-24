@@ -1216,18 +1216,18 @@ app.post("/api/whatsapp/delivery-followup", requireApiKey, async (req, res) => {
 
 // ---------- Products ----------
 
-app.get("/api/products", requireApiKey, (req, res) => {
+app.get("/api/products", requireAccess("products"), (req, res) => {
   const rows = db.prepare("SELECT * FROM products ORDER BY name").all();
   res.json(rows);
 });
 
-app.get("/api/products/:sku", requireApiKey, (req, res) => {
+app.get("/api/products/:sku", requireAccess("products"), (req, res) => {
   const row = db.prepare("SELECT * FROM products WHERE sku = ?").get(req.params.sku);
   if (!row) return res.status(404).json({ error: "not found" });
   res.json(row);
 });
 
-app.post("/api/products", requireApiKey, (req, res) => {
+app.post("/api/products", requireAccess("products"), (req, res) => {
   const { sku, name, category, dp_price, mrp_price, pv, bv, status } = req.body;
   if (!sku || !name) return res.status(400).json({ error: "sku and name are required" });
   try {
@@ -1254,7 +1254,7 @@ app.post("/api/products", requireApiKey, (req, res) => {
   res.json(row);
 });
 
-app.patch("/api/products/:sku", requireApiKey, (req, res) => {
+app.patch("/api/products/:sku", requireAccess("products"), (req, res) => {
   const existing = db.prepare("SELECT * FROM products WHERE sku = ?").get(req.params.sku);
   if (!existing) return res.status(404).json({ error: "not found" });
   const merged = { ...existing, ...req.body };
@@ -1275,19 +1275,19 @@ app.patch("/api/products/:sku", requireApiKey, (req, res) => {
   res.json(row);
 });
 
-app.delete("/api/products/:sku", requireApiKey, (req, res) => {
+app.delete("/api/products/:sku", requireAccess("products"), (req, res) => {
   const result = db.prepare("DELETE FROM products WHERE sku = ?").run(req.params.sku);
   res.json({ deleted: result.changes > 0 });
 });
 
 // ---------- Franchises ----------
 
-app.get("/api/franchises", requireApiKey, (req, res) => {
+app.get("/api/franchises", requireAccess("franchises"), (req, res) => {
   const rows = db.prepare("SELECT * FROM franchises ORDER BY franchise_name").all();
   res.json(rows);
 });
 
-app.get("/api/franchises/:code", requireApiKey, (req, res) => {
+app.get("/api/franchises/:code", requireAccess("franchises"), (req, res) => {
   const row = db
     .prepare("SELECT * FROM franchises WHERE franchise_code = ?")
     .get(req.params.code);
@@ -1297,14 +1297,14 @@ app.get("/api/franchises/:code", requireApiKey, (req, res) => {
 
 // Direct children of a franchise (one level) — building block for the
 // full "Distributor Tree" / "Franchise Details" view later.
-app.get("/api/franchises/:code/children", requireApiKey, (req, res) => {
+app.get("/api/franchises/:code/children", requireAccess("franchises"), (req, res) => {
   const rows = db
     .prepare("SELECT * FROM franchises WHERE parent_franchise_code = ? ORDER BY franchise_name")
     .all(req.params.code);
   res.json(rows);
 });
 
-app.post("/api/franchises", requireApiKey, (req, res) => {
+app.post("/api/franchises", requireAccess("franchises"), (req, res) => {
   const {
     franchise_code,
     franchise_name,
@@ -1351,7 +1351,7 @@ app.post("/api/franchises", requireApiKey, (req, res) => {
   res.json(row);
 });
 
-app.patch("/api/franchises/:code", requireApiKey, (req, res) => {
+app.patch("/api/franchises/:code", requireAccess("franchises"), (req, res) => {
   const existing = db
     .prepare("SELECT * FROM franchises WHERE franchise_code = ?")
     .get(req.params.code);
@@ -1377,7 +1377,7 @@ app.patch("/api/franchises/:code", requireApiKey, (req, res) => {
   res.json(row);
 });
 
-app.delete("/api/franchises/:code", requireApiKey, (req, res) => {
+app.delete("/api/franchises/:code", requireAccess("franchises"), (req, res) => {
   const result = db.prepare("DELETE FROM franchises WHERE franchise_code = ?").run(req.params.code);
   res.json({ deleted: result.changes > 0 });
 });
@@ -1448,7 +1448,7 @@ app.patch("/api/franchise-stock/:franchise_code/:sku", requireApiKey, (req, res)
 // See MLM_INTEGRATION_PLAN.md.
 // =====================================================================
 
-app.get("/api/members", requireApiKey, (req, res) => {
+app.get("/api/members", requireAccess("members"), (req, res) => {
   const { status, sponsor_code } = req.query;
   let sql = "SELECT * FROM members";
   const clauses = [];
@@ -1466,14 +1466,14 @@ app.get("/api/members", requireApiKey, (req, res) => {
   res.json(db.prepare(sql).all(...params));
 });
 
-app.get("/api/members/:code", requireApiKey, (req, res) => {
+app.get("/api/members/:code", requireAccess("members"), (req, res) => {
   const row = db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code);
   if (!row) return res.status(404).json({ error: "not found" });
   res.json(row);
 });
 
 // Direct downline only (one level) — mirrors "Downline Members".
-app.get("/api/members/:code/downline", requireApiKey, (req, res) => {
+app.get("/api/members/:code/downline", requireAccess("members"), (req, res) => {
   const rows = db
     .prepare("SELECT * FROM members WHERE sponsor_code = ? ORDER BY joined_at")
     .all(req.params.code);
@@ -1483,7 +1483,7 @@ app.get("/api/members/:code/downline", requireApiKey, (req, res) => {
 // Full recursive downline tree — mirrors "Leg Structure" / "Distributor Tree".
 // Walked in JS (not a SQL recursive CTE) with a depth guard, so a bad/cyclic
 // sponsor_code in the data can never spin this into an infinite loop.
-app.get("/api/members/:code/tree", requireApiKey, (req, res) => {
+app.get("/api/members/:code/tree", requireAccess("members"), (req, res) => {
   const root = db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code);
   if (!root) return res.status(404).json({ error: "not found" });
 
@@ -1515,7 +1515,7 @@ function generateMemberCode() {
   throw new Error("could not generate a unique member_code — try again");
 }
 
-app.post("/api/members", requireApiKey, (req, res) => {
+app.post("/api/members", requireAccess("members"), (req, res) => {
   const {
     name,
     sponsor_code,
@@ -1604,7 +1604,7 @@ function parseLegacyDate(s) {
 // sponsor_code left NULL (always satisfies the FK), pass 2 wires up
 // sponsor_code now that every member_code in the batch is guaranteed to
 // exist — avoids "child imported before parent" failures entirely.
-app.post("/api/members/bulk-import", requireApiKey, (req, res) => {
+app.post("/api/members/bulk-import", requireAccess("members"), (req, res) => {
   const rows = Array.isArray(req.body?.rows) ? req.body.rows : null;
   if (!rows) return res.status(400).json({ error: "body must be { rows: [...] }" });
 
@@ -1690,7 +1690,7 @@ app.post("/api/members/bulk-import", requireApiKey, (req, res) => {
 // sequential placeholder names, or a mobile/PAN shared by several
 // "different" people. Never deletes anything — only sets likely_dummy +
 // dummy_reason so reports/UI can filter.
-app.post("/api/members/flag-dummies", requireApiKey, (req, res) => {
+app.post("/api/members/flag-dummies", requireAccess("members"), (req, res) => {
   const namePattern = /^(mr|mrs|ms)?\.?\s*(airx|mahadev|pranvayu|test|demo|dummy|sample)\s*\d+$/i;
 
   const mobileDupes = db
@@ -1741,7 +1741,7 @@ app.post("/api/members/flag-dummies", requireApiKey, (req, res) => {
   res.json({ total_members: all.length, flagged_dummy: flagged, clean: all.length - flagged });
 });
 
-app.get("/api/reports/dummy-summary", requireApiKey, (req, res) => {
+app.get("/api/reports/dummy-summary", requireAccess("dashboard"), (req, res) => {
   const total = db.prepare("SELECT COUNT(*) AS n FROM members").get().n;
   const dummy = db.prepare("SELECT COUNT(*) AS n FROM members WHERE likely_dummy = 1").get().n;
   const bySource = db.prepare("SELECT data_source, COUNT(*) AS n FROM members GROUP BY data_source").all();
@@ -1753,7 +1753,7 @@ app.get("/api/reports/dummy-summary", requireApiKey, (req, res) => {
   });
 });
 
-app.patch("/api/members/:code", requireApiKey, (req, res) => {
+app.patch("/api/members/:code", requireAccess("members"), (req, res) => {
   const existing = db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code);
   if (!existing) return res.status(404).json({ error: "not found" });
   const merged = { ...existing, ...req.body };
@@ -1781,14 +1781,14 @@ app.patch("/api/members/:code", requireApiKey, (req, res) => {
 // Convenience endpoints mirroring admin.airxplus.com's "Block Id" / "Unblock Id" /
 // "Manual Active" — same PATCH under the hood, just named for what the ops team
 // actually does day to day.
-app.post("/api/members/:code/block", requireApiKey, (req, res) => {
+app.post("/api/members/:code/block", requireAccess("members"), (req, res) => {
   const existing = db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code);
   if (!existing) return res.status(404).json({ error: "not found" });
   db.prepare("UPDATE members SET status='Blocked', updated_at=datetime('now') WHERE member_code=?").run(req.params.code);
   res.json(db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code));
 });
 
-app.post("/api/members/:code/unblock", requireApiKey, (req, res) => {
+app.post("/api/members/:code/unblock", requireAccess("members"), (req, res) => {
   const existing = db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code);
   if (!existing) return res.status(404).json({ error: "not found" });
   db.prepare("UPDATE members SET status='Active', updated_at=datetime('now') WHERE member_code=?").run(req.params.code);
@@ -1807,7 +1807,7 @@ app.post("/api/members/:code/unblock", requireApiKey, (req, res) => {
 // is the right tool there — and only actually delete when a member is
 // "clean" (no money history, no downline), cascading the safe metadata
 // (KYC docs, audit log, empty pv_balance row) that's fine to remove.
-app.delete("/api/members/:code", requireApiKey, (req, res) => {
+app.delete("/api/members/:code", requireAccess("members"), (req, res) => {
   const existing = db.prepare("SELECT member_code FROM members WHERE member_code = ?").get(req.params.code);
   if (!existing) return res.json({ deleted: false });
 
@@ -1994,11 +1994,11 @@ function computeMatching(periodLabel) {
 
 // ---------- Commission settings (this IS the "admin manages the plan" screen) ----------
 
-app.get("/api/settings/commission", requireApiKey, (req, res) => {
+app.get("/api/settings/commission", requireAccess("commission"), (req, res) => {
   res.json(db.prepare("SELECT * FROM commission_settings ORDER BY setting_key").all());
 });
 
-app.put("/api/settings/commission", requireApiKey, (req, res) => {
+app.put("/api/settings/commission", requireAccess("commission"), (req, res) => {
   const updates = req.body || {};
   const stmt = db.prepare(
     `INSERT INTO commission_settings (setting_key, setting_value, label)
@@ -2014,12 +2014,12 @@ app.put("/api/settings/commission", requireApiKey, (req, res) => {
 
 // ---------- Weekly matching payout run (preview, read-only, then commit) ----------
 
-app.get("/api/payouts/preview", requireApiKey, (req, res) => {
+app.get("/api/payouts/preview", requireAccess("payouts"), (req, res) => {
   const periodLabel = req.query.period || `PREVIEW-${new Date().toISOString().slice(0, 10)}`;
   res.json(computeMatching(periodLabel));
 });
 
-app.post("/api/payouts/commit", requireApiKey, (req, res) => {
+app.post("/api/payouts/commit", requireAccess("payouts"), (req, res) => {
   const { period_label } = req.body;
   if (!period_label) return res.status(400).json({ error: "period_label is required" });
   const already = db.prepare("SELECT id FROM payout_runs WHERE period_label = ?").get(period_label);
@@ -2059,13 +2059,13 @@ app.post("/api/payouts/commit", requireApiKey, (req, res) => {
   res.json({ committed: true, ...result });
 });
 
-app.get("/api/payouts/runs", requireApiKey, (req, res) => {
+app.get("/api/payouts/runs", requireAccess("payouts"), (req, res) => {
   res.json(db.prepare("SELECT * FROM payout_runs ORDER BY id DESC").all());
 });
 
 // ---------- Incoming vs outgoing — the business-health check the owner asked for ----------
 // "commission mein kitna % distribute ho raha hai, incoming (BV) ke against outgoing (net payout) kitna hai"
-app.get("/api/reports/payout-health", requireApiKey, (req, res) => {
+app.get("/api/reports/payout-health", requireAccess("dashboard"), (req, res) => {
   const runs = db.prepare("SELECT * FROM payout_runs ORDER BY id").all();
   const totalIncoming = round2(runs.reduce((s, r) => s + r.total_incoming_bv, 0));
   const totalOutgoing = round2(runs.reduce((s, r) => s + r.total_outgoing_net, 0));
@@ -2084,11 +2084,11 @@ app.get("/api/reports/payout-health", requireApiKey, (req, res) => {
 
 // ---------- Rewards master ----------
 
-app.get("/api/rewards", requireApiKey, (req, res) => {
+app.get("/api/rewards", requireAccess("rewards"), (req, res) => {
   res.json(db.prepare("SELECT * FROM rewards ORDER BY criteria_pv").all());
 });
 
-app.post("/api/rewards", requireApiKey, (req, res) => {
+app.post("/api/rewards", requireAccess("rewards"), (req, res) => {
   const { reward_name, criteria_pv, reward_value, session_label } = req.body;
   if (!reward_name) return res.status(400).json({ error: "reward_name is required" });
   const result = db
@@ -2099,7 +2099,7 @@ app.post("/api/rewards", requireApiKey, (req, res) => {
   res.json(db.prepare("SELECT * FROM rewards WHERE id = ?").get(result.lastInsertRowid));
 });
 
-app.patch("/api/rewards/:id", requireApiKey, (req, res) => {
+app.patch("/api/rewards/:id", requireAccess("rewards"), (req, res) => {
   const existing = db.prepare("SELECT * FROM rewards WHERE id = ?").get(req.params.id);
   if (!existing) return res.status(404).json({ error: "not found" });
   const merged = { ...existing, ...req.body };
@@ -2109,14 +2109,14 @@ app.patch("/api/rewards/:id", requireApiKey, (req, res) => {
   res.json(db.prepare("SELECT * FROM rewards WHERE id = ?").get(req.params.id));
 });
 
-app.delete("/api/rewards/:id", requireApiKey, (req, res) => {
+app.delete("/api/rewards/:id", requireAccess("rewards"), (req, res) => {
   const result = db.prepare("DELETE FROM rewards WHERE id = ?").run(req.params.id);
   res.json({ deleted: result.changes > 0 });
 });
 
 // ---------- Reward achievers (mirrors "Reward Details" / "Rank Achivers List") ----------
 
-app.get("/api/reward-achievers", requireApiKey, (req, res) => {
+app.get("/api/reward-achievers", requireAccess("rewards"), (req, res) => {
   const { member_code, reward_id } = req.query;
   let sql = `SELECT reward_achievers.*, rewards.reward_name, rewards.reward_value, members.name AS member_name
              FROM reward_achievers
@@ -2137,7 +2137,7 @@ app.get("/api/reward-achievers", requireApiKey, (req, res) => {
   res.json(db.prepare(sql).all(...params));
 });
 
-app.post("/api/reward-achievers", requireApiKey, (req, res) => {
+app.post("/api/reward-achievers", requireAccess("rewards"), (req, res) => {
   const { member_code, reward_id } = req.body;
   if (!member_code || !reward_id) {
     return res.status(400).json({ error: "member_code and reward_id are required" });
@@ -2152,7 +2152,7 @@ app.post("/api/reward-achievers", requireApiKey, (req, res) => {
   res.json(db.prepare("SELECT * FROM reward_achievers WHERE id = ?").get(result.lastInsertRowid));
 });
 
-app.delete("/api/reward-achievers/:id", requireApiKey, (req, res) => {
+app.delete("/api/reward-achievers/:id", requireAccess("rewards"), (req, res) => {
   const result = db.prepare("DELETE FROM reward_achievers WHERE id = ?").run(req.params.id);
   res.json({ deleted: result.changes > 0 });
 });
@@ -2160,7 +2160,7 @@ app.delete("/api/reward-achievers/:id", requireApiKey, (req, res) => {
 // ---------- Reports ----------
 
 // "Member Balance" — nets every wallet_transactions row for one member.
-app.get("/api/reports/member-balance/:code", requireApiKey, (req, res) => {
+app.get("/api/reports/member-balance/:code", requireAccess("reports"), (req, res) => {
   const member = db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code);
   if (!member) return res.status(404).json({ error: "not found" });
   const row = db
@@ -2181,7 +2181,7 @@ app.get("/api/reports/member-balance/:code", requireApiKey, (req, res) => {
 
 // "Downline PV Detail" — this member's own PV plus every downline member's PV,
 // walked the same cycle-safe way as /api/members/:code/tree.
-app.get("/api/reports/downline-pv/:code", requireApiKey, (req, res) => {
+app.get("/api/reports/downline-pv/:code", requireAccess("reports"), (req, res) => {
   const root = db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code);
   if (!root) return res.status(404).json({ error: "not found" });
 
@@ -2211,7 +2211,7 @@ app.get("/api/reports/downline-pv/:code", requireApiKey, (req, res) => {
 });
 
 // "Rank Achivers List" — every reward achieved, most recent first.
-app.get("/api/reports/rank-achievers", requireApiKey, (req, res) => {
+app.get("/api/reports/rank-achievers", requireAccess("rewards"), (req, res) => {
   res.json(
     db
       .prepare(
@@ -2247,11 +2247,11 @@ app.get("/api/reports/rank-achievers", requireApiKey, (req, res) => {
 
 // ---------- Master: Bank ----------
 
-app.get("/api/masters/banks", requireApiKey, (req, res) => {
+app.get("/api/masters/banks", requireAccess("masters"), (req, res) => {
   res.json(db.prepare("SELECT * FROM banks ORDER BY bank_name").all());
 });
 
-app.post("/api/masters/banks", requireApiKey, (req, res) => {
+app.post("/api/masters/banks", requireAccess("masters"), (req, res) => {
   const { bank_name, status } = req.body;
   if (!bank_name) return res.status(400).json({ error: "bank_name is required" });
   try {
@@ -2267,7 +2267,7 @@ app.post("/api/masters/banks", requireApiKey, (req, res) => {
   }
 });
 
-app.patch("/api/masters/banks/:id", requireApiKey, (req, res) => {
+app.patch("/api/masters/banks/:id", requireAccess("masters"), (req, res) => {
   const existing = db.prepare("SELECT * FROM banks WHERE id = ?").get(req.params.id);
   if (!existing) return res.status(404).json({ error: "not found" });
   const merged = { ...existing, ...req.body };
@@ -2275,18 +2275,18 @@ app.patch("/api/masters/banks/:id", requireApiKey, (req, res) => {
   res.json(db.prepare("SELECT * FROM banks WHERE id = ?").get(req.params.id));
 });
 
-app.delete("/api/masters/banks/:id", requireApiKey, (req, res) => {
+app.delete("/api/masters/banks/:id", requireAccess("masters"), (req, res) => {
   const result = db.prepare("DELETE FROM banks WHERE id = ?").run(req.params.id);
   res.json({ deleted: result.changes > 0 });
 });
 
 // ---------- Master: State ----------
 
-app.get("/api/masters/states", requireApiKey, (req, res) => {
+app.get("/api/masters/states", requireAccess("masters"), (req, res) => {
   res.json(db.prepare("SELECT * FROM states ORDER BY state_name").all());
 });
 
-app.post("/api/masters/states", requireApiKey, (req, res) => {
+app.post("/api/masters/states", requireAccess("masters"), (req, res) => {
   const { state_name, status } = req.body;
   if (!state_name) return res.status(400).json({ error: "state_name is required" });
   try {
@@ -2302,7 +2302,7 @@ app.post("/api/masters/states", requireApiKey, (req, res) => {
   }
 });
 
-app.patch("/api/masters/states/:id", requireApiKey, (req, res) => {
+app.patch("/api/masters/states/:id", requireAccess("masters"), (req, res) => {
   const existing = db.prepare("SELECT * FROM states WHERE id = ?").get(req.params.id);
   if (!existing) return res.status(404).json({ error: "not found" });
   const merged = { ...existing, ...req.body };
@@ -2310,18 +2310,18 @@ app.patch("/api/masters/states/:id", requireApiKey, (req, res) => {
   res.json(db.prepare("SELECT * FROM states WHERE id = ?").get(req.params.id));
 });
 
-app.delete("/api/masters/states/:id", requireApiKey, (req, res) => {
+app.delete("/api/masters/states/:id", requireAccess("masters"), (req, res) => {
   const result = db.prepare("DELETE FROM states WHERE id = ?").run(req.params.id);
   res.json({ deleted: result.changes > 0 });
 });
 
 // ---------- Master: Package (join-kit master, e.g. REGISTRATION / ACTIVE) ----------
 
-app.get("/api/masters/packages", requireApiKey, (req, res) => {
+app.get("/api/masters/packages", requireAccess("masters"), (req, res) => {
   res.json(db.prepare("SELECT * FROM packages ORDER BY pair_value_pv").all());
 });
 
-app.post("/api/masters/packages", requireApiKey, (req, res) => {
+app.post("/api/masters/packages", requireAccess("masters"), (req, res) => {
   const { package_name, pair_value_pv, price, status } = req.body;
   if (!package_name) return res.status(400).json({ error: "package_name is required" });
   try {
@@ -2337,7 +2337,7 @@ app.post("/api/masters/packages", requireApiKey, (req, res) => {
   }
 });
 
-app.patch("/api/masters/packages/:id", requireApiKey, (req, res) => {
+app.patch("/api/masters/packages/:id", requireAccess("masters"), (req, res) => {
   const existing = db.prepare("SELECT * FROM packages WHERE id = ?").get(req.params.id);
   if (!existing) return res.status(404).json({ error: "not found" });
   const merged = { ...existing, ...req.body };
@@ -2347,20 +2347,20 @@ app.patch("/api/masters/packages/:id", requireApiKey, (req, res) => {
   res.json(db.prepare("SELECT * FROM packages WHERE id = ?").get(req.params.id));
 });
 
-app.delete("/api/masters/packages/:id", requireApiKey, (req, res) => {
+app.delete("/api/masters/packages/:id", requireAccess("masters"), (req, res) => {
   const result = db.prepare("DELETE FROM packages WHERE id = ?").run(req.params.id);
   res.json({ deleted: result.changes > 0 });
 });
 
 // ---------- Member: KYC Documents ----------
 
-app.get("/api/members/:code/kyc-documents", requireApiKey, (req, res) => {
+app.get("/api/members/:code/kyc-documents", requireAccess("members"), (req, res) => {
   res.json(
     db.prepare("SELECT * FROM kyc_documents WHERE member_code = ? ORDER BY uploaded_at DESC").all(req.params.code)
   );
 });
 
-app.post("/api/members/:code/kyc-documents", requireApiKey, (req, res) => {
+app.post("/api/members/:code/kyc-documents", requireAccess("members"), (req, res) => {
   const member = db.prepare("SELECT member_code FROM members WHERE member_code = ?").get(req.params.code);
   if (!member) return res.status(404).json({ error: "member not found" });
   const { doc_type, doc_number, note } = req.body;
@@ -2374,7 +2374,7 @@ app.post("/api/members/:code/kyc-documents", requireApiKey, (req, res) => {
 // Approve/reject a KYC document — also nudges the member's own kyc_status
 // forward when every document on file is Approved, back to Pending on
 // any Rejected, mirroring what "KYC Document" review does in admin.airxplus.com.
-app.patch("/api/kyc-documents/:id", requireApiKey, (req, res) => {
+app.patch("/api/kyc-documents/:id", requireAccess("members"), (req, res) => {
   const existing = db.prepare("SELECT * FROM kyc_documents WHERE id = ?").get(req.params.id);
   if (!existing) return res.status(404).json({ error: "not found" });
   const { status, review_note } = req.body;
@@ -2401,7 +2401,7 @@ app.patch("/api/kyc-documents/:id", requireApiKey, (req, res) => {
 
 // "Manual Active" — admin force-activates a member outside the normal
 // matching/activation flow (e.g. an offline cash payment for the kit).
-app.post("/api/members/:code/manual-active", requireApiKey, (req, res) => {
+app.post("/api/members/:code/manual-active", requireAccess("members"), (req, res) => {
   const member = db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code);
   if (!member) return res.status(404).json({ error: "not found" });
   const { note } = req.body;
@@ -2417,7 +2417,7 @@ app.post("/api/members/:code/manual-active", requireApiKey, (req, res) => {
 
 // "Reset Member Status" — puts a member back to Inactive/Pending, e.g. to
 // undo an accidental manual-active or restart their activation flow.
-app.post("/api/members/:code/reset-status", requireApiKey, (req, res) => {
+app.post("/api/members/:code/reset-status", requireAccess("members"), (req, res) => {
   const member = db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code);
   if (!member) return res.status(404).json({ error: "not found" });
   const { note } = req.body;
@@ -2435,7 +2435,7 @@ app.post("/api/members/:code/reset-status", requireApiKey, (req, res) => {
 // identity details (name/mobile/email/PAN), keeping the ID, downline and
 // PV history intact. Every prior value is written to the audit log so
 // nothing is silently overwritten.
-app.post("/api/members/:code/change-user", requireApiKey, (req, res) => {
+app.post("/api/members/:code/change-user", requireAccess("members"), (req, res) => {
   const member = db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code);
   if (!member) return res.status(404).json({ error: "not found" });
   const { name, mobile, email, pan_number, note } = req.body;
@@ -2451,7 +2451,7 @@ app.post("/api/members/:code/change-user", requireApiKey, (req, res) => {
   res.json(db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code));
 });
 
-app.get("/api/members/:code/audit-log", requireApiKey, (req, res) => {
+app.get("/api/members/:code/audit-log", requireAccess("members"), (req, res) => {
   res.json(
     db.prepare("SELECT * FROM member_audit_log WHERE member_code = ? ORDER BY created_at DESC").all(req.params.code)
   );
@@ -2463,7 +2463,7 @@ app.get("/api/members/:code/audit-log", requireApiKey, (req, res) => {
 // "this weekly run's activity broken down by the day it was recorded",
 // same numbers as the Weekly MIS Report just sliced differently.
 
-app.get("/api/reports/daily-points", requireApiKey, (req, res) => {
+app.get("/api/reports/daily-points", requireAccess("reports"), (req, res) => {
   const { from, to } = req.query;
   let sql = `SELECT date(created_at) AS day, member_code, entry_type,
                     SUM(pv) AS total_pv, SUM(bv) AS total_bv, COUNT(*) AS entries
@@ -2477,7 +2477,7 @@ app.get("/api/reports/daily-points", requireApiKey, (req, res) => {
   res.json(db.prepare(sql).all(...params));
 });
 
-app.get("/api/reports/daily-payouts", requireApiKey, (req, res) => {
+app.get("/api/reports/daily-payouts", requireAccess("reports"), (req, res) => {
   const { from, to } = req.query;
   let sql = `SELECT date(created_at) AS day, member_code, period_label,
                     gross_amount, tds_amount, admin_charge, net_amount, status
@@ -2493,7 +2493,7 @@ app.get("/api/reports/daily-payouts", requireApiKey, (req, res) => {
 
 // ---------- Accounts: Fund Requests (also answers Reports > View Fund Request) ----------
 
-app.get("/api/fund-requests", requireApiKey, (req, res) => {
+app.get("/api/fund-requests", requireAccess("accounts"), (req, res) => {
   const { status, member_code } = req.query;
   let sql = `SELECT fund_requests.*, members.name AS member_name FROM fund_requests
              JOIN members ON members.member_code = fund_requests.member_code`;
@@ -2506,7 +2506,7 @@ app.get("/api/fund-requests", requireApiKey, (req, res) => {
   res.json(db.prepare(sql).all(...params));
 });
 
-app.post("/api/fund-requests", requireApiKey, (req, res) => {
+app.post("/api/fund-requests", requireAccess("accounts"), (req, res) => {
   const { member_code, amount, wallet_type, note } = req.body;
   if (!member_code || !amount) return res.status(400).json({ error: "member_code and amount are required" });
   const member = db.prepare("SELECT member_code FROM members WHERE member_code = ?").get(member_code);
@@ -2519,7 +2519,7 @@ app.post("/api/fund-requests", requireApiKey, (req, res) => {
 
 // Approve posts a debit to the member's wallet immediately (so Member
 // Balance reflects the payout); reject just records the decision.
-app.patch("/api/fund-requests/:id", requireApiKey, (req, res) => {
+app.patch("/api/fund-requests/:id", requireAccess("accounts"), (req, res) => {
   const existing = db.prepare("SELECT * FROM fund_requests WHERE id = ?").get(req.params.id);
   if (!existing) return res.status(404).json({ error: "not found" });
   const { status, process_note } = req.body;
@@ -2550,7 +2550,7 @@ app.patch("/api/fund-requests/:id", requireApiKey, (req, res) => {
 
 // "Payout Transfer Weekly" — per-member breakdown of one committed
 // weekly run (same source as the run's own totals, sliced per member).
-app.get("/api/reports/payout-transfer-weekly", requireApiKey, (req, res) => {
+app.get("/api/reports/payout-transfer-weekly", requireAccess("reports"), (req, res) => {
   const { period } = req.query;
   if (!period) return res.status(400).json({ error: "period query param is required" });
   const rows = db
@@ -2565,7 +2565,7 @@ app.get("/api/reports/payout-transfer-weekly", requireApiKey, (req, res) => {
 
 // "Topup Detail" — pv_ledger rows recorded as a package upgrade/topup
 // rather than a regular order (entry_type = 'topup').
-app.get("/api/reports/topup-detail", requireApiKey, (req, res) => {
+app.get("/api/reports/topup-detail", requireAccess("reports"), (req, res) => {
   const rows = db
     .prepare(
       `SELECT pv_ledger.*, members.name AS member_name FROM pv_ledger
@@ -2577,7 +2577,7 @@ app.get("/api/reports/topup-detail", requireApiKey, (req, res) => {
 });
 
 // "All TDS Report" — TDS withheld per committed period.
-app.get("/api/reports/tds", requireApiKey, (req, res) => {
+app.get("/api/reports/tds", requireAccess("reports"), (req, res) => {
   const rows = db
     .prepare(
       `SELECT period_label, COUNT(*) AS member_count, SUM(gross_amount) AS total_gross,
@@ -2595,7 +2595,7 @@ app.get("/api/reports/tds", requireApiKey, (req, res) => {
 // member's wallet (bonus, correction, manual deduction) with a reason,
 // and see the full ledger.
 
-app.get("/api/wallet/transactions", requireApiKey, (req, res) => {
+app.get("/api/wallet/transactions", requireAccess("accounts"), (req, res) => {
   const { member_code, txn_type } = req.query;
   let sql = `SELECT wallet_transactions.*, members.name AS member_name FROM wallet_transactions
              JOIN members ON members.member_code = wallet_transactions.member_code`;
@@ -2608,7 +2608,7 @@ app.get("/api/wallet/transactions", requireApiKey, (req, res) => {
   res.json(db.prepare(sql).all(...params));
 });
 
-app.get("/api/wallet/:code", requireApiKey, (req, res) => {
+app.get("/api/wallet/:code", requireAccess("accounts"), (req, res) => {
   const member = db.prepare("SELECT member_code FROM members WHERE member_code = ?").get(req.params.code);
   if (!member) return res.status(404).json({ error: "not found" });
   const transactions = db
@@ -2645,16 +2645,16 @@ function walletAdjust(txnType) {
     res.json(db.prepare("SELECT * FROM wallet_transactions WHERE id = ?").get(result.lastInsertRowid));
   };
 }
-app.post("/api/wallet/credit", requireApiKey, walletAdjust("credit"));
-app.post("/api/wallet/debit", requireApiKey, walletAdjust("debit"));
+app.post("/api/wallet/credit", requireAccess("accounts"), walletAdjust("credit"));
+app.post("/api/wallet/debit", requireAccess("accounts"), walletAdjust("debit"));
 
 // ---------- Reward Session (Master for the "session_label" already on rewards) ----------
 
-app.get("/api/reward-sessions", requireApiKey, (req, res) => {
+app.get("/api/reward-sessions", requireAccess("rewards"), (req, res) => {
   res.json(db.prepare("SELECT * FROM reward_sessions ORDER BY session_date DESC").all());
 });
 
-app.post("/api/reward-sessions", requireApiKey, (req, res) => {
+app.post("/api/reward-sessions", requireAccess("rewards"), (req, res) => {
   const { session_name, session_date, status } = req.body;
   if (!session_name) return res.status(400).json({ error: "session_name is required" });
   try {
@@ -2670,7 +2670,7 @@ app.post("/api/reward-sessions", requireApiKey, (req, res) => {
   }
 });
 
-app.patch("/api/reward-sessions/:id", requireApiKey, (req, res) => {
+app.patch("/api/reward-sessions/:id", requireAccess("rewards"), (req, res) => {
   const existing = db.prepare("SELECT * FROM reward_sessions WHERE id = ?").get(req.params.id);
   if (!existing) return res.status(404).json({ error: "not found" });
   const merged = { ...existing, ...req.body };
@@ -2683,7 +2683,7 @@ app.patch("/api/reward-sessions/:id", requireApiKey, (req, res) => {
   res.json(db.prepare("SELECT * FROM reward_sessions WHERE id = ?").get(req.params.id));
 });
 
-app.delete("/api/reward-sessions/:id", requireApiKey, (req, res) => {
+app.delete("/api/reward-sessions/:id", requireAccess("rewards"), (req, res) => {
   const result = db.prepare("DELETE FROM reward_sessions WHERE id = ?").run(req.params.id);
   res.json({ deleted: result.changes > 0 });
 });
@@ -2713,7 +2713,7 @@ function requireCmsType(req, res, next) {
   next();
 }
 
-app.get("/api/cms/:type", requireApiKey, requireCmsType, (req, res) => {
+app.get("/api/cms/:type", requireAccess("cms"), requireCmsType, (req, res) => {
   res.json(
     db
       .prepare("SELECT * FROM cms_content WHERE content_type = ? ORDER BY display_order ASC, created_at DESC")
@@ -2721,7 +2721,7 @@ app.get("/api/cms/:type", requireApiKey, requireCmsType, (req, res) => {
   );
 });
 
-app.post("/api/cms/:type", requireApiKey, requireCmsType, (req, res) => {
+app.post("/api/cms/:type", requireAccess("cms"), requireCmsType, (req, res) => {
   const { title, description, image_url, link_url, event_date, display_order, status } = req.body;
   if (!title) return res.status(400).json({ error: "title is required" });
   const result = db
@@ -2742,7 +2742,7 @@ app.post("/api/cms/:type", requireApiKey, requireCmsType, (req, res) => {
   res.json(db.prepare("SELECT * FROM cms_content WHERE id = ?").get(result.lastInsertRowid));
 });
 
-app.patch("/api/cms/:type/:id", requireApiKey, requireCmsType, (req, res) => {
+app.patch("/api/cms/:type/:id", requireAccess("cms"), requireCmsType, (req, res) => {
   const existing = db
     .prepare("SELECT * FROM cms_content WHERE id = ? AND content_type = ?")
     .get(req.params.id, req.params.type);
@@ -2764,7 +2764,7 @@ app.patch("/api/cms/:type/:id", requireApiKey, requireCmsType, (req, res) => {
   res.json(db.prepare("SELECT * FROM cms_content WHERE id = ?").get(req.params.id));
 });
 
-app.delete("/api/cms/:type/:id", requireApiKey, requireCmsType, (req, res) => {
+app.delete("/api/cms/:type/:id", requireAccess("cms"), requireCmsType, (req, res) => {
   const result = db
     .prepare("DELETE FROM cms_content WHERE id = ? AND content_type = ?")
     .run(req.params.id, req.params.type);

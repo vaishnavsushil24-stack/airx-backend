@@ -500,3 +500,109 @@ to `(id, content_type)` together (a delete call for the right id but
 wrong type is correctly a no-op). All 15 assertions pass, and every
 endpoint was also re-verified live against the deployed Render API
 after push.
+
+## Phase 8 — multi-user admin auth: Admin / User / UserGroup / Permissions (2026-08-24)
+
+store.airxplus.com's / admin.airxplus.com's own Admin, User, UserGroup and
+Permissions screens — the one category explicitly deferred at the end of
+Phase 6 as "a separate, security-sensitive project on top of the current
+single-shared-`AIRX_API_KEY` model." Built additively: the master
+`AIRX_API_KEY` still works exactly as it always has, unchanged, for
+anything already using it (this app's own "API Key" login option included)
+— nothing that worked before this phase stopped working. What's new is an
+*alternative* credential: individual staff logins with real
+username/password authentication, session tokens, and per-role
+module-level permissions actually enforced by the server, not just hidden
+in the UI.
+
+**Schema** (`db.js`): `admin_roles` (a role/UserGroup — `role_name` +
+`permissions`, a JSON array of module keys, or `["*"]` for every module —
+Super Admin), `admin_users` (username, `password_hash`/`password_salt` via
+Node's built-in `crypto.scryptSync` — no bcrypt dependency needed, since
+`npm install` is blocked in this sandbox and Render's build environment is
+the only place new dependencies would actually get installed and tested),
+`admin_sessions` (a random 32-byte token per login, 7-day expiry).
+
+**Auth endpoints** (all public — that's the point): `GET
+/api/auth/bootstrap-status` (does any admin user exist yet?), `POST
+/api/auth/bootstrap` (creates the first Super Admin — self-disables with a
+`409` the moment one admin user exists, so it can only ever run once),
+`POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/me`.
+
+**User/Role management** (`GET/POST/PATCH/DELETE /api/admin/roles`,
+`GET/POST/PATCH/DELETE /api/admin/users`, `POST
+/api/admin/users/:id/reset-password` — the last one wipes all of that
+user's sessions, forcing re-login everywhere) — all gated by the new
+`requireAccess("user_management")` middleware, which accepts either the
+master `x-api-key` (unrestricted, same as always) or a `Bearer` session
+token whose role includes `"user_management"` or `"*"`. Guards: a role
+still assigned to a user can't be deleted (`409`, reassign first, same
+pattern as the Phase 6 member delete-guard), and the last remaining admin
+user can't be deleted (`409` — prevents ever locking the new login system
+out entirely, though the master API key would still work regardless).
+
+**Wiring `requireAccess` into the existing ~80 feature routes.** A
+session token is useless if it can only reach the two new auth/admin
+route groups — a staff login needs to actually be able to use
+Members/Masters/Payouts/etc. So every existing route that
+`public/admin.html` calls got its `requireApiKey` swapped for
+`requireAccess("<module>")`, where `<module>` matches whichever
+admin.html tab actually calls that endpoint (verified by grepping every
+`api('...')` call inside each tab's `loadX()` function, not guessed):
+`products`, `franchises`, `members` (including KYC documents, manual
+active/reset/change-user, audit log), `dashboard` (the two summary
+endpoints `loadDashboard()` calls), `commission`, `payouts`, `rewards`
+(including reward-achievers and rank-achievers, unused by the UI today
+but conceptually the same menu group), `reports`, `masters`, `accounts`
+(fund requests + wallet), `cms`. Deliberately **left untouched** — still
+master-key-only, `requireApiKey` unchanged — are the endpoints
+`public/admin.html` never calls at all: `/api/shopify/*`,
+`/api/indiapost/*`, `/api/leads*`, `/api/orders*`, `/api/inventory*`,
+`/api/staff/summary`, `/api/whatsapp/*`, `/api/franchise-stock*`. Those
+predate the MLM admin panel entirely (Phase 0's lead/e-commerce ops) and
+are out of scope for "admin.airxplus.com's own user system" — no reason
+to touch them.
+
+`requireAccess(moduleKey)` (`server.js`): checks `x-api-key` first (master
+bypass, identical behavior to the old `requireApiKey` — this is the
+invariant the whole migration leans on for safety), then falls back to
+`Authorization: Bearer <token>` — looks up the session, checks it hasn't
+expired, checks the user is `Active`, checks the role's permissions
+include the module or `"*"`. `401` for no/invalid credentials, `403` for
+"valid login, wrong permissions."
+
+**`public/admin.html`** gained: a login screen with three modes (API Key
+— unchanged default; "staff user" username/password; and a first-run
+"create the first Super Admin" form that auto-shows when
+`bootstrap-status` reports no admin users exist yet — an existing
+browser with a saved API key never sees it, since that check only runs
+when there's no stored credential at all) — plus a new **User
+Management** tab with a Roles & Permissions panel (add a role, tick
+which modules it grants, or check "All permissions" for Super Admin) and
+an Admin Users panel (add a user, assign a role, Activate/Deactivate,
+Reset Password, Delete). `renderNav()` now filters which tabs even
+render based on the signed-in identity's permissions — a staff user
+without `"masters"` never sees a Masters tab to begin with, and even if
+they hit the API directly they'd get a `403` from the server, not just a
+hidden button.
+
+A functional test (`test_phase8.js`) exercises the password hashing
+(`scryptSync` correct/wrong/near-miss), session issue/lookup/expiry, the
+permission-check logic (`"*"` vs a specific module list), and both delete
+guards, directly against `db.js` + Node's `crypto` — 18 assertions, all
+passing. The `requireAccess` wiring itself (Express middleware) can only
+be verified live, the same constraint as every other phase in this
+sandbox (`npm install` is blocked here — Render's build is the only place
+`express` actually installs) — verified against the deployed Render API
+after push: the master key still reaches every route exactly as before
+(regression check), a fresh staff login with a limited role gets `200` on
+its granted modules and `403` on everything else, and an expired/garbage
+token gets `401`.
+
+**Deliberately not built in this pass:** two-factor auth, password
+complexity rules beyond an 8-character minimum, and an audit trail of
+*who* (which admin user) performed each Members/Masters/etc. action —
+`member_audit_log` (Phase 6) still just records whatever free-text note
+the caller supplies, it doesn't yet look up `req.identity.user.username`
+automatically. That's a natural small follow-up once staff accounts are
+actually in daily use, not assumed here.
