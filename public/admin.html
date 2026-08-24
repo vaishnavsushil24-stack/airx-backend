@@ -190,8 +190,11 @@
   <main>
     <div class="tab" id="tab-dashboard"></div>
     <div class="tab" id="tab-members"></div>
+    <div class="tab" id="tab-masters"></div>
     <div class="tab" id="tab-commission"></div>
     <div class="tab" id="tab-payouts"></div>
+    <div class="tab" id="tab-accounts"></div>
+    <div class="tab" id="tab-reports"></div>
     <div class="tab" id="tab-products"></div>
     <div class="tab" id="tab-franchises"></div>
     <div class="tab" id="tab-rewards"></div>
@@ -211,8 +214,11 @@ let API_KEY = localStorage.getItem('airx_api_key') || '';
 const TABS = [
   { id: 'dashboard', label: 'Dashboard' },
   { id: 'members', label: 'Members' },
+  { id: 'masters', label: 'Masters' },
   { id: 'commission', label: 'Commission Settings' },
   { id: 'payouts', label: 'Payouts' },
+  { id: 'accounts', label: 'Accounts & Wallet' },
+  { id: 'reports', label: 'Reports' },
   { id: 'products', label: 'Products' },
   { id: 'franchises', label: 'Franchises' },
   { id: 'rewards', label: 'Rewards' },
@@ -290,7 +296,7 @@ function renderNav() {
 function switchTab(id) {
   document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === id));
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.id === 'tab-' + id));
-  const loaders = { dashboard: loadDashboard, members: loadMembers, commission: loadCommission, payouts: loadPayouts, products: loadProducts, franchises: loadFranchises, rewards: loadRewards };
+  const loaders = { dashboard: loadDashboard, members: loadMembers, masters: loadMasters, commission: loadCommission, payouts: loadPayouts, accounts: loadAccounts, reports: loadReports, products: loadProducts, franchises: loadFranchises, rewards: loadRewards };
   if (loaders[id]) loaders[id]();
 }
 
@@ -449,12 +455,92 @@ async function openMemberDetail(code) {
       </div>
       <p class="muted">Legacy package: ${esc(m.legacy_package) || '—'} · Joined: ${esc(m.joined_at) || '—'} · Source: ${esc(m.data_source)}</p>
       ${balance ? `<p class="muted">Wallet balance: ₹${balance.balance.toLocaleString('en-IN')} (credit ₹${balance.total_credit.toLocaleString('en-IN')} / debit ₹${balance.total_debit.toLocaleString('en-IN')})</p>` : ''}
+      <p class="muted">KYC status: <span class="badge ${m.kyc_status==='Approved'?'active':'inactive'}">${esc(m.kyc_status)}</span></p>
       <div class="row">
         <button id="saveMemberBtn">Save</button>
         ${m.status === 'Blocked' ? '<button class="secondary" id="unblockBtn">Unblock</button>' : '<button class="danger" id="blockBtn">Block</button>'}
         <button class="secondary" id="closeDetailBtn">Close</button>
       </div>
+
+      <div class="panel" style="margin:16px 0 0;padding:14px">
+        <h2 style="font-size:13px">Admin actions</h2>
+        <div class="row">
+          <button class="secondary" id="manualActiveBtn">Manual Active</button>
+          <button class="secondary" id="resetStatusBtn">Reset Status</button>
+          <button class="secondary" id="changeUserBtn">Change User</button>
+        </div>
+        <div class="muted" id="adminActionNote"></div>
+      </div>
+
+      <div class="panel" style="margin:12px 0 0;padding:14px">
+        <h2 style="font-size:13px">KYC Documents</h2>
+        <div id="kycDocsWrap"><div class="empty">Loading…</div></div>
+        <div class="row" style="margin-top:8px">
+          <select id="kyc_doc_type" style="max-width:160px">
+            <option value="PAN">PAN</option>
+            <option value="Aadhaar">Aadhaar</option>
+            <option value="Bank Passbook">Bank Passbook</option>
+            <option value="Photo">Photo</option>
+            <option value="Other">Other</option>
+          </select>
+          <input id="kyc_doc_number" placeholder="Document number (optional)" style="max-width:180px" />
+          <button class="secondary" id="addKycBtn">+ Record document</button>
+        </div>
+      </div>
     `;
+    (async function loadKycDocs() {
+      try {
+        const docs = await api('/api/members/' + encodeURIComponent(code) + '/kyc-documents');
+        document.getElementById('kycDocsWrap').innerHTML = docs.length
+          ? `<table><thead><tr><th>Type</th><th>Number</th><th>Status</th><th></th></tr></thead><tbody>
+              ${docs.map(d => `<tr>
+                <td>${esc(d.doc_type)}</td><td>${esc(d.doc_number) || '—'}</td>
+                <td><span class="badge ${d.status==='Approved'?'active':d.status==='Rejected'?'blocked':'inactive'}">${esc(d.status)}</span></td>
+                <td>${d.status==='Pending' ? `<button class="secondary" data-approve="${d.id}" style="padding:3px 8px;font-size:11px">Approve</button> <button class="danger" data-reject="${d.id}" style="padding:3px 8px;font-size:11px">Reject</button>` : ''}</td>
+              </tr>`).join('')}
+            </tbody></table>`
+          : '<div class="empty">No documents recorded yet.</div>';
+        document.querySelectorAll('[data-approve]').forEach(b => b.addEventListener('click', async () => {
+          try { await api('/api/kyc-documents/' + b.dataset.approve, { method: 'PATCH', body: JSON.stringify({ status: 'Approved' }) }); toast('Approved', 'success'); loadKycDocs(); openMemberDetail(code); }
+          catch (e) { toast('Failed: ' + e.message, 'error'); }
+        }));
+        document.querySelectorAll('[data-reject]').forEach(b => b.addEventListener('click', async () => {
+          try { await api('/api/kyc-documents/' + b.dataset.reject, { method: 'PATCH', body: JSON.stringify({ status: 'Rejected' }) }); toast('Rejected', 'success'); loadKycDocs(); }
+          catch (e) { toast('Failed: ' + e.message, 'error'); }
+        }));
+      } catch (e) {
+        document.getElementById('kycDocsWrap').innerHTML = `<div class="empty">Failed to load: ${esc(e.message)}</div>`;
+      }
+    })();
+    document.getElementById('addKycBtn').addEventListener('click', async () => {
+      try {
+        await api('/api/members/' + encodeURIComponent(code) + '/kyc-documents', { method: 'POST', body: JSON.stringify({
+          doc_type: document.getElementById('kyc_doc_type').value,
+          doc_number: document.getElementById('kyc_doc_number').value.trim() || undefined,
+        })});
+        toast('Document recorded', 'success');
+        openMemberDetail(code);
+      } catch (e) { toast('Failed: ' + e.message, 'error'); }
+    });
+    document.getElementById('manualActiveBtn').addEventListener('click', async () => {
+      const note = prompt('Manual Active — reason (e.g. offline cash payment):') || '';
+      try { await api('/api/members/' + encodeURIComponent(code) + '/manual-active', { method: 'POST', body: JSON.stringify({ note }) }); toast('Member set Active', 'success'); openMemberDetail(code); loadMembers(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    });
+    document.getElementById('resetStatusBtn').addEventListener('click', async () => {
+      if (!confirm('Reset this member back to Inactive?')) return;
+      const note = prompt('Reset Status — reason:') || '';
+      try { await api('/api/members/' + encodeURIComponent(code) + '/reset-status', { method: 'POST', body: JSON.stringify({ note }) }); toast('Member reset to Inactive', 'success'); openMemberDetail(code); loadMembers(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    });
+    document.getElementById('changeUserBtn').addEventListener('click', async () => {
+      const newName = prompt('Change User — new name for this ID:', m.name);
+      if (!newName) return;
+      const newMobile = prompt('New mobile (optional):', m.mobile || '') || undefined;
+      const note = prompt('Reason (e.g. ID transferred to new owner):') || '';
+      try { await api('/api/members/' + encodeURIComponent(code) + '/change-user', { method: 'POST', body: JSON.stringify({ name: newName, mobile: newMobile, note }) }); toast('User changed', 'success'); openMemberDetail(code); loadMembers(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    });
     document.getElementById('saveMemberBtn').addEventListener('click', async () => {
       try {
         await api('/api/members/' + encodeURIComponent(code), { method: 'PATCH', body: JSON.stringify({
@@ -586,6 +672,245 @@ async function loadPayouts() {
   }
 }
 
+// ---------- Masters (Bank / State / Package) ----------
+async function loadMasters() {
+  const el = document.getElementById('tab-masters');
+  el.innerHTML = `
+    <div class="panel"><h2>Package Master (join kits)</h2>
+      <div class="row">
+        <input id="pk_name" placeholder="Package name, e.g. ACTIVE" style="max-width:160px" />
+        <input id="pk_pv" placeholder="Pair value PV" type="number" style="max-width:130px" />
+        <input id="pk_price" placeholder="Price ₹" type="number" style="max-width:130px" />
+        <button id="addPackageBtn">+ Add</button>
+      </div>
+      <div id="packagesTable"><div class="empty">Loading…</div></div>
+    </div>
+    <div class="panel"><h2>Bank Master</h2>
+      <div class="row"><input id="bk_name" placeholder="Bank name" /><button id="addBankBtn">+ Add</button></div>
+      <div id="banksTable"><div class="empty">Loading…</div></div>
+    </div>
+    <div class="panel"><h2>State Master</h2>
+      <div class="row"><input id="st_name" placeholder="State name" /><button id="addStateBtn">+ Add</button></div>
+      <div id="statesTable"><div class="empty">Loading…</div></div>
+    </div>
+  `;
+  async function refreshPackages() {
+    const rows = await api('/api/masters/packages');
+    document.getElementById('packagesTable').innerHTML = rows.length
+      ? `<table><thead><tr><th>Name</th><th>Pair Value PV</th><th>Price</th><th>Status</th></tr></thead><tbody>
+          ${rows.map(r => `<tr><td>${esc(r.package_name)}</td><td>${r.pair_value_pv}</td><td>₹${r.price}</td><td>${esc(r.status)}</td></tr>`).join('')}
+        </tbody></table>` : '<div class="empty">No packages yet.</div>';
+  }
+  async function refreshBanks() {
+    const rows = await api('/api/masters/banks');
+    document.getElementById('banksTable').innerHTML = rows.length
+      ? `<table><thead><tr><th>Bank</th><th>Status</th></tr></thead><tbody>${rows.map(r => `<tr><td>${esc(r.bank_name)}</td><td>${esc(r.status)}</td></tr>`).join('')}</tbody></table>`
+      : '<div class="empty">No banks yet.</div>';
+  }
+  async function refreshStates() {
+    const rows = await api('/api/masters/states');
+    document.getElementById('statesTable').innerHTML = rows.length
+      ? `<table><thead><tr><th>State</th><th>Status</th></tr></thead><tbody>${rows.map(r => `<tr><td>${esc(r.state_name)}</td><td>${esc(r.status)}</td></tr>`).join('')}</tbody></table>`
+      : '<div class="empty">No states yet.</div>';
+  }
+  document.getElementById('addPackageBtn').addEventListener('click', async () => {
+    try {
+      await api('/api/masters/packages', { method: 'POST', body: JSON.stringify({
+        package_name: document.getElementById('pk_name').value.trim(),
+        pair_value_pv: Number(document.getElementById('pk_pv').value) || 0,
+        price: Number(document.getElementById('pk_price').value) || 0,
+      })});
+      toast('Package added', 'success'); refreshPackages();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+  document.getElementById('addBankBtn').addEventListener('click', async () => {
+    try {
+      await api('/api/masters/banks', { method: 'POST', body: JSON.stringify({ bank_name: document.getElementById('bk_name').value.trim() })});
+      toast('Bank added', 'success'); refreshBanks();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+  document.getElementById('addStateBtn').addEventListener('click', async () => {
+    try {
+      await api('/api/masters/states', { method: 'POST', body: JSON.stringify({ state_name: document.getElementById('st_name').value.trim() })});
+      toast('State added', 'success'); refreshStates();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+  refreshPackages().catch(e => { document.getElementById('packagesTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+  refreshBanks().catch(e => { document.getElementById('banksTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+  refreshStates().catch(e => { document.getElementById('statesTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+}
+
+// ---------- Accounts & Wallet (Fund Requests, Fund Credit/Debit, Payout Transfer Weekly) ----------
+async function loadAccounts() {
+  const el = document.getElementById('tab-accounts');
+  el.innerHTML = `
+    <div class="panel"><h2>Fund Requests</h2>
+      <p class="muted">A member's withdrawal request. Approving posts a debit to their wallet immediately.</p>
+      <div class="row">
+        <select id="fr_status_filter"><option value="Pending">Pending</option><option value="">All</option><option value="Approved">Approved</option><option value="Rejected">Rejected</option></select>
+      </div>
+      <div id="fundRequestsTable"><div class="empty">Loading…</div></div>
+      <h2 style="margin-top:18px;font-size:13px">New fund request</h2>
+      <div class="row">
+        <input id="fr_member_code" placeholder="Member code" style="max-width:160px" />
+        <input id="fr_amount" placeholder="Amount ₹" type="number" style="max-width:130px" />
+        <button id="addFundRequestBtn">+ Create request</button>
+      </div>
+    </div>
+    <div class="panel"><h2>Wallet — Fund Credit / Debit</h2>
+      <p class="muted">Manually adjust a member's wallet (bonus, correction, deduction). Every entry needs a reason.</p>
+      <div class="row">
+        <input id="wl_member_code" placeholder="Member code" style="max-width:160px" />
+        <input id="wl_amount" placeholder="Amount ₹" type="number" style="max-width:120px" />
+        <input id="wl_reason" placeholder="Reason" style="flex:1;min-width:160px" />
+        <button id="creditBtn">Credit</button>
+        <button class="danger" id="debitBtn">Debit</button>
+      </div>
+      <div class="row">
+        <input id="wl_lookup_code" placeholder="Look up member code…" style="max-width:200px" />
+        <button class="secondary" id="wl_lookup_btn">Show wallet</button>
+      </div>
+      <div id="walletLookupResult"></div>
+    </div>
+    <div class="panel"><h2>Payout Transfer Weekly</h2>
+      <div class="row">
+        <input id="ptw_period" placeholder="Period label, e.g. WEEK-35-2026" style="max-width:220px" />
+        <button class="secondary" id="ptw_btn">Look up</button>
+      </div>
+      <div id="ptwResult"></div>
+    </div>
+  `;
+  async function refreshFundRequests() {
+    const status = document.getElementById('fr_status_filter').value;
+    const rows = await api('/api/fund-requests' + (status ? '?status=' + encodeURIComponent(status) : ''));
+    document.getElementById('fundRequestsTable').innerHTML = rows.length
+      ? `<table><thead><tr><th>Member</th><th>Amount</th><th>Status</th><th>Requested</th><th></th></tr></thead><tbody>
+          ${rows.map(r => `<tr>
+            <td>${esc(r.member_name)} <span class="muted">(${esc(r.member_code)})</span></td>
+            <td>₹${r.amount.toLocaleString('en-IN')}</td>
+            <td><span class="badge ${r.status==='Approved'?'active':r.status==='Rejected'?'blocked':'inactive'}">${esc(r.status)}</span></td>
+            <td>${esc(r.requested_at)}</td>
+            <td>${r.status==='Pending' ? `<button class="secondary" data-approve="${r.id}" style="padding:3px 8px;font-size:11px">Approve</button> <button class="danger" data-reject="${r.id}" style="padding:3px 8px;font-size:11px">Reject</button>` : ''}</td>
+          </tr>`).join('')}
+        </tbody></table>` : '<div class="empty">No fund requests.</div>';
+    document.querySelectorAll('[data-approve]').forEach(b => b.addEventListener('click', async () => {
+      try { await api('/api/fund-requests/' + b.dataset.approve, { method: 'PATCH', body: JSON.stringify({ status: 'Approved' }) }); toast('Approved', 'success'); refreshFundRequests(); } catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+    document.querySelectorAll('[data-reject]').forEach(b => b.addEventListener('click', async () => {
+      try { await api('/api/fund-requests/' + b.dataset.reject, { method: 'PATCH', body: JSON.stringify({ status: 'Rejected' }) }); toast('Rejected', 'success'); refreshFundRequests(); } catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+  }
+  document.getElementById('fr_status_filter').addEventListener('change', refreshFundRequests);
+  document.getElementById('addFundRequestBtn').addEventListener('click', async () => {
+    try {
+      await api('/api/fund-requests', { method: 'POST', body: JSON.stringify({
+        member_code: document.getElementById('fr_member_code').value.trim(),
+        amount: Number(document.getElementById('fr_amount').value) || 0,
+      })});
+      toast('Fund request created', 'success'); refreshFundRequests();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+  document.getElementById('creditBtn').addEventListener('click', () => walletAdjust('credit'));
+  document.getElementById('debitBtn').addEventListener('click', () => walletAdjust('debit'));
+  async function walletAdjust(type) {
+    try {
+      await api('/api/wallet/' + type, { method: 'POST', body: JSON.stringify({
+        member_code: document.getElementById('wl_member_code').value.trim(),
+        amount: Number(document.getElementById('wl_amount').value) || 0,
+        reason: document.getElementById('wl_reason').value.trim(),
+      })});
+      toast('Wallet ' + type + ' posted', 'success');
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  }
+  document.getElementById('wl_lookup_btn').addEventListener('click', async () => {
+    const code = document.getElementById('wl_lookup_code').value.trim();
+    if (!code) return;
+    try {
+      const w = await api('/api/wallet/' + encodeURIComponent(code));
+      document.getElementById('walletLookupResult').innerHTML = `
+        <p class="muted">Balance: ₹${w.balance.toLocaleString('en-IN')} (credit ₹${w.total_credit.toLocaleString('en-IN')} / debit ₹${w.total_debit.toLocaleString('en-IN')})</p>
+        ${w.transactions.length ? `<table><thead><tr><th>Type</th><th>Amount</th><th>Reason</th><th>Date</th></tr></thead><tbody>
+          ${w.transactions.slice(0,50).map(t => `<tr><td>${esc(t.txn_type)}</td><td>₹${t.amount.toLocaleString('en-IN')}</td><td>${esc(t.reason)||'—'}</td><td>${esc(t.created_at)}</td></tr>`).join('')}
+        </tbody></table>` : '<div class="empty">No transactions yet.</div>'}
+      `;
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+  document.getElementById('ptw_btn').addEventListener('click', async () => {
+    const period = document.getElementById('ptw_period').value.trim();
+    if (!period) return;
+    try {
+      const r = await api('/api/reports/payout-transfer-weekly?period=' + encodeURIComponent(period));
+      document.getElementById('ptwResult').innerHTML = `
+        <p class="muted">${r.count} members · Total net ₹${r.total_net.toLocaleString('en-IN')}</p>
+        ${r.rows.length ? `<table><thead><tr><th>Member</th><th>Gross</th><th>TDS</th><th>Admin charge</th><th>Net</th></tr></thead><tbody>
+          ${r.rows.map(x => `<tr><td>${esc(x.member_name)} (${esc(x.member_code)})</td><td>₹${x.gross_amount}</td><td>₹${x.tds_amount}</td><td>₹${x.admin_charge}</td><td>₹${x.net_amount}</td></tr>`).join('')}
+        </tbody></table>` : '<div class="empty">No rows for that period.</div>'}
+      `;
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+  refreshFundRequests().catch(e => { document.getElementById('fundRequestsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+}
+
+// ---------- Reports (Daily Point/Payout Detail, Topup Detail, TDS, Member Balance, Downline PV) ----------
+async function loadReports() {
+  const el = document.getElementById('tab-reports');
+  el.innerHTML = `
+    <div class="panel"><h2>All TDS Report</h2><div id="tdsTable"><div class="empty">Loading…</div></div></div>
+    <div class="panel"><h2>Topup Detail</h2><div id="topupTable"><div class="empty">Loading…</div></div></div>
+    <div class="panel"><h2>Daily Point Detail</h2><div id="dailyPointsTable"><div class="empty">Loading…</div></div></div>
+    <div class="panel"><h2>Daily Payout Detail</h2><div id="dailyPayoutsTable"><div class="empty">Loading…</div></div></div>
+    <div class="panel"><h2>Downline PV / Member Balance lookup</h2>
+      <div class="row"><input id="rp_code" placeholder="Member code" style="max-width:160px" /><button class="secondary" id="rp_btn">Look up</button></div>
+      <div id="rp_result"></div>
+    </div>
+  `;
+  try {
+    const tds = await api('/api/reports/tds');
+    document.getElementById('tdsTable').innerHTML = tds.length
+      ? `<table><thead><tr><th>Period</th><th>Members</th><th>Gross</th><th>TDS</th><th>Net</th></tr></thead><tbody>
+          ${tds.map(t => `<tr><td>${esc(t.period_label)}</td><td>${t.member_count}</td><td>₹${t.total_gross}</td><td>₹${t.total_tds}</td><td>₹${t.total_net}</td></tr>`).join('')}
+        </tbody></table>` : '<div class="empty">No committed payout runs yet.</div>';
+  } catch (e) { document.getElementById('tdsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; }
+
+  try {
+    const topups = await api('/api/reports/topup-detail');
+    document.getElementById('topupTable').innerHTML = topups.length
+      ? `<table><thead><tr><th>Member</th><th>PV</th><th>BV</th><th>Date</th></tr></thead><tbody>
+          ${topups.slice(0,100).map(t => `<tr><td>${esc(t.member_name)} (${esc(t.member_code)})</td><td>${t.pv}</td><td>${t.bv}</td><td>${esc(t.created_at)}</td></tr>`).join('')}
+        </tbody></table>` : '<div class="empty">No topups recorded yet (pv_ledger entry_type = "topup").</div>';
+  } catch (e) { document.getElementById('topupTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; }
+
+  try {
+    const dp = await api('/api/reports/daily-points');
+    document.getElementById('dailyPointsTable').innerHTML = dp.length
+      ? `<table><thead><tr><th>Day</th><th>Member</th><th>Type</th><th>PV</th><th>BV</th><th>Entries</th></tr></thead><tbody>
+          ${dp.slice(0,100).map(r => `<tr><td>${esc(r.day)}</td><td>${esc(r.member_code)}</td><td>${esc(r.entry_type)}</td><td>${r.total_pv}</td><td>${r.total_bv}</td><td>${r.entries}</td></tr>`).join('')}
+        </tbody></table>` : '<div class="empty">No PV ledger activity yet.</div>';
+  } catch (e) { document.getElementById('dailyPointsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; }
+
+  try {
+    const dpay = await api('/api/reports/daily-payouts');
+    document.getElementById('dailyPayoutsTable').innerHTML = dpay.length
+      ? `<table><thead><tr><th>Day</th><th>Member</th><th>Period</th><th>Net</th><th>Status</th></tr></thead><tbody>
+          ${dpay.slice(0,100).map(r => `<tr><td>${esc(r.day)}</td><td>${esc(r.member_code)}</td><td>${esc(r.period_label)}</td><td>₹${r.net_amount}</td><td>${esc(r.status)}</td></tr>`).join('')}
+        </tbody></table>` : '<div class="empty">No payouts committed yet.</div>';
+  } catch (e) { document.getElementById('dailyPayoutsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; }
+
+  document.getElementById('rp_btn').addEventListener('click', async () => {
+    const code = document.getElementById('rp_code').value.trim();
+    if (!code) return;
+    try {
+      const [pv, bal] = await Promise.all([
+        api('/api/reports/downline-pv/' + encodeURIComponent(code)),
+        api('/api/reports/member-balance/' + encodeURIComponent(code)),
+      ]);
+      document.getElementById('rp_result').innerHTML = `
+        <p class="muted">Total downline PV: ${pv.total_pv} · Total downline BV: ${pv.total_bv} · Wallet balance: ₹${bal.balance.toLocaleString('en-IN')}</p>
+      `;
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+}
+
 // ---------- Products ----------
 async function loadProducts() {
   const el = document.getElementById('tab-products');
@@ -669,6 +994,15 @@ async function loadRewards() {
       <button id="addRewardBtn">+ Add</button>
     </div>
     <div id="rewardsTable"><div class="empty">Loading…</div></div>
+  </div>
+  <div class="panel"><h2>Reward Sessions</h2>
+    <p class="muted">Groups rewards into a named session/cycle (e.g. "Aug 2026 Session") — matches admin.airxplus.com's Reward Session master.</p>
+    <div class="row">
+      <input id="rs_name" placeholder="Session name" />
+      <input id="rs_date" type="date" style="max-width:160px" />
+      <button id="addSessionBtn">+ Add</button>
+    </div>
+    <div id="sessionsTable"><div class="empty">Loading…</div></div>
   </div>`;
   async function refresh() {
     const rewards = await api('/api/rewards');
@@ -677,6 +1011,14 @@ async function loadRewards() {
           ${rewards.map(r => `<tr><td>${esc(r.reward_name)}</td><td>${r.criteria_pv}</td><td>${esc(r.reward_value)}</td></tr>`).join('')}
         </tbody></table>`
       : '<div class="empty">No rewards defined yet.</div>';
+  }
+  async function refreshSessions() {
+    const sessions = await api('/api/reward-sessions');
+    document.getElementById('sessionsTable').innerHTML = sessions.length
+      ? `<table><thead><tr><th>Session</th><th>Date</th><th>Status</th></tr></thead><tbody>
+          ${sessions.map(s => `<tr><td>${esc(s.session_name)}</td><td>${esc(s.session_date) || '—'}</td><td>${esc(s.status)}</td></tr>`).join('')}
+        </tbody></table>`
+      : '<div class="empty">No reward sessions yet.</div>';
   }
   document.getElementById('addRewardBtn').addEventListener('click', async () => {
     try {
@@ -688,7 +1030,17 @@ async function loadRewards() {
       toast('Reward added', 'success'); refresh();
     } catch (e) { toast('Failed: ' + e.message, 'error'); }
   });
+  document.getElementById('addSessionBtn').addEventListener('click', async () => {
+    try {
+      await api('/api/reward-sessions', { method: 'POST', body: JSON.stringify({
+        session_name: document.getElementById('rs_name').value.trim(),
+        session_date: document.getElementById('rs_date').value || undefined,
+      })});
+      toast('Session added', 'success'); refreshSessions();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
   refresh().catch(e => { document.getElementById('rewardsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+  refreshSessions().catch(e => { document.getElementById('sessionsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
 }
 
 // ---------- Boot ----------
