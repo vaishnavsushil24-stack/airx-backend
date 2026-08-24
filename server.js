@@ -44,7 +44,7 @@ const SHOP_FILE = path.join(__dirname, "data", "shopify.json");
 // aren't available in the build environment this was developed in.
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Headers", "Content-Type, x-api-key");
+  res.header("Access-Control-Allow-Headers", "Content-Type, x-api-key, Authorization");
   res.header("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
@@ -91,6 +91,84 @@ function requireApiKey(req, res, next) {
     return res.status(401).json({ error: "invalid or missing x-api-key" });
   }
   next();
+}
+
+// ---------- Phase 8: multi-user admin auth (Admin/User/UserGroup/Permissions) ----------
+// requireApiKey (above) is untouched and keeps working exactly as before —
+// it's now the "system/master" credential. requireAccess(moduleKey) is the
+// new guard: it accepts EITHER the same master x-api-key (unrestricted, for
+// backward compatibility with anything already using it) OR a per-user
+// session token whose role grants that specific module.
+
+const MODULE_KEYS = [
+  "dashboard",
+  "members",
+  "masters",
+  "commission",
+  "payouts",
+  "accounts",
+  "reports",
+  "products",
+  "franchises",
+  "rewards",
+  "cms",
+  "user_management",
+];
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return { salt, hash };
+}
+
+function verifyPassword(password, salt, hash) {
+  const attempt = crypto.scryptSync(password, salt, 64).toString("hex");
+  const a = Buffer.from(attempt, "hex");
+  const b = Buffer.from(hash, "hex");
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function loadSession(token) {
+  if (!token) return null;
+  const session = db.prepare("SELECT * FROM admin_sessions WHERE token = ?").get(token);
+  if (!session) return null;
+  if (new Date(session.expires_at).getTime() < Date.now()) {
+    db.prepare("DELETE FROM admin_sessions WHERE id = ?").run(session.id);
+    return null;
+  }
+  const user = db.prepare("SELECT * FROM admin_users WHERE id = ?").get(session.user_id);
+  if (!user || user.status !== "Active") return null;
+  const role = db.prepare("SELECT * FROM admin_roles WHERE id = ?").get(user.role_id);
+  if (!role) return null;
+  let permissions = [];
+  try {
+    permissions = JSON.parse(role.permissions);
+  } catch (e) {
+    permissions = [];
+  }
+  db.prepare("UPDATE admin_sessions SET last_seen_at = datetime('now') WHERE id = ?").run(session.id);
+  return { session, user, role, permissions };
+}
+
+function requireAccess(moduleKey) {
+  return (req, res, next) => {
+    const apiKey = req.header("x-api-key");
+    if (process.env.AIRX_API_KEY && apiKey === process.env.AIRX_API_KEY) {
+      req.identity = { type: "system", permissions: ["*"] };
+      return next();
+    }
+    const auth = req.header("Authorization") || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : null;
+    const loaded = loadSession(token);
+    if (!loaded) {
+      return res.status(401).json({ error: "invalid or missing credentials (x-api-key or Authorization: Bearer <token>)" });
+    }
+    if (!loaded.permissions.includes("*") && !loaded.permissions.includes(moduleKey)) {
+      return res.status(403).json({ error: `user "${loaded.user.username}" does not have access to "${moduleKey}"` });
+    }
+    req.identity = { type: "admin_user", user: loaded.user, role: loaded.role, permissions: loaded.permissions };
+    next();
+  };
 }
 
 // =====================================================================
@@ -2690,6 +2768,239 @@ app.delete("/api/cms/:type/:id", requireApiKey, requireCmsType, (req, res) => {
   const result = db
     .prepare("DELETE FROM cms_content WHERE id = ? AND content_type = ?")
     .run(req.params.id, req.params.type);
+  res.json({ deleted: result.changes > 0 });
+});
+
+// ==========================================================================
+// PHASE 8 — multi-user admin auth: Admin / User / UserGroup / Permissions
+// (2026-08-24). Additive on top of the existing single-shared-AIRX_API_KEY
+// model (see requireAccess above) — every route below is brand new, nothing
+// pre-existing was touched in this pass.
+// ==========================================================================
+
+const SESSION_DAYS = 7;
+
+function issueSession(userId) {
+  const token = crypto.randomBytes(32).toString("hex");
+  const expiresAt = new Date(Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  db.prepare("INSERT INTO admin_sessions (user_id, token, expires_at) VALUES (?, ?, ?)").run(userId, token, expiresAt);
+  return { token, expiresAt };
+}
+
+function publicUser(user, role) {
+  let permissions = [];
+  try {
+    permissions = JSON.parse(role.permissions);
+  } catch (e) {
+    permissions = [];
+  }
+  return {
+    id: user.id,
+    username: user.username,
+    full_name: user.full_name,
+    status: user.status,
+    role_id: role.id,
+    role_name: role.role_name,
+    permissions,
+  };
+}
+
+// GET /api/auth/bootstrap-status — public. The admin.html login screen uses
+// this to decide whether to show "create the first Super Admin" instead of
+// a normal login form (no staff accounts exist yet).
+app.get("/api/auth/bootstrap-status", (req, res) => {
+  const count = db.prepare("SELECT COUNT(*) AS n FROM admin_users").get().n;
+  res.json({ needsBootstrap: count === 0 });
+});
+
+// POST /api/auth/bootstrap — public, but self-disables the moment the first
+// admin_users row exists (409 after that). Creates (or reuses) a "Super
+// Admin" role with permissions ["*"] and the first user, then logs them in.
+app.post("/api/auth/bootstrap", (req, res) => {
+  const existing = db.prepare("SELECT COUNT(*) AS n FROM admin_users").get().n;
+  if (existing > 0) {
+    return res.status(409).json({ error: "an admin user already exists — use /api/auth/login instead" });
+  }
+  const { username, password, full_name } = req.body;
+  if (!username || !password) return res.status(400).json({ error: "username and password are required" });
+  if (String(password).length < 8) return res.status(400).json({ error: "password must be at least 8 characters" });
+  let role = db.prepare("SELECT * FROM admin_roles WHERE role_name = 'Super Admin'").get();
+  if (!role) {
+    const roleResult = db
+      .prepare("INSERT INTO admin_roles (role_name, permissions) VALUES ('Super Admin', ?)")
+      .run(JSON.stringify(["*"]));
+    role = db.prepare("SELECT * FROM admin_roles WHERE id = ?").get(roleResult.lastInsertRowid);
+  }
+  const { salt, hash } = hashPassword(password);
+  const userResult = db
+    .prepare("INSERT INTO admin_users (username, password_hash, password_salt, full_name, role_id) VALUES (?, ?, ?, ?, ?)")
+    .run(username, hash, salt, full_name || null, role.id);
+  const user = db.prepare("SELECT * FROM admin_users WHERE id = ?").get(userResult.lastInsertRowid);
+  const { token, expiresAt } = issueSession(user.id);
+  res.json({ token, expiresAt, user: publicUser(user, role) });
+});
+
+app.post("/api/auth/login", (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ error: "username and password are required" });
+  const user = db.prepare("SELECT * FROM admin_users WHERE username = ?").get(username);
+  if (!user || user.status !== "Active" || !verifyPassword(password, user.password_salt, user.password_hash)) {
+    return res.status(401).json({ error: "invalid username or password" });
+  }
+  const role = db.prepare("SELECT * FROM admin_roles WHERE id = ?").get(user.role_id);
+  db.prepare("UPDATE admin_users SET last_login_at = datetime('now') WHERE id = ?").run(user.id);
+  const { token, expiresAt } = issueSession(user.id);
+  res.json({ token, expiresAt, user: publicUser(user, role) });
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  const auth = req.header("Authorization") || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : null;
+  if (!token) return res.json({ loggedOut: false });
+  const result = db.prepare("DELETE FROM admin_sessions WHERE token = ?").run(token);
+  res.json({ loggedOut: result.changes > 0 });
+});
+
+app.get("/api/auth/me", (req, res) => {
+  const apiKey = req.header("x-api-key");
+  if (process.env.AIRX_API_KEY && apiKey === process.env.AIRX_API_KEY) {
+    return res.json({ type: "system", username: "system (AIRX_API_KEY)", permissions: ["*"] });
+  }
+  const auth = req.header("Authorization") || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : null;
+  const loaded = loadSession(token);
+  if (!loaded) return res.status(401).json({ error: "invalid or missing credentials" });
+  res.json({ type: "admin_user", ...publicUser(loaded.user, loaded.role) });
+});
+
+// ---------- UserGroup / Permissions (admin_roles) ----------
+
+app.get("/api/admin/roles", requireAccess("user_management"), (req, res) => {
+  res.json(db.prepare("SELECT * FROM admin_roles ORDER BY role_name ASC").all().map((r) => ({ ...r, permissions: JSON.parse(r.permissions) })));
+});
+
+app.post("/api/admin/roles", requireAccess("user_management"), (req, res) => {
+  const { role_name, permissions } = req.body;
+  if (!role_name) return res.status(400).json({ error: "role_name is required" });
+  const perms = Array.isArray(permissions) ? permissions : [];
+  const invalid = perms.filter((p) => p !== "*" && !MODULE_KEYS.includes(p));
+  if (invalid.length) return res.status(400).json({ error: `unknown permission(s): ${invalid.join(", ")}` });
+  try {
+    const result = db.prepare("INSERT INTO admin_roles (role_name, permissions) VALUES (?, ?)").run(role_name, JSON.stringify(perms));
+    const row = db.prepare("SELECT * FROM admin_roles WHERE id = ?").get(result.lastInsertRowid);
+    res.json({ ...row, permissions: JSON.parse(row.permissions) });
+  } catch (err) {
+    if (String(err.message).includes("UNIQUE")) return res.status(409).json({ error: `role "${role_name}" already exists` });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/api/admin/roles/:id", requireAccess("user_management"), (req, res) => {
+  const existing = db.prepare("SELECT * FROM admin_roles WHERE id = ?").get(req.params.id);
+  if (!existing) return res.status(404).json({ error: "not found" });
+  const role_name = req.body.role_name || existing.role_name;
+  let perms = existing.permissions;
+  if (Array.isArray(req.body.permissions)) {
+    const invalid = req.body.permissions.filter((p) => p !== "*" && !MODULE_KEYS.includes(p));
+    if (invalid.length) return res.status(400).json({ error: `unknown permission(s): ${invalid.join(", ")}` });
+    perms = JSON.stringify(req.body.permissions);
+  }
+  db.prepare("UPDATE admin_roles SET role_name=?, permissions=? WHERE id=?").run(role_name, perms, req.params.id);
+  const row = db.prepare("SELECT * FROM admin_roles WHERE id = ?").get(req.params.id);
+  res.json({ ...row, permissions: JSON.parse(row.permissions) });
+});
+
+app.delete("/api/admin/roles/:id", requireAccess("user_management"), (req, res) => {
+  const inUse = db.prepare("SELECT 1 FROM admin_users WHERE role_id = ? LIMIT 1").get(req.params.id);
+  if (inUse) return res.status(409).json({ error: "cannot delete a role that is still assigned to a user — reassign them first" });
+  const result = db.prepare("DELETE FROM admin_roles WHERE id = ?").run(req.params.id);
+  res.json({ deleted: result.changes > 0 });
+});
+
+// ---------- Admin Users ----------
+
+app.get("/api/admin/users", requireAccess("user_management"), (req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT admin_users.*, admin_roles.role_name, admin_roles.permissions AS role_permissions
+       FROM admin_users JOIN admin_roles ON admin_roles.id = admin_users.role_id
+       ORDER BY admin_users.created_at DESC`
+    )
+    .all();
+  res.json(
+    rows.map((r) => ({
+      id: r.id,
+      username: r.username,
+      full_name: r.full_name,
+      status: r.status,
+      role_id: r.role_id,
+      role_name: r.role_name,
+      permissions: JSON.parse(r.role_permissions),
+      created_at: r.created_at,
+      last_login_at: r.last_login_at,
+    }))
+  );
+});
+
+app.post("/api/admin/users", requireAccess("user_management"), (req, res) => {
+  const { username, password, full_name, role_id } = req.body;
+  if (!username || !password || !role_id) return res.status(400).json({ error: "username, password and role_id are required" });
+  if (String(password).length < 8) return res.status(400).json({ error: "password must be at least 8 characters" });
+  const role = db.prepare("SELECT * FROM admin_roles WHERE id = ?").get(role_id);
+  if (!role) return res.status(400).json({ error: "unknown role_id" });
+  const { salt, hash } = hashPassword(password);
+  try {
+    const result = db
+      .prepare("INSERT INTO admin_users (username, password_hash, password_salt, full_name, role_id) VALUES (?, ?, ?, ?, ?)")
+      .run(username, hash, salt, full_name || null, role_id);
+    const user = db.prepare("SELECT * FROM admin_users WHERE id = ?").get(result.lastInsertRowid);
+    res.json(publicUser(user, role));
+  } catch (err) {
+    if (String(err.message).includes("UNIQUE")) return res.status(409).json({ error: `username "${username}" already exists` });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/api/admin/users/:id", requireAccess("user_management"), (req, res) => {
+  const existing = db.prepare("SELECT * FROM admin_users WHERE id = ?").get(req.params.id);
+  if (!existing) return res.status(404).json({ error: "not found" });
+  const merged = {
+    full_name: req.body.full_name !== undefined ? req.body.full_name : existing.full_name,
+    role_id: req.body.role_id !== undefined ? req.body.role_id : existing.role_id,
+    status: req.body.status !== undefined ? req.body.status : existing.status,
+  };
+  if (merged.role_id !== existing.role_id && !db.prepare("SELECT 1 FROM admin_roles WHERE id = ?").get(merged.role_id)) {
+    return res.status(400).json({ error: "unknown role_id" });
+  }
+  db.prepare("UPDATE admin_users SET full_name=?, role_id=?, status=? WHERE id=?").run(
+    merged.full_name,
+    merged.role_id,
+    merged.status,
+    req.params.id
+  );
+  const role = db.prepare("SELECT * FROM admin_roles WHERE id = ?").get(merged.role_id);
+  const user = db.prepare("SELECT * FROM admin_users WHERE id = ?").get(req.params.id);
+  res.json(publicUser(user, role));
+});
+
+app.post("/api/admin/users/:id/reset-password", requireAccess("user_management"), (req, res) => {
+  const existing = db.prepare("SELECT * FROM admin_users WHERE id = ?").get(req.params.id);
+  if (!existing) return res.status(404).json({ error: "not found" });
+  const { password } = req.body;
+  if (!password || String(password).length < 8) return res.status(400).json({ error: "password must be at least 8 characters" });
+  const { salt, hash } = hashPassword(password);
+  db.prepare("UPDATE admin_users SET password_hash=?, password_salt=? WHERE id=?").run(hash, salt, req.params.id);
+  db.prepare("DELETE FROM admin_sessions WHERE user_id = ?").run(req.params.id); // force re-login everywhere
+  res.json({ reset: true });
+});
+
+app.delete("/api/admin/users/:id", requireAccess("user_management"), (req, res) => {
+  const totalUsers = db.prepare("SELECT COUNT(*) AS n FROM admin_users").get().n;
+  if (totalUsers <= 1) {
+    return res.status(409).json({ error: "cannot delete the last remaining admin user — create another one first" });
+  }
+  db.prepare("DELETE FROM admin_sessions WHERE user_id = ?").run(req.params.id);
+  const result = db.prepare("DELETE FROM admin_users WHERE id = ?").run(req.params.id);
   res.json({ deleted: result.changes > 0 });
 });
 

@@ -356,6 +356,43 @@ CREATE TABLE IF NOT EXISTS cms_content (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Phase 8: store.airxplus.com's / admin.airxplus.com's own Admin, User,
+-- UserGroup, Permissions screens — a real multi-staff login system on top
+-- of (not instead of) the single shared AIRX_API_KEY, which keeps working
+-- unchanged as the "system/master" credential (existing automation, and
+-- this app's own login screen, are unaffected). admin_roles.permissions is
+-- a JSON array of module keys (see MODULE_KEYS in server.js), or ["*"] for
+-- every module (Super Admin).
+CREATE TABLE IF NOT EXISTS admin_roles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  role_name TEXT UNIQUE NOT NULL,
+  permissions TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS admin_users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  password_salt TEXT NOT NULL,
+  full_name TEXT,
+  role_id INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'Active',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_login_at TEXT,
+  FOREIGN KEY (role_id) REFERENCES admin_roles(id)
+);
+
+CREATE TABLE IF NOT EXISTS admin_sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  token TEXT UNIQUE NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  expires_at TEXT NOT NULL,
+  last_seen_at TEXT,
+  FOREIGN KEY (user_id) REFERENCES admin_users(id)
+);
 `);
 
 module.exports = { db };
