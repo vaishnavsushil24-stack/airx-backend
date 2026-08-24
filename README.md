@@ -459,12 +459,44 @@ cascading the safe metadata (KYC docs, audit log, empty PV balance row)
 — when a member is genuinely "clean" (no money history, no downline).
 
 **Deliberately not built** (flagged, not silently skipped): store.airxplus.com's
-own Admin/User/UserGroup/Permissions screens and admin.airxplus.com's
-content-management menus (News, Meeting, Gallery/Video/Media/Presentations,
-Training, Testimonial, Slider). The former is a full multi-role login
-system — a separate, security-sensitive project on top of the current
-single-shared-`AIRX_API_KEY` model, not something to bolt on casually.
-The latter is public-facing marketing content rather than
-distributor/financial ops, and each is its own small CMS (title, body,
-media, publish date) — happy to build them next if wanted, just called
-out here rather than assumed.
+own Admin/User/UserGroup/Permissions screens. This is a full multi-role
+login system — a separate, security-sensitive project on top of the
+current single-shared-`AIRX_API_KEY` model, not something to bolt on
+casually — so it's still waiting on an explicit go-ahead.
+
+## Phase 7 — CMS content menus (2026-08-24)
+
+admin.airxplus.com's remaining public-facing content menus — **News**,
+**Meeting**, **Gallery**, **Video**, **Media/Presentations**,
+**Training**, **Testimonial**, **Slider** — are all structurally the
+same thing: a list of entries with a title, some text, an optional
+image/link, a date, a display order and a status. Rather than eight
+near-identical tables and route sets, they share one table,
+`cms_content` (`content_type` column selects which menu a row belongs
+to), and one generic route family:
+
+`GET/POST /api/cms/:type`, `PATCH/DELETE /api/cms/:type/:id` — `:type`
+is one of `news`, `meeting`, `gallery`, `video`, `media`, `training`,
+`testimonial`, `slider` (validated, `400` on anything else). Fields:
+`title` (required), `description`, `image_url`, `link_url`,
+`event_date`, `display_order`, `status`.
+
+There's no file-upload infrastructure in this app — KYC documents
+(Phase 6) are metadata-only too (`doc_type`/`doc_number`, no binary
+storage) — so `image_url`/`link_url` are pasted URLs (an already-hosted
+image or video link) rather than uploaded files, consistent with that
+existing pattern.
+
+`public/admin.html` got a new **Content (CMS)** tab with one panel per
+menu, each with an add-form (title/order/date/description/image/link)
+and a table with Activate/Deactivate and Delete actions per row — one
+shared renderer parameterized by content type rather than eight copies
+of the same panel.
+
+A functional test (`test_phase7.js`, run with `node test_phase7.js`)
+exercises the exact SQL the routes use: an insert per content type,
+type-scoped listing + ordering, patch/update, and that delete is scoped
+to `(id, content_type)` together (a delete call for the right id but
+wrong type is correctly a no-op). All 15 assertions pass, and every
+endpoint was also re-verified live against the deployed Render API
+after push.

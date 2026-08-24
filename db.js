@@ -333,6 +333,29 @@ CREATE TABLE IF NOT EXISTS member_audit_log (
   detail TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Phase 7: admin.airxplus.com's public-facing content menus (News, Meeting,
+-- Gallery, Video, Media/Presentations, Training, Testimonial, Slider). One
+-- shared table keyed by content_type — these menus are all "a list of
+-- entries with a title, some text, an optional image/link, an order and a
+-- status" so a single generic table + generic CRUD route avoids seven
+-- near-identical copies. There's no file-upload infra in this app (KYC
+-- documents are metadata-only too, see kyc_documents.doc_number) so
+-- image_url/link_url are pasted URLs (e.g. already-hosted image/video
+-- links), not uploaded binaries.
+CREATE TABLE IF NOT EXISTS cms_content (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  content_type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT,
+  image_url TEXT,
+  link_url TEXT,
+  event_date TEXT,
+  display_order INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'Active',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 `);
 
 module.exports = { db };

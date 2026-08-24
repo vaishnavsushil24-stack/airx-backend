@@ -2610,6 +2610,89 @@ app.delete("/api/reward-sessions/:id", requireApiKey, (req, res) => {
   res.json({ deleted: result.changes > 0 });
 });
 
+// ==========================================================================
+// PHASE 7 — admin.airxplus.com's public-facing content menus (2026-08-24)
+// News, Meeting, Gallery, Video, Media/Presentations, Training, Testimonial,
+// Slider. One generic table (cms_content, see db.js) + one generic CRUD
+// route family keyed by :type, instead of seven near-identical route sets.
+// ==========================================================================
+
+const CMS_CONTENT_TYPES = [
+  "news",
+  "meeting",
+  "gallery",
+  "video",
+  "media",
+  "training",
+  "testimonial",
+  "slider",
+];
+
+function requireCmsType(req, res, next) {
+  if (!CMS_CONTENT_TYPES.includes(req.params.type)) {
+    return res.status(400).json({ error: `unknown content type "${req.params.type}". Valid: ${CMS_CONTENT_TYPES.join(", ")}` });
+  }
+  next();
+}
+
+app.get("/api/cms/:type", requireApiKey, requireCmsType, (req, res) => {
+  res.json(
+    db
+      .prepare("SELECT * FROM cms_content WHERE content_type = ? ORDER BY display_order ASC, created_at DESC")
+      .all(req.params.type)
+  );
+});
+
+app.post("/api/cms/:type", requireApiKey, requireCmsType, (req, res) => {
+  const { title, description, image_url, link_url, event_date, display_order, status } = req.body;
+  if (!title) return res.status(400).json({ error: "title is required" });
+  const result = db
+    .prepare(
+      `INSERT INTO cms_content (content_type, title, description, image_url, link_url, event_date, display_order, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      req.params.type,
+      title,
+      description || null,
+      image_url || null,
+      link_url || null,
+      event_date || null,
+      Number.isFinite(Number(display_order)) ? Number(display_order) : 0,
+      status || "Active"
+    );
+  res.json(db.prepare("SELECT * FROM cms_content WHERE id = ?").get(result.lastInsertRowid));
+});
+
+app.patch("/api/cms/:type/:id", requireApiKey, requireCmsType, (req, res) => {
+  const existing = db
+    .prepare("SELECT * FROM cms_content WHERE id = ? AND content_type = ?")
+    .get(req.params.id, req.params.type);
+  if (!existing) return res.status(404).json({ error: "not found" });
+  const merged = { ...existing, ...req.body };
+  db.prepare(
+    `UPDATE cms_content SET title=?, description=?, image_url=?, link_url=?, event_date=?, display_order=?, status=?, updated_at=datetime('now')
+     WHERE id=?`
+  ).run(
+    merged.title,
+    merged.description,
+    merged.image_url,
+    merged.link_url,
+    merged.event_date,
+    Number.isFinite(Number(merged.display_order)) ? Number(merged.display_order) : 0,
+    merged.status,
+    req.params.id
+  );
+  res.json(db.prepare("SELECT * FROM cms_content WHERE id = ?").get(req.params.id));
+});
+
+app.delete("/api/cms/:type/:id", requireApiKey, requireCmsType, (req, res) => {
+  const result = db
+    .prepare("DELETE FROM cms_content WHERE id = ? AND content_type = ?")
+    .run(req.params.id, req.params.type);
+  res.json({ deleted: result.changes > 0 });
+});
+
 app.get("/health", (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
 app.listen(PORT, () => {
