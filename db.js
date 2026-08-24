@@ -242,4 +242,97 @@ for (const [key, value, label] of defaultCommissionSettings) {
   insertCommissionSetting.run(key, value, label);
 }
 
+// ---------------------------------------------------------------------
+// Phase 6 — remaining admin.airxplus.com menus (2026-08-24): Master
+// (Bank/State/Package), Member (KYC Documents, audit trail for Manual
+// Active / Reset Status / Change User), Accounts (Fund Requests, which
+// also answers Reports > "View Fund Request"), and Reward Session. Daily
+// Point/Payout detail, Topup Detail, Payout Transfer Weekly and the TDS
+// report are all served as derived queries over pv_ledger / payouts /
+// wallet_transactions (already have the right columns) rather than new
+// tables — see the matching routes in server.js.
+// ---------------------------------------------------------------------
+db.exec(`
+CREATE TABLE IF NOT EXISTS banks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  bank_name TEXT UNIQUE NOT NULL,
+  status TEXT NOT NULL DEFAULT 'Active',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS states (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  state_name TEXT UNIQUE NOT NULL,
+  status TEXT NOT NULL DEFAULT 'Active',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Mirrors admin.airxplus.com Master > Package (KitMaster.aspx) — join
+-- kits like REGISTRATION / ACTIVE, each with its own pair-value PV. The
+-- commission engine's pair_value_pv setting stays as the single number
+-- used for matching until the owner asks to price per-package; this
+-- table exists so those kit prices/names are at least tracked and
+-- editable, same as the legacy Package master.
+CREATE TABLE IF NOT EXISTS packages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  package_name TEXT UNIQUE NOT NULL,
+  pair_value_pv REAL NOT NULL DEFAULT 0,
+  price REAL NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'Active',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS kyc_documents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  member_code TEXT NOT NULL,
+  doc_type TEXT NOT NULL,
+  doc_number TEXT,
+  note TEXT,
+  status TEXT NOT NULL DEFAULT 'Pending',
+  uploaded_at TEXT NOT NULL DEFAULT (datetime('now')),
+  reviewed_at TEXT,
+  review_note TEXT,
+  FOREIGN KEY (member_code) REFERENCES members(member_code)
+);
+
+-- Accounts > "View Fund Request" (also serves Reports > "View Fund
+-- Request", same underlying data) — a member/franchise asks to withdraw
+-- from their wallet; admin approves or rejects. Approval posts a debit
+-- to wallet_transactions so the balance reflects the payout immediately.
+CREATE TABLE IF NOT EXISTS fund_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  member_code TEXT NOT NULL,
+  amount REAL NOT NULL,
+  wallet_type TEXT NOT NULL DEFAULT 'Weekly',
+  status TEXT NOT NULL DEFAULT 'Pending',
+  note TEXT,
+  requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+  processed_at TEXT,
+  process_note TEXT,
+  FOREIGN KEY (member_code) REFERENCES members(member_code)
+);
+
+CREATE TABLE IF NOT EXISTS reward_sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_name TEXT UNIQUE NOT NULL,
+  session_date TEXT,
+  status TEXT NOT NULL DEFAULT 'Active',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Audit trail for the admin-only member actions that change state without
+-- a normal PATCH (Manual Active, Reset Member Status, Change User) — so
+-- there's always a record of who/what/when even without full multi-user
+-- login (still single shared AIRX_API_KEY; "who" is whatever note the
+-- caller supplies).
+CREATE TABLE IF NOT EXISTS member_audit_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  member_code TEXT NOT NULL,
+  action TEXT NOT NULL,
+  detail TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+`);
+
 module.exports = { db };

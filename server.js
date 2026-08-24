@@ -2100,6 +2100,469 @@ app.get("/api/reports/rank-achievers", requireApiKey, (req, res) => {
   );
 });
 
+// =====================================================================
+// PHASE 6 — REMAINING admin.airxplus.com FEATURES (2026-08-24)
+// Covers Master (Bank/State/Package), Member (KYC Documents, Manual
+// Active, Reset Member Status, Change User), Payout (Daily Point/Payout
+// Detail), Accounts (Fund Requests, Payout Transfer Weekly, Topup
+// Detail, TDS Report), Utility (Fund Credit/Debit wallet ledger — the
+// wallet_transactions table already existed for the weekly payout
+// engine but had no direct API of its own until now), and Reward
+// Session. See MLM_INTEGRATION_PLAN.md for the full source menu list.
+//
+// Deliberately NOT built here: store.airxplus.com's own Admin/User /
+// UserGroup / Permissions screens and admin.airxplus.com's content-
+// management menus (News, Meeting, Gallery/Video/Media/Presentations,
+// Training, Testimonial, Slider). Those are either a full multi-role
+// login system (a separate, security-sensitive project on top of the
+// current single-shared-API-key model) or public-facing marketing
+// content rather than distributor/financial ops — flagged to the owner
+// rather than assumed.
+// =====================================================================
+
+// ---------- Master: Bank ----------
+
+app.get("/api/masters/banks", requireApiKey, (req, res) => {
+  res.json(db.prepare("SELECT * FROM banks ORDER BY bank_name").all());
+});
+
+app.post("/api/masters/banks", requireApiKey, (req, res) => {
+  const { bank_name, status } = req.body;
+  if (!bank_name) return res.status(400).json({ error: "bank_name is required" });
+  try {
+    const result = db
+      .prepare("INSERT INTO banks (bank_name, status) VALUES (?, ?)")
+      .run(bank_name, status || "Active");
+    res.json(db.prepare("SELECT * FROM banks WHERE id = ?").get(result.lastInsertRowid));
+  } catch (err) {
+    if (String(err.message).includes("UNIQUE")) {
+      return res.status(409).json({ error: `bank "${bank_name}" already exists` });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/api/masters/banks/:id", requireApiKey, (req, res) => {
+  const existing = db.prepare("SELECT * FROM banks WHERE id = ?").get(req.params.id);
+  if (!existing) return res.status(404).json({ error: "not found" });
+  const merged = { ...existing, ...req.body };
+  db.prepare("UPDATE banks SET bank_name=?, status=? WHERE id=?").run(merged.bank_name, merged.status, req.params.id);
+  res.json(db.prepare("SELECT * FROM banks WHERE id = ?").get(req.params.id));
+});
+
+app.delete("/api/masters/banks/:id", requireApiKey, (req, res) => {
+  const result = db.prepare("DELETE FROM banks WHERE id = ?").run(req.params.id);
+  res.json({ deleted: result.changes > 0 });
+});
+
+// ---------- Master: State ----------
+
+app.get("/api/masters/states", requireApiKey, (req, res) => {
+  res.json(db.prepare("SELECT * FROM states ORDER BY state_name").all());
+});
+
+app.post("/api/masters/states", requireApiKey, (req, res) => {
+  const { state_name, status } = req.body;
+  if (!state_name) return res.status(400).json({ error: "state_name is required" });
+  try {
+    const result = db
+      .prepare("INSERT INTO states (state_name, status) VALUES (?, ?)")
+      .run(state_name, status || "Active");
+    res.json(db.prepare("SELECT * FROM states WHERE id = ?").get(result.lastInsertRowid));
+  } catch (err) {
+    if (String(err.message).includes("UNIQUE")) {
+      return res.status(409).json({ error: `state "${state_name}" already exists` });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/api/masters/states/:id", requireApiKey, (req, res) => {
+  const existing = db.prepare("SELECT * FROM states WHERE id = ?").get(req.params.id);
+  if (!existing) return res.status(404).json({ error: "not found" });
+  const merged = { ...existing, ...req.body };
+  db.prepare("UPDATE states SET state_name=?, status=? WHERE id=?").run(merged.state_name, merged.status, req.params.id);
+  res.json(db.prepare("SELECT * FROM states WHERE id = ?").get(req.params.id));
+});
+
+app.delete("/api/masters/states/:id", requireApiKey, (req, res) => {
+  const result = db.prepare("DELETE FROM states WHERE id = ?").run(req.params.id);
+  res.json({ deleted: result.changes > 0 });
+});
+
+// ---------- Master: Package (join-kit master, e.g. REGISTRATION / ACTIVE) ----------
+
+app.get("/api/masters/packages", requireApiKey, (req, res) => {
+  res.json(db.prepare("SELECT * FROM packages ORDER BY pair_value_pv").all());
+});
+
+app.post("/api/masters/packages", requireApiKey, (req, res) => {
+  const { package_name, pair_value_pv, price, status } = req.body;
+  if (!package_name) return res.status(400).json({ error: "package_name is required" });
+  try {
+    const result = db
+      .prepare("INSERT INTO packages (package_name, pair_value_pv, price, status) VALUES (?, ?, ?, ?)")
+      .run(package_name, Number(pair_value_pv) || 0, Number(price) || 0, status || "Active");
+    res.json(db.prepare("SELECT * FROM packages WHERE id = ?").get(result.lastInsertRowid));
+  } catch (err) {
+    if (String(err.message).includes("UNIQUE")) {
+      return res.status(409).json({ error: `package "${package_name}" already exists` });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/api/masters/packages/:id", requireApiKey, (req, res) => {
+  const existing = db.prepare("SELECT * FROM packages WHERE id = ?").get(req.params.id);
+  if (!existing) return res.status(404).json({ error: "not found" });
+  const merged = { ...existing, ...req.body };
+  db.prepare(
+    "UPDATE packages SET package_name=?, pair_value_pv=?, price=?, status=?, updated_at=datetime('now') WHERE id=?"
+  ).run(merged.package_name, Number(merged.pair_value_pv) || 0, Number(merged.price) || 0, merged.status, req.params.id);
+  res.json(db.prepare("SELECT * FROM packages WHERE id = ?").get(req.params.id));
+});
+
+app.delete("/api/masters/packages/:id", requireApiKey, (req, res) => {
+  const result = db.prepare("DELETE FROM packages WHERE id = ?").run(req.params.id);
+  res.json({ deleted: result.changes > 0 });
+});
+
+// ---------- Member: KYC Documents ----------
+
+app.get("/api/members/:code/kyc-documents", requireApiKey, (req, res) => {
+  res.json(
+    db.prepare("SELECT * FROM kyc_documents WHERE member_code = ? ORDER BY uploaded_at DESC").all(req.params.code)
+  );
+});
+
+app.post("/api/members/:code/kyc-documents", requireApiKey, (req, res) => {
+  const member = db.prepare("SELECT member_code FROM members WHERE member_code = ?").get(req.params.code);
+  if (!member) return res.status(404).json({ error: "member not found" });
+  const { doc_type, doc_number, note } = req.body;
+  if (!doc_type) return res.status(400).json({ error: "doc_type is required (e.g. PAN, Aadhaar, Bank Passbook)" });
+  const result = db
+    .prepare("INSERT INTO kyc_documents (member_code, doc_type, doc_number, note) VALUES (?, ?, ?, ?)")
+    .run(req.params.code, doc_type, doc_number || null, note || null);
+  res.json(db.prepare("SELECT * FROM kyc_documents WHERE id = ?").get(result.lastInsertRowid));
+});
+
+// Approve/reject a KYC document — also nudges the member's own kyc_status
+// forward when every document on file is Approved, back to Pending on
+// any Rejected, mirroring what "KYC Document" review does in admin.airxplus.com.
+app.patch("/api/kyc-documents/:id", requireApiKey, (req, res) => {
+  const existing = db.prepare("SELECT * FROM kyc_documents WHERE id = ?").get(req.params.id);
+  if (!existing) return res.status(404).json({ error: "not found" });
+  const { status, review_note } = req.body;
+  if (!["Pending", "Approved", "Rejected"].includes(status)) {
+    return res.status(400).json({ error: "status must be Pending, Approved, or Rejected" });
+  }
+  db.prepare(
+    "UPDATE kyc_documents SET status=?, review_note=?, reviewed_at=datetime('now') WHERE id=?"
+  ).run(status, review_note || null, req.params.id);
+
+  const docs = db.prepare("SELECT status FROM kyc_documents WHERE member_code = ?").all(existing.member_code);
+  let memberKyc = "Pending";
+  if (docs.length && docs.every((d) => d.status === "Approved")) memberKyc = "Approved";
+  else if (docs.some((d) => d.status === "Rejected")) memberKyc = "Pending";
+  db.prepare("UPDATE members SET kyc_status = ?, updated_at = datetime('now') WHERE member_code = ?").run(
+    memberKyc,
+    existing.member_code
+  );
+
+  res.json(db.prepare("SELECT * FROM kyc_documents WHERE id = ?").get(req.params.id));
+});
+
+// ---------- Member: Manual Active / Reset Member Status / Change User ----------
+
+// "Manual Active" — admin force-activates a member outside the normal
+// matching/activation flow (e.g. an offline cash payment for the kit).
+app.post("/api/members/:code/manual-active", requireApiKey, (req, res) => {
+  const member = db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code);
+  if (!member) return res.status(404).json({ error: "not found" });
+  const { note } = req.body;
+  db.prepare("UPDATE members SET status = 'Active', updated_at = datetime('now') WHERE member_code = ?").run(
+    req.params.code
+  );
+  db.prepare("INSERT INTO member_audit_log (member_code, action, detail) VALUES (?, 'manual_active', ?)").run(
+    req.params.code,
+    note || null
+  );
+  res.json(db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code));
+});
+
+// "Reset Member Status" — puts a member back to Inactive/Pending, e.g. to
+// undo an accidental manual-active or restart their activation flow.
+app.post("/api/members/:code/reset-status", requireApiKey, (req, res) => {
+  const member = db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code);
+  if (!member) return res.status(404).json({ error: "not found" });
+  const { note } = req.body;
+  db.prepare("UPDATE members SET status = 'Inactive', updated_at = datetime('now') WHERE member_code = ?").run(
+    req.params.code
+  );
+  db.prepare("INSERT INTO member_audit_log (member_code, action, detail) VALUES (?, 'reset_status', ?)").run(
+    req.params.code,
+    note || null
+  );
+  res.json(db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code));
+});
+
+// "Change User" — re-assign an existing member ID to a different person's
+// identity details (name/mobile/email/PAN), keeping the ID, downline and
+// PV history intact. Every prior value is written to the audit log so
+// nothing is silently overwritten.
+app.post("/api/members/:code/change-user", requireApiKey, (req, res) => {
+  const member = db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code);
+  if (!member) return res.status(404).json({ error: "not found" });
+  const { name, mobile, email, pan_number, note } = req.body;
+  if (!name) return res.status(400).json({ error: "name is required" });
+  const before = { name: member.name, mobile: member.mobile, email: member.email, pan_number: member.pan_number };
+  db.prepare(
+    "UPDATE members SET name=?, mobile=?, email=?, pan_number=?, updated_at=datetime('now') WHERE member_code=?"
+  ).run(name, mobile || null, email || null, pan_number || null, req.params.code);
+  db.prepare("INSERT INTO member_audit_log (member_code, action, detail) VALUES (?, 'change_user', ?)").run(
+    req.params.code,
+    JSON.stringify({ before, note: note || null })
+  );
+  res.json(db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code));
+});
+
+app.get("/api/members/:code/audit-log", requireApiKey, (req, res) => {
+  res.json(
+    db.prepare("SELECT * FROM member_audit_log WHERE member_code = ? ORDER BY created_at DESC").all(req.params.code)
+  );
+});
+
+// ---------- Payout: Daily Point Detail / Daily Payout Detail ----------
+// Derived from pv_ledger / payouts grouped by calendar day — we run
+// payouts weekly (not as separate daily jobs), so "daily" here means
+// "this weekly run's activity broken down by the day it was recorded",
+// same numbers as the Weekly MIS Report just sliced differently.
+
+app.get("/api/reports/daily-points", requireApiKey, (req, res) => {
+  const { from, to } = req.query;
+  let sql = `SELECT date(created_at) AS day, member_code, entry_type,
+                    SUM(pv) AS total_pv, SUM(bv) AS total_bv, COUNT(*) AS entries
+             FROM pv_ledger`;
+  const clauses = [];
+  const params = [];
+  if (from) { clauses.push("date(created_at) >= ?"); params.push(from); }
+  if (to) { clauses.push("date(created_at) <= ?"); params.push(to); }
+  if (clauses.length) sql += " WHERE " + clauses.join(" AND ");
+  sql += " GROUP BY day, member_code, entry_type ORDER BY day DESC";
+  res.json(db.prepare(sql).all(...params));
+});
+
+app.get("/api/reports/daily-payouts", requireApiKey, (req, res) => {
+  const { from, to } = req.query;
+  let sql = `SELECT date(created_at) AS day, member_code, period_label,
+                    gross_amount, tds_amount, admin_charge, net_amount, status
+             FROM payouts`;
+  const clauses = [];
+  const params = [];
+  if (from) { clauses.push("date(created_at) >= ?"); params.push(from); }
+  if (to) { clauses.push("date(created_at) <= ?"); params.push(to); }
+  if (clauses.length) sql += " WHERE " + clauses.join(" AND ");
+  sql += " ORDER BY created_at DESC";
+  res.json(db.prepare(sql).all(...params));
+});
+
+// ---------- Accounts: Fund Requests (also answers Reports > View Fund Request) ----------
+
+app.get("/api/fund-requests", requireApiKey, (req, res) => {
+  const { status, member_code } = req.query;
+  let sql = `SELECT fund_requests.*, members.name AS member_name FROM fund_requests
+             JOIN members ON members.member_code = fund_requests.member_code`;
+  const clauses = [];
+  const params = [];
+  if (status) { clauses.push("fund_requests.status = ?"); params.push(status); }
+  if (member_code) { clauses.push("fund_requests.member_code = ?"); params.push(member_code); }
+  if (clauses.length) sql += " WHERE " + clauses.join(" AND ");
+  sql += " ORDER BY fund_requests.requested_at DESC";
+  res.json(db.prepare(sql).all(...params));
+});
+
+app.post("/api/fund-requests", requireApiKey, (req, res) => {
+  const { member_code, amount, wallet_type, note } = req.body;
+  if (!member_code || !amount) return res.status(400).json({ error: "member_code and amount are required" });
+  const member = db.prepare("SELECT member_code FROM members WHERE member_code = ?").get(member_code);
+  if (!member) return res.status(400).json({ error: `unknown member_code "${member_code}"` });
+  const result = db
+    .prepare("INSERT INTO fund_requests (member_code, amount, wallet_type, note) VALUES (?, ?, ?, ?)")
+    .run(member_code, round2(Number(amount)), wallet_type || "Weekly", note || null);
+  res.json(db.prepare("SELECT * FROM fund_requests WHERE id = ?").get(result.lastInsertRowid));
+});
+
+// Approve posts a debit to the member's wallet immediately (so Member
+// Balance reflects the payout); reject just records the decision.
+app.patch("/api/fund-requests/:id", requireApiKey, (req, res) => {
+  const existing = db.prepare("SELECT * FROM fund_requests WHERE id = ?").get(req.params.id);
+  if (!existing) return res.status(404).json({ error: "not found" });
+  const { status, process_note } = req.body;
+  if (!["Approved", "Rejected"].includes(status)) {
+    return res.status(400).json({ error: "status must be Approved or Rejected" });
+  }
+  if (existing.status !== "Pending") {
+    return res.status(409).json({ error: `fund request is already ${existing.status}` });
+  }
+  db.exec("BEGIN");
+  try {
+    db.prepare(
+      "UPDATE fund_requests SET status=?, process_note=?, processed_at=datetime('now') WHERE id=?"
+    ).run(status, process_note || null, req.params.id);
+    if (status === "Approved") {
+      db.prepare(
+        `INSERT INTO wallet_transactions (member_code, wallet_type, txn_type, amount, reason)
+         VALUES (?, ?, 'debit', ?, ?)`
+      ).run(existing.member_code, existing.wallet_type, existing.amount, `Fund request #${existing.id} approved`);
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    return res.status(500).json({ error: err.message });
+  }
+  res.json(db.prepare("SELECT * FROM fund_requests WHERE id = ?").get(req.params.id));
+});
+
+// "Payout Transfer Weekly" — per-member breakdown of one committed
+// weekly run (same source as the run's own totals, sliced per member).
+app.get("/api/reports/payout-transfer-weekly", requireApiKey, (req, res) => {
+  const { period } = req.query;
+  if (!period) return res.status(400).json({ error: "period query param is required" });
+  const rows = db
+    .prepare(
+      `SELECT payouts.*, members.name AS member_name FROM payouts
+       JOIN members ON members.member_code = payouts.member_code
+       WHERE payouts.period_label = ? ORDER BY payouts.net_amount DESC`
+    )
+    .all(period);
+  res.json({ period_label: period, count: rows.length, total_net: round2(rows.reduce((s, r) => s + r.net_amount, 0)), rows });
+});
+
+// "Topup Detail" — pv_ledger rows recorded as a package upgrade/topup
+// rather than a regular order (entry_type = 'topup').
+app.get("/api/reports/topup-detail", requireApiKey, (req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT pv_ledger.*, members.name AS member_name FROM pv_ledger
+       JOIN members ON members.member_code = pv_ledger.member_code
+       WHERE pv_ledger.entry_type = 'topup' ORDER BY pv_ledger.created_at DESC`
+    )
+    .all();
+  res.json(rows);
+});
+
+// "All TDS Report" — TDS withheld per committed period.
+app.get("/api/reports/tds", requireApiKey, (req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT period_label, COUNT(*) AS member_count, SUM(gross_amount) AS total_gross,
+              SUM(tds_amount) AS total_tds, SUM(net_amount) AS total_net
+       FROM payouts GROUP BY period_label ORDER BY period_label DESC`
+    )
+    .all();
+  res.json(rows);
+});
+
+// ---------- Utility: Fund Credit / Debit (wallet ledger) ----------
+// wallet_transactions already existed (the weekly payout engine writes
+// to it) but had no direct API — this is the "Fund Credit", "Fund Credit
+// Detail", "Fund Credit/Debit" screen: admin can manually adjust a
+// member's wallet (bonus, correction, manual deduction) with a reason,
+// and see the full ledger.
+
+app.get("/api/wallet/transactions", requireApiKey, (req, res) => {
+  const { member_code, txn_type } = req.query;
+  let sql = `SELECT wallet_transactions.*, members.name AS member_name FROM wallet_transactions
+             JOIN members ON members.member_code = wallet_transactions.member_code`;
+  const clauses = [];
+  const params = [];
+  if (member_code) { clauses.push("wallet_transactions.member_code = ?"); params.push(member_code); }
+  if (txn_type) { clauses.push("wallet_transactions.txn_type = ?"); params.push(txn_type); }
+  if (clauses.length) sql += " WHERE " + clauses.join(" AND ");
+  sql += " ORDER BY wallet_transactions.created_at DESC";
+  res.json(db.prepare(sql).all(...params));
+});
+
+app.get("/api/wallet/:code", requireApiKey, (req, res) => {
+  const member = db.prepare("SELECT member_code FROM members WHERE member_code = ?").get(req.params.code);
+  if (!member) return res.status(404).json({ error: "not found" });
+  const transactions = db
+    .prepare("SELECT * FROM wallet_transactions WHERE member_code = ? ORDER BY created_at DESC")
+    .all(req.params.code);
+  const totals = db
+    .prepare(
+      `SELECT COALESCE(SUM(CASE WHEN txn_type='credit' THEN amount ELSE 0 END),0) AS total_credit,
+              COALESCE(SUM(CASE WHEN txn_type='debit' THEN amount ELSE 0 END),0) AS total_debit
+       FROM wallet_transactions WHERE member_code = ?`
+    )
+    .get(req.params.code);
+  res.json({
+    member_code: req.params.code,
+    total_credit: totals.total_credit,
+    total_debit: totals.total_debit,
+    balance: round2(totals.total_credit - totals.total_debit),
+    transactions,
+  });
+});
+
+function walletAdjust(txnType) {
+  return (req, res) => {
+    const { member_code, amount, wallet_type, reason } = req.body;
+    if (!member_code || !amount) return res.status(400).json({ error: "member_code and amount are required" });
+    if (Number(amount) <= 0) return res.status(400).json({ error: "amount must be positive" });
+    const member = db.prepare("SELECT member_code FROM members WHERE member_code = ?").get(member_code);
+    if (!member) return res.status(400).json({ error: `unknown member_code "${member_code}"` });
+    const result = db
+      .prepare(
+        "INSERT INTO wallet_transactions (member_code, wallet_type, txn_type, amount, reason) VALUES (?, ?, ?, ?, ?)"
+      )
+      .run(member_code, wallet_type || "Weekly", txnType, round2(Number(amount)), reason || null);
+    res.json(db.prepare("SELECT * FROM wallet_transactions WHERE id = ?").get(result.lastInsertRowid));
+  };
+}
+app.post("/api/wallet/credit", requireApiKey, walletAdjust("credit"));
+app.post("/api/wallet/debit", requireApiKey, walletAdjust("debit"));
+
+// ---------- Reward Session (Master for the "session_label" already on rewards) ----------
+
+app.get("/api/reward-sessions", requireApiKey, (req, res) => {
+  res.json(db.prepare("SELECT * FROM reward_sessions ORDER BY session_date DESC").all());
+});
+
+app.post("/api/reward-sessions", requireApiKey, (req, res) => {
+  const { session_name, session_date, status } = req.body;
+  if (!session_name) return res.status(400).json({ error: "session_name is required" });
+  try {
+    const result = db
+      .prepare("INSERT INTO reward_sessions (session_name, session_date, status) VALUES (?, ?, ?)")
+      .run(session_name, session_date || null, status || "Active");
+    res.json(db.prepare("SELECT * FROM reward_sessions WHERE id = ?").get(result.lastInsertRowid));
+  } catch (err) {
+    if (String(err.message).includes("UNIQUE")) {
+      return res.status(409).json({ error: `reward session "${session_name}" already exists` });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/api/reward-sessions/:id", requireApiKey, (req, res) => {
+  const existing = db.prepare("SELECT * FROM reward_sessions WHERE id = ?").get(req.params.id);
+  if (!existing) return res.status(404).json({ error: "not found" });
+  const merged = { ...existing, ...req.body };
+  db.prepare("UPDATE reward_sessions SET session_name=?, session_date=?, status=? WHERE id=?").run(
+    merged.session_name,
+    merged.session_date,
+    merged.status,
+    req.params.id
+  );
+  res.json(db.prepare("SELECT * FROM reward_sessions WHERE id = ?").get(req.params.id));
+});
+
+app.delete("/api/reward-sessions/:id", requireApiKey, (req, res) => {
+  const result = db.prepare("DELETE FROM reward_sessions WHERE id = ?").run(req.params.id);
+  res.json({ deleted: result.changes > 0 });
+});
+
 app.get("/health", (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
 app.listen(PORT, () => {
