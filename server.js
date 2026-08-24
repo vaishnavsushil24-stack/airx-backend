@@ -1717,9 +1717,56 @@ app.post("/api/members/:code/unblock", requireApiKey, (req, res) => {
   res.json(db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code));
 });
 
+// Hard-delete a member. Pre-existing bug fixed here (2026-08-24, surfaced
+// by Phase 6 testing): members.member_code is referenced by FOREIGN KEY
+// from pv_ledger, payouts, wallet_transactions, pv_balance, reward_achievers,
+// fund_requests, kyc_documents, member_audit_log, and other members'
+// sponsor_code — with PRAGMA foreign_keys = ON a plain DELETE on any member
+// that has EVER had money move (a payout, a wallet transaction, a fund
+// request) or has downline used to fail with a raw unhandled 500. Real
+// financial/relationship history should not silently vanish, so: block
+// hard-delete (409, clear message) when any of that exists — Block/Unblock
+// is the right tool there — and only actually delete when a member is
+// "clean" (no money history, no downline), cascading the safe metadata
+// (KYC docs, audit log, empty pv_balance row) that's fine to remove.
 app.delete("/api/members/:code", requireApiKey, (req, res) => {
-  const result = db.prepare("DELETE FROM members WHERE member_code = ?").run(req.params.code);
-  res.json({ deleted: result.changes > 0 });
+  const existing = db.prepare("SELECT member_code FROM members WHERE member_code = ?").get(req.params.code);
+  if (!existing) return res.json({ deleted: false });
+
+  const blockers = [
+    ["pv_ledger", "has PV/BV ledger history"],
+    ["payouts", "has recorded payouts"],
+    ["wallet_transactions", "has wallet transactions"],
+    ["fund_requests", "has fund requests"],
+    ["reward_achievers", "has reward achievements"],
+  ];
+  for (const [table, reason] of blockers) {
+    const row = db.prepare(`SELECT 1 FROM ${table} WHERE member_code = ? LIMIT 1`).get(req.params.code);
+    if (row) {
+      return res.status(409).json({
+        error: `cannot delete "${req.params.code}" — ${reason}. Use Block instead to preserve financial/audit history.`,
+      });
+    }
+  }
+  const hasDownline = db.prepare("SELECT 1 FROM members WHERE sponsor_code = ? LIMIT 1").get(req.params.code);
+  if (hasDownline) {
+    return res.status(409).json({
+      error: `cannot delete "${req.params.code}" — other members list it as their sponsor. Reassign their sponsor_code first.`,
+    });
+  }
+
+  db.exec("BEGIN");
+  try {
+    db.prepare("DELETE FROM kyc_documents WHERE member_code = ?").run(req.params.code);
+    db.prepare("DELETE FROM member_audit_log WHERE member_code = ?").run(req.params.code);
+    db.prepare("DELETE FROM pv_balance WHERE member_code = ?").run(req.params.code);
+    const result = db.prepare("DELETE FROM members WHERE member_code = ?").run(req.params.code);
+    db.exec("COMMIT");
+    res.json({ deleted: result.changes > 0 });
+  } catch (err) {
+    db.exec("ROLLBACK");
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // =====================================================================

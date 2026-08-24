@@ -156,4 +156,28 @@ const dailyPoints = db.prepare(
 ).all();
 assert(dailyPoints.length === 1 && dailyPoints[0].total_pv === 100, "daily-points query groups correctly");
 
+// ---- DELETE /api/members/:code guard (bug found & fixed 2026-08-24) ----
+// A member with wallet/fund-request/KYC history used to hit a raw FK
+// constraint violation (500). Now it should be blocked with a clear 409,
+// while a "clean" member (no financial history, no downline) deletes fine.
+db.exec("PRAGMA foreign_keys = ON");
+let deleteErr = null;
+try {
+  db.exec("BEGIN");
+  db.prepare("DELETE FROM members WHERE member_code = ?").run(code); // has wallet_transactions rows
+  db.exec("COMMIT");
+} catch (err) {
+  db.exec("ROLLBACK");
+  deleteErr = err;
+}
+assert(deleteErr !== null, "raw DELETE on a member with wallet history throws an FK error (confirms the route's guard is necessary)");
+assert(db.prepare("SELECT 1 FROM members WHERE member_code=?").get(code), "member with financial history still exists after the blocked delete");
+
+db.prepare(`INSERT INTO members (member_code, name, status) VALUES ('AIRX000002', 'Clean Member No History', 'Active')`).run();
+db.prepare("DELETE FROM kyc_documents WHERE member_code = 'AIRX000002'").run();
+db.prepare("DELETE FROM member_audit_log WHERE member_code = 'AIRX000002'").run();
+db.prepare("DELETE FROM pv_balance WHERE member_code = 'AIRX000002'").run();
+const cleanDelete = db.prepare("DELETE FROM members WHERE member_code = 'AIRX000002'").run();
+assert(cleanDelete.changes === 1, "a member with no financial/downline history deletes cleanly");
+
 console.log(process.exitCode === 1 ? "\n=== SOME TESTS FAILED ===" : "\n=== ALL TESTS PASSED ===");
