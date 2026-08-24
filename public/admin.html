@@ -198,6 +198,7 @@
     <div class="tab" id="tab-products"></div>
     <div class="tab" id="tab-franchises"></div>
     <div class="tab" id="tab-rewards"></div>
+    <div class="tab" id="tab-cms"></div>
   </main>
 </div>
 
@@ -222,6 +223,7 @@ const TABS = [
   { id: 'products', label: 'Products' },
   { id: 'franchises', label: 'Franchises' },
   { id: 'rewards', label: 'Rewards' },
+  { id: 'cms', label: 'Content (CMS)' },
 ];
 
 function toast(msg, type) {
@@ -296,7 +298,7 @@ function renderNav() {
 function switchTab(id) {
   document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === id));
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.id === 'tab-' + id));
-  const loaders = { dashboard: loadDashboard, members: loadMembers, masters: loadMasters, commission: loadCommission, payouts: loadPayouts, accounts: loadAccounts, reports: loadReports, products: loadProducts, franchises: loadFranchises, rewards: loadRewards };
+  const loaders = { dashboard: loadDashboard, members: loadMembers, masters: loadMasters, commission: loadCommission, payouts: loadPayouts, accounts: loadAccounts, reports: loadReports, products: loadProducts, franchises: loadFranchises, rewards: loadRewards, cms: loadCms };
   if (loaders[id]) loaders[id]();
 }
 
@@ -1041,6 +1043,95 @@ async function loadRewards() {
   });
   refresh().catch(e => { document.getElementById('rewardsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
   refreshSessions().catch(e => { document.getElementById('sessionsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+}
+
+// ---------- Content (CMS): News, Meeting, Gallery, Video, Media/Presentations, Training, Testimonial, Slider ----------
+// One generic panel-renderer for all 8 admin.airxplus.com content menus —
+// they're all "title + description + optional image/link + date + order +
+// status", backed by the single cms_content table (see db.js / server.js).
+const CMS_TYPES = [
+  { type: 'news', label: 'News', imgLabel: 'Image URL', linkLabel: 'Link URL (optional)', dateLabel: 'Publish date' },
+  { type: 'meeting', label: 'Meeting', imgLabel: 'Banner image URL (optional)', linkLabel: 'Meeting link (optional)', dateLabel: 'Meeting date' },
+  { type: 'gallery', label: 'Gallery', imgLabel: 'Image URL', linkLabel: 'Link URL (optional)', dateLabel: 'Date (optional)' },
+  { type: 'video', label: 'Video', imgLabel: 'Thumbnail URL (optional)', linkLabel: 'Video URL', dateLabel: 'Date (optional)' },
+  { type: 'media', label: 'Media / Presentations', imgLabel: 'Thumbnail URL (optional)', linkLabel: 'File URL', dateLabel: 'Date (optional)' },
+  { type: 'training', label: 'Training', imgLabel: 'Thumbnail URL (optional)', linkLabel: 'Video/File URL', dateLabel: 'Date (optional)' },
+  { type: 'testimonial', label: 'Testimonial', imgLabel: 'Photo URL (optional)', linkLabel: 'Link URL (optional)', dateLabel: 'Date (optional)' },
+  { type: 'slider', label: 'Slider / Banner', imgLabel: 'Banner image URL', linkLabel: 'Click-through link (optional)', dateLabel: 'Date (optional)' },
+];
+
+async function loadCms() {
+  const el = document.getElementById('tab-cms');
+  el.innerHTML = CMS_TYPES.map(c => `
+    <div class="panel"><h2>${esc(c.label)}</h2>
+      <div class="row">
+        <input id="cms_${c.type}_title" placeholder="Title" style="min-width:160px" />
+        <input id="cms_${c.type}_order" placeholder="Order" type="number" style="max-width:80px" />
+        <input id="cms_${c.type}_date" placeholder="${esc(c.dateLabel)}" type="date" style="max-width:150px" />
+        <button id="cms_${c.type}_add">+ Add</button>
+      </div>
+      <div class="row">
+        <input id="cms_${c.type}_desc" placeholder="Description (optional)" style="flex:1;min-width:160px" />
+        <input id="cms_${c.type}_img" placeholder="${esc(c.imgLabel)}" style="flex:1;min-width:160px" />
+        <input id="cms_${c.type}_link" placeholder="${esc(c.linkLabel)}" style="flex:1;min-width:160px" />
+      </div>
+      <div id="cms_${c.type}_table"><div class="empty">Loading…</div></div>
+    </div>
+  `).join('');
+
+  async function refresh(type) {
+    const rows = await api('/api/cms/' + type);
+    const tableEl = document.getElementById('cms_' + type + '_table');
+    tableEl.innerHTML = rows.length
+      ? `<table><thead><tr><th>Order</th><th>Title</th><th>Date</th><th>Status</th><th></th></tr></thead><tbody>
+          ${rows.map(r => `<tr>
+            <td>${r.display_order}</td>
+            <td>${esc(r.title)}${r.image_url ? ` <a href="${esc(r.image_url)}" target="_blank" rel="noopener">img</a>` : ''}${r.link_url ? ` <a href="${esc(r.link_url)}" target="_blank" rel="noopener">link</a>` : ''}</td>
+            <td>${esc(r.event_date) || '—'}</td>
+            <td><span class="badge ${r.status === 'Active' ? 'active' : 'inactive'}">${esc(r.status)}</span></td>
+            <td>
+              <button class="secondary" data-toggle="${type}:${r.id}:${r.status}" style="padding:3px 8px;font-size:11px">${r.status === 'Active' ? 'Deactivate' : 'Activate'}</button>
+              <button class="danger" data-del="${type}:${r.id}" style="padding:3px 8px;font-size:11px">Delete</button>
+            </td>
+          </tr>`).join('')}
+        </tbody></table>`
+      : '<div class="empty">No entries yet.</div>';
+    tableEl.querySelectorAll('[data-toggle]').forEach(b => b.addEventListener('click', async () => {
+      const [t, id, curStatus] = b.dataset.toggle.split(':');
+      try {
+        await api(`/api/cms/${t}/${id}`, { method: 'PATCH', body: JSON.stringify({ status: curStatus === 'Active' ? 'Inactive' : 'Active' }) });
+        toast('Updated', 'success'); refresh(t);
+      } catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+    tableEl.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', async () => {
+      const [t, id] = b.dataset.del.split(':');
+      try {
+        await api(`/api/cms/${t}/${id}`, { method: 'DELETE' });
+        toast('Deleted', 'success'); refresh(t);
+      } catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+  }
+
+  CMS_TYPES.forEach(c => {
+    document.getElementById('cms_' + c.type + '_add').addEventListener('click', async () => {
+      const title = document.getElementById('cms_' + c.type + '_title').value.trim();
+      if (!title) { toast('Title required', 'error'); return; }
+      try {
+        await api('/api/cms/' + c.type, { method: 'POST', body: JSON.stringify({
+          title,
+          description: document.getElementById('cms_' + c.type + '_desc').value.trim() || undefined,
+          image_url: document.getElementById('cms_' + c.type + '_img').value.trim() || undefined,
+          link_url: document.getElementById('cms_' + c.type + '_link').value.trim() || undefined,
+          event_date: document.getElementById('cms_' + c.type + '_date').value || undefined,
+          display_order: Number(document.getElementById('cms_' + c.type + '_order').value) || 0,
+        })});
+        toast(c.label + ' added', 'success');
+        ['title', 'desc', 'img', 'link', 'date', 'order'].forEach(f => { document.getElementById('cms_' + c.type + '_' + f).value = ''; });
+        refresh(c.type);
+      } catch (e) { toast('Failed: ' + e.message, 'error'); }
+    });
+    refresh(c.type).catch(e => { document.getElementById('cms_' + c.type + '_table').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+  });
 }
 
 // ---------- Boot ----------
