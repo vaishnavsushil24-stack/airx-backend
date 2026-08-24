@@ -384,3 +384,87 @@ pairs, gross/admin-charge/TDS/net split, and carry-forward math against
 a small hand-checked binary tree.
 
 **Phase 5 (cutover)** — after Phase 3 is validated in production, see the plan doc.
+
+## Phase 6 — the remaining admin.airxplus.com menus (2026-08-24)
+
+After the Phase 5 cutover (2,437 members re-migrated, parity confirmed:
+Total=2437, Active=75), the owner asked for every remaining feature to be
+added. This phase covers what was still missing against the full
+admin.airxplus.com menu list in `MLM_INTEGRATION_PLAN.md`:
+
+**Master** — `GET/POST/PATCH/DELETE /api/masters/banks`,
+`/api/masters/states`, `/api/masters/packages` (join-kit master: name,
+pair-value PV, price — separate from the single `pair_value_pv` the
+commission engine actually matches with, so different kit prices can be
+tracked even though matching still uses one plan-wide PV figure).
+
+**Member** — `GET/POST /api/members/:code/kyc-documents` +
+`PATCH /api/kyc-documents/:id` (approve/reject; a member's own
+`kyc_status` auto-bumps to Approved once every document on file is
+Approved). `POST /api/members/:code/manual-active`,
+`POST /api/members/:code/reset-status`,
+`POST /api/members/:code/change-user` (re-assign an ID to a different
+person's identity — every prior value is written to
+`GET /api/members/:code/audit-log` so nothing is silently overwritten).
+
+**Payout** — `GET /api/reports/daily-points`,
+`GET /api/reports/daily-payouts` — the existing weekly-run data sliced
+by the calendar day it was recorded (payouts still run weekly, not as
+separate daily jobs, so "daily" here means "this week's activity by
+day", same numbers as the Weekly MIS Report / payout-health report).
+
+**Accounts** — `GET/POST /api/fund-requests` +
+`PATCH /api/fund-requests/:id` (approve posts an immediate wallet debit;
+this same data answers Reports > "View Fund Request" too),
+`GET /api/reports/payout-transfer-weekly?period=...`,
+`GET /api/reports/topup-detail` (pv_ledger rows with
+`entry_type = 'topup'`), `GET /api/reports/tds` (TDS withheld per
+committed period).
+
+**Utility** — `GET /api/wallet/:code`, `GET /api/wallet/transactions`,
+`POST /api/wallet/credit`, `POST /api/wallet/debit` — direct API for the
+`wallet_transactions` table, which existed since Phase 3 (the weekly
+payout engine writes to it) but had no manual-adjustment or ledger-view
+endpoints of its own until now.
+
+**Reward** — `GET/POST/PATCH/DELETE /api/reward-sessions` (the Master
+behind the `session_label` field `rewards` already had).
+
+All of the above also got matching UI in `public/admin.html`: a new
+**Masters** tab (Bank/State/Package), a new **Accounts & Wallet** tab
+(Fund Requests, wallet credit/debit + lookup, Payout Transfer Weekly),
+a new **Reports** tab (TDS, Topup Detail, Daily Point/Payout Detail,
+Downline PV / Member Balance lookup), and the member detail panel grew
+an "Admin actions" block (Manual Active / Reset Status / Change User)
+and a KYC Documents section.
+
+A functional test (`test_phase6.js`, run with `node test_phase6.js`)
+exercises every new table and the exact SQL each route uses — masters
+CRUD + uniqueness, KYC approve bumping `kyc_status`, the three
+member-state actions plus their audit trail, wallet credit/debit
+balance math, fund-request approve posting a debit, and the delete-guard
+below. Every new endpoint was also re-verified live against the
+deployed Render API after each push (not just locally), the same way
+the Phase 5 migration was.
+
+**Bug found and fixed in the same pass:** `DELETE /api/members/:code`
+pre-dates Phase 6 but had never been exercised against a member with
+real financial/child records. With `PRAGMA foreign_keys = ON`, deleting
+a member that has ever had a payout, wallet transaction, fund request,
+reward achievement, PV ledger entry, or downline pointing at them as
+sponsor used to throw a raw, unhandled foreign-key error (500). It now
+returns a clear `409` telling the caller to use Block instead (which
+already existed) to preserve that history, and only actually deletes —
+cascading the safe metadata (KYC docs, audit log, empty PV balance row)
+— when a member is genuinely "clean" (no money history, no downline).
+
+**Deliberately not built** (flagged, not silently skipped): store.airxplus.com's
+own Admin/User/UserGroup/Permissions screens and admin.airxplus.com's
+content-management menus (News, Meeting, Gallery/Video/Media/Presentations,
+Training, Testimonial, Slider). The former is a full multi-role login
+system — a separate, security-sensitive project on top of the current
+single-shared-`AIRX_API_KEY` model, not something to bolt on casually.
+The latter is public-facing marketing content rather than
+distributor/financial ops, and each is its own small CMS (title, body,
+media, publish date) — happy to build them next if wanted, just called
+out here rather than assumed.
