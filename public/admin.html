@@ -168,12 +168,30 @@
 <div id="loginScreen">
   <div id="loginBox">
     <h1>AIRX Ops — Admin</h1>
-    <p>Enter your API key (AIRX_API_KEY) to continue. It's stored only in this browser (localStorage), never sent anywhere except this API.</p>
-    <div class="field">
-      <label>API Key</label>
-      <input type="password" id="apiKeyInput" placeholder="x-api-key" />
+    <div id="loginModeApiKey">
+      <p>Enter your API key (AIRX_API_KEY) to continue. It's stored only in this browser (localStorage), never sent anywhere except this API.</p>
+      <div class="field">
+        <label>API Key</label>
+        <input type="password" id="apiKeyInput" placeholder="x-api-key" />
+      </div>
+      <button id="loginBtn" style="width:100%">Connect</button>
+      <p class="muted" style="margin-top:10px"><a href="#" id="showStaffLoginLink">Or sign in as a staff user →</a></p>
     </div>
-    <button id="loginBtn" style="width:100%">Connect</button>
+    <div id="loginModeStaff" style="display:none">
+      <p>Sign in with your staff username and password.</p>
+      <div class="field"><label>Username</label><input id="staffUsernameInput" /></div>
+      <div class="field"><label>Password</label><input type="password" id="staffPasswordInput" /></div>
+      <button id="staffLoginBtn" style="width:100%">Sign in</button>
+      <p class="muted" style="margin-top:10px"><a href="#" id="showApiKeyLoginLink">Or connect with the API key →</a></p>
+    </div>
+    <div id="loginModeBootstrap" style="display:none">
+      <p>No staff accounts exist yet. Create the first Super Admin account for AIRX Ops.</p>
+      <div class="field"><label>Username</label><input id="bootstrapUsernameInput" /></div>
+      <div class="field"><label>Full name</label><input id="bootstrapFullNameInput" /></div>
+      <div class="field"><label>Password (min 8 characters)</label><input type="password" id="bootstrapPasswordInput" /></div>
+      <button id="bootstrapBtn" style="width:100%">Create Super Admin &amp; sign in</button>
+      <p class="muted" style="margin-top:10px"><a href="#" id="skipBootstrapLink">Or connect with the API key instead →</a></p>
+    </div>
     <div id="errBanner"></div>
   </div>
 </div>
@@ -182,7 +200,7 @@
   <header>
     <div>
       <h1>AIRX Ops</h1>
-      <div class="sub">AIRX PLUS HEALTHCARE PRIVATE LIMITED — internal admin</div>
+      <div class="sub" id="identityLine">AIRX PLUS HEALTHCARE PRIVATE LIMITED — internal admin</div>
     </div>
     <button class="secondary" id="logoutBtn">Disconnect</button>
   </header>
@@ -199,6 +217,7 @@
     <div class="tab" id="tab-franchises"></div>
     <div class="tab" id="tab-rewards"></div>
     <div class="tab" id="tab-cms"></div>
+    <div class="tab" id="tab-user_management"></div>
   </main>
 </div>
 
@@ -211,6 +230,8 @@
 <script>
 const API_BASE = window.location.origin;
 let API_KEY = localStorage.getItem('airx_api_key') || '';
+let SESSION_TOKEN = localStorage.getItem('airx_session_token') || '';
+let CURRENT_IDENTITY = null; // { type: 'system'|'admin_user', username, full_name?, permissions: [...] }
 
 const TABS = [
   { id: 'dashboard', label: 'Dashboard' },
@@ -224,6 +245,24 @@ const TABS = [
   { id: 'franchises', label: 'Franchises' },
   { id: 'rewards', label: 'Rewards' },
   { id: 'cms', label: 'Content (CMS)' },
+  { id: 'user_management', label: 'User Management' },
+];
+
+// Mirrors server.js MODULE_KEYS — the set of modules a role's permissions
+// array can grant. '*' in a role means "all of these".
+const MODULE_KEYS = [
+  { key: 'dashboard', label: 'Dashboard' },
+  { key: 'members', label: 'Members' },
+  { key: 'masters', label: 'Masters' },
+  { key: 'commission', label: 'Commission Settings' },
+  { key: 'payouts', label: 'Payouts' },
+  { key: 'accounts', label: 'Accounts & Wallet' },
+  { key: 'reports', label: 'Reports' },
+  { key: 'products', label: 'Products' },
+  { key: 'franchises', label: 'Franchises' },
+  { key: 'rewards', label: 'Rewards' },
+  { key: 'cms', label: 'Content (CMS)' },
+  { key: 'user_management', label: 'User Management' },
 ];
 
 function toast(msg, type) {
@@ -236,7 +275,11 @@ function toast(msg, type) {
 
 async function api(path, opts) {
   opts = opts || {};
-  const headers = Object.assign({ 'x-api-key': API_KEY }, opts.body ? { 'Content-Type': 'application/json' } : {}, opts.headers || {});
+  // Staff sign-in (Phase 8) uses a Bearer session token; the original API
+  // key login (unchanged, still works) uses x-api-key. Whichever credential
+  // is currently active is what gets sent.
+  const authHeader = SESSION_TOKEN ? { 'Authorization': 'Bearer ' + SESSION_TOKEN } : { 'x-api-key': API_KEY };
+  const headers = Object.assign({}, authHeader, opts.body ? { 'Content-Type': 'application/json' } : {}, opts.headers || {});
   const res = await fetch(API_BASE + path, Object.assign({}, opts, { headers }));
   let body;
   try { body = await res.json(); } catch (e) { body = null; }
@@ -248,11 +291,24 @@ async function api(path, opts) {
 }
 
 // ---------- Login ----------
+// Two credential modes, either one sets CURRENT_IDENTITY.permissions:
+//  - API key (unchanged since Phase 0-7): full access, permissions = ['*'].
+//  - Staff username/password (Phase 8): a Bearer session token whose role's
+//    permissions gate which tabs/API calls actually work.
+function currentPermissions() {
+  return (CURRENT_IDENTITY && CURRENT_IDENTITY.permissions) || ['*'];
+}
 function showApp() {
   document.getElementById('loginScreen').style.display = 'none';
   document.getElementById('app').style.display = 'block';
   renderNav();
-  switchTab('dashboard');
+  const identityLine = document.getElementById('identityLine');
+  identityLine.textContent = CURRENT_IDENTITY
+    ? 'Signed in as ' + (CURRENT_IDENTITY.full_name || CURRENT_IDENTITY.username) + (CURRENT_IDENTITY.role_name ? ' (' + CURRENT_IDENTITY.role_name + ')' : '')
+    : 'AIRX PLUS HEALTHCARE PRIVATE LIMITED — internal admin';
+  const perms = currentPermissions();
+  const firstTab = perms.includes('*') ? 'dashboard' : (TABS.find(t => perms.includes(t.id)) || {}).id;
+  if (firstTab) switchTab(firstTab);
 }
 function showLogin(err) {
   document.getElementById('loginScreen').style.display = 'flex';
@@ -261,14 +317,21 @@ function showLogin(err) {
   if (err) { banner.textContent = err; banner.style.display = 'block'; }
   else { banner.style.display = 'none'; }
 }
+function setLoginMode(mode) {
+  document.getElementById('loginModeApiKey').style.display = mode === 'apikey' ? 'block' : 'none';
+  document.getElementById('loginModeStaff').style.display = mode === 'staff' ? 'block' : 'none';
+  document.getElementById('loginModeBootstrap').style.display = mode === 'bootstrap' ? 'block' : 'none';
+}
 
 document.getElementById('loginBtn').addEventListener('click', async () => {
   const key = document.getElementById('apiKeyInput').value.trim();
   if (!key) return;
-  API_KEY = key;
+  API_KEY = key; SESSION_TOKEN = '';
   try {
     await api('/api/settings/commission');
     localStorage.setItem('airx_api_key', key);
+    localStorage.removeItem('airx_session_token');
+    CURRENT_IDENTITY = { type: 'system', username: 'system (AIRX_API_KEY)', permissions: ['*'] };
     showApp();
   } catch (e) {
     showLogin('Could not connect — check the API key. (' + e.message + ')');
@@ -277,9 +340,58 @@ document.getElementById('loginBtn').addEventListener('click', async () => {
 document.getElementById('apiKeyInput').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') document.getElementById('loginBtn').click();
 });
-document.getElementById('logoutBtn').addEventListener('click', () => {
+
+document.getElementById('staffLoginBtn').addEventListener('click', async () => {
+  const username = document.getElementById('staffUsernameInput').value.trim();
+  const password = document.getElementById('staffPasswordInput').value;
+  if (!username || !password) return;
+  try {
+    const res = await fetch(API_BASE + '/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) });
+    const body = await res.json().catch(() => null);
+    if (!res.ok) throw new Error((body && body.error) || ('HTTP ' + res.status));
+    SESSION_TOKEN = body.token; API_KEY = '';
+    localStorage.setItem('airx_session_token', body.token);
+    localStorage.removeItem('airx_api_key');
+    CURRENT_IDENTITY = Object.assign({ type: 'admin_user' }, body.user);
+    showApp();
+  } catch (e) {
+    showLogin('Sign-in failed: ' + e.message);
+  }
+});
+document.getElementById('staffPasswordInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') document.getElementById('staffLoginBtn').click();
+});
+
+document.getElementById('bootstrapBtn').addEventListener('click', async () => {
+  const username = document.getElementById('bootstrapUsernameInput').value.trim();
+  const full_name = document.getElementById('bootstrapFullNameInput').value.trim();
+  const password = document.getElementById('bootstrapPasswordInput').value;
+  if (!username || !password) return;
+  try {
+    const res = await fetch(API_BASE + '/api/auth/bootstrap', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password, full_name }) });
+    const body = await res.json().catch(() => null);
+    if (!res.ok) throw new Error((body && body.error) || ('HTTP ' + res.status));
+    SESSION_TOKEN = body.token; API_KEY = '';
+    localStorage.setItem('airx_session_token', body.token);
+    localStorage.removeItem('airx_api_key');
+    CURRENT_IDENTITY = Object.assign({ type: 'admin_user' }, body.user);
+    showApp();
+  } catch (e) {
+    showLogin('Could not create the Super Admin account: ' + e.message);
+  }
+});
+
+document.getElementById('showStaffLoginLink').addEventListener('click', (e) => { e.preventDefault(); setLoginMode('staff'); });
+document.getElementById('showApiKeyLoginLink').addEventListener('click', (e) => { e.preventDefault(); setLoginMode('apikey'); });
+document.getElementById('skipBootstrapLink').addEventListener('click', (e) => { e.preventDefault(); setLoginMode('apikey'); });
+
+document.getElementById('logoutBtn').addEventListener('click', async () => {
+  if (SESSION_TOKEN) {
+    try { await fetch(API_BASE + '/api/auth/logout', { method: 'POST', headers: { 'Authorization': 'Bearer ' + SESSION_TOKEN } }); } catch (e) { /* ignore */ }
+  }
   localStorage.removeItem('airx_api_key');
-  API_KEY = '';
+  localStorage.removeItem('airx_session_token');
+  API_KEY = ''; SESSION_TOKEN = ''; CURRENT_IDENTITY = null;
   showLogin();
 });
 
@@ -287,7 +399,9 @@ document.getElementById('logoutBtn').addEventListener('click', () => {
 function renderNav() {
   const nav = document.getElementById('nav');
   nav.innerHTML = '';
-  TABS.forEach(t => {
+  const perms = currentPermissions();
+  const allowed = perms.includes('*') ? TABS : TABS.filter(t => perms.includes(t.id));
+  allowed.forEach(t => {
     const btn = document.createElement('button');
     btn.textContent = t.label;
     btn.dataset.tab = t.id;
@@ -298,7 +412,7 @@ function renderNav() {
 function switchTab(id) {
   document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === id));
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.id === 'tab-' + id));
-  const loaders = { dashboard: loadDashboard, members: loadMembers, masters: loadMasters, commission: loadCommission, payouts: loadPayouts, accounts: loadAccounts, reports: loadReports, products: loadProducts, franchises: loadFranchises, rewards: loadRewards, cms: loadCms };
+  const loaders = { dashboard: loadDashboard, members: loadMembers, masters: loadMasters, commission: loadCommission, payouts: loadPayouts, accounts: loadAccounts, reports: loadReports, products: loadProducts, franchises: loadFranchises, rewards: loadRewards, cms: loadCms, user_management: loadUserManagement };
   if (loaders[id]) loaders[id]();
 }
 
@@ -1134,12 +1248,171 @@ async function loadCms() {
   });
 }
 
+// ---------- User Management (Admin / User / UserGroup / Permissions) ----------
+// Additive on top of the original API-key login — see the Phase 8 note in
+// server.js. A role's permissions array is either ['*'] (every module) or a
+// subset of MODULE_KEYS; renderNav() above already filters tabs by whatever
+// the signed-in identity's permissions allow.
+async function loadUserManagement() {
+  const el = document.getElementById('tab-user_management');
+  el.innerHTML = `
+    <div class="panel"><h2>Roles &amp; Permissions (UserGroup)</h2>
+      <p class="muted">A role bundles which tabs/modules a staff login can use. "All permissions" is the Super Admin role.</p>
+      <div class="row">
+        <input id="role_name" placeholder="Role name, e.g. Payout Clerk" style="min-width:180px" />
+        <label style="display:flex;align-items:center;gap:4px;font-size:12px"><input type="checkbox" id="role_all" /> All permissions (Super Admin)</label>
+        <button id="addRoleBtn">+ Add role</button>
+      </div>
+      <div id="rolePermsChecks" class="row" style="flex-wrap:wrap;gap:6px 16px;margin-top:6px"></div>
+      <div id="rolesTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
+    </div>
+    <div class="panel"><h2>Admin Users</h2>
+      <p class="muted">Individual staff logins. Each one signs in with a username/password (separate from the shared API key) and only sees the tabs their role permits.</p>
+      <div class="row">
+        <input id="au_username" placeholder="Username" style="max-width:140px" />
+        <input id="au_fullname" placeholder="Full name" style="max-width:160px" />
+        <input id="au_password" placeholder="Password (min 8 chars)" type="password" style="max-width:170px" />
+        <select id="au_role"></select>
+        <button id="addUserBtn">+ Add user</button>
+      </div>
+      <div id="usersTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
+    </div>
+  `;
+  document.getElementById('rolePermsChecks').innerHTML = MODULE_KEYS.map(m =>
+    `<label style="display:flex;align-items:center;gap:4px;font-size:12px"><input type="checkbox" class="role-perm-check" value="${m.key}" /> ${esc(m.label)}</label>`
+  ).join('');
+  document.getElementById('role_all').addEventListener('change', (e) => {
+    document.querySelectorAll('.role-perm-check').forEach(c => { c.disabled = e.target.checked; if (e.target.checked) c.checked = false; });
+  });
+
+  function permLabel(key) {
+    const found = MODULE_KEYS.find(m => m.key === key);
+    return found ? found.label : key;
+  }
+
+  async function refreshRoles() {
+    const rows = await api('/api/admin/roles');
+    document.getElementById('rolesTable').innerHTML = rows.length
+      ? `<table><thead><tr><th>Role</th><th>Permissions</th><th></th></tr></thead><tbody>
+          ${rows.map(r => `<tr>
+            <td>${esc(r.role_name)}</td>
+            <td>${r.permissions.includes('*') ? '<span class="badge active">All modules</span>' : (r.permissions.map(permLabel).map(esc).join(', ') || '<span class="muted">none</span>')}</td>
+            <td><button class="danger" data-del-role="${r.id}" style="padding:3px 8px;font-size:11px">Delete</button></td>
+          </tr>`).join('')}
+        </tbody></table>` : '<div class="empty">No roles yet.</div>';
+    document.getElementById('au_role').innerHTML = rows.map(r => `<option value="${r.id}">${esc(r.role_name)}</option>`).join('');
+    document.querySelectorAll('[data-del-role]').forEach(b => b.addEventListener('click', async () => {
+      try { await api('/api/admin/roles/' + b.dataset.delRole, { method: 'DELETE' }); toast('Role deleted', 'success'); refreshRoles(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+  }
+
+  async function refreshUsers() {
+    const rows = await api('/api/admin/users');
+    document.getElementById('usersTable').innerHTML = rows.length
+      ? `<table><thead><tr><th>Username</th><th>Name</th><th>Role</th><th>Status</th><th>Last login</th><th></th></tr></thead><tbody>
+          ${rows.map(u => `<tr>
+            <td>${esc(u.username)}</td>
+            <td>${esc(u.full_name) || '—'}</td>
+            <td>${esc(u.role_name)}</td>
+            <td><span class="badge ${u.status === 'Active' ? 'active' : 'inactive'}">${esc(u.status)}</span></td>
+            <td>${esc(u.last_login_at) || 'never'}</td>
+            <td>
+              <button class="secondary" data-toggle-user="${u.id}:${u.status}" style="padding:3px 8px;font-size:11px">${u.status === 'Active' ? 'Deactivate' : 'Activate'}</button>
+              <button class="secondary" data-reset="${u.id}" style="padding:3px 8px;font-size:11px">Reset PW</button>
+              <button class="danger" data-del-user="${u.id}" style="padding:3px 8px;font-size:11px">Delete</button>
+            </td>
+          </tr>`).join('')}
+        </tbody></table>` : '<div class="empty">No admin users yet.</div>';
+    document.querySelectorAll('[data-toggle-user]').forEach(b => b.addEventListener('click', async () => {
+      const [id, curStatus] = b.dataset.toggleUser.split(':');
+      try { await api('/api/admin/users/' + id, { method: 'PATCH', body: JSON.stringify({ status: curStatus === 'Active' ? 'Inactive' : 'Active' }) }); toast('Updated', 'success'); refreshUsers(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+    document.querySelectorAll('[data-reset]').forEach(b => b.addEventListener('click', async () => {
+      const pw = prompt('New password for this user (min 8 characters):');
+      if (!pw) return;
+      try { await api('/api/admin/users/' + b.dataset.reset + '/reset-password', { method: 'POST', body: JSON.stringify({ password: pw }) }); toast('Password reset — user must sign in again', 'success'); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+    document.querySelectorAll('[data-del-user]').forEach(b => b.addEventListener('click', async () => {
+      try { await api('/api/admin/users/' + b.dataset.delUser, { method: 'DELETE' }); toast('User deleted', 'success'); refreshUsers(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+  }
+
+  document.getElementById('addRoleBtn').addEventListener('click', async () => {
+    const role_name = document.getElementById('role_name').value.trim();
+    if (!role_name) { toast('Role name required', 'error'); return; }
+    const allChecked = document.getElementById('role_all').checked;
+    const permissions = allChecked ? ['*'] : Array.from(document.querySelectorAll('.role-perm-check:checked')).map(c => c.value);
+    try {
+      await api('/api/admin/roles', { method: 'POST', body: JSON.stringify({ role_name, permissions }) });
+      toast('Role added', 'success');
+      document.getElementById('role_name').value = '';
+      document.getElementById('role_all').checked = false;
+      document.querySelectorAll('.role-perm-check').forEach(c => { c.checked = false; c.disabled = false; });
+      refreshRoles();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+
+  document.getElementById('addUserBtn').addEventListener('click', async () => {
+    const username = document.getElementById('au_username').value.trim();
+    const password = document.getElementById('au_password').value;
+    const full_name = document.getElementById('au_fullname').value.trim();
+    const role_id = Number(document.getElementById('au_role').value);
+    if (!username || !password || !role_id) { toast('Username, password and a role are required', 'error'); return; }
+    try {
+      await api('/api/admin/users', { method: 'POST', body: JSON.stringify({ username, password, full_name, role_id }) });
+      toast('User added', 'success');
+      document.getElementById('au_username').value = '';
+      document.getElementById('au_password').value = '';
+      document.getElementById('au_fullname').value = '';
+      refreshUsers();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+
+  refreshRoles().catch(e => { document.getElementById('rolesTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+  refreshUsers().catch(e => { document.getElementById('usersTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+}
+
 // ---------- Boot ----------
-if (API_KEY) {
-  api('/api/settings/commission').then(showApp).catch(() => showLogin('Saved key no longer works — enter it again.'));
-} else {
+async function boot() {
+  if (SESSION_TOKEN) {
+    try {
+      const res = await fetch(API_BASE + '/api/auth/me', { headers: { 'Authorization': 'Bearer ' + SESSION_TOKEN } });
+      const body = await res.json().catch(() => null);
+      if (!res.ok) throw new Error((body && body.error) || 'session expired');
+      CURRENT_IDENTITY = body;
+      showApp();
+      return;
+    } catch (e) {
+      localStorage.removeItem('airx_session_token');
+      SESSION_TOKEN = '';
+    }
+  }
+  if (API_KEY) {
+    try {
+      await api('/api/settings/commission');
+      CURRENT_IDENTITY = { type: 'system', username: 'system (AIRX_API_KEY)', permissions: ['*'] };
+      showApp();
+      return;
+    } catch (e) {
+      showLogin('Saved key no longer works — enter it again.');
+      return;
+    }
+  }
+  // No stored credential — if this is a fresh install with zero staff
+  // accounts, jump straight to the "create the first Super Admin" form
+  // instead of a login form nobody can use yet.
+  try {
+    const res = await fetch(API_BASE + '/api/auth/bootstrap-status');
+    const body = await res.json();
+    if (body && body.needsBootstrap) setLoginMode('bootstrap');
+  } catch (e) { /* ignore — default API-key login screen still works */ }
   showLogin();
 }
+boot();
 </script>
 </body>
 </html>
