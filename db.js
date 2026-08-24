@@ -15,7 +15,13 @@ const path = require("path");
 const fs = require("fs");
 const { DatabaseSync } = require("node:sqlite");
 
-const DATA_DIR = path.join(__dirname, "data");
+// DATA_DIR points at the Render Persistent Disk mount path (set via the
+// DATA_DIR env var, e.g. "/var/data") when one is attached to this service.
+// Falls back to a local "data" folder next to this file for local dev, or
+// for any deploy that hasn't attached a disk yet — in that fallback case
+// the folder (and anything in it) is wiped on every redeploy, since the
+// service filesystem itself is ephemeral without a mounted disk.
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const DB_FILE = path.join(DATA_DIR, "airx.db");
