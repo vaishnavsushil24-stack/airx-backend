@@ -215,6 +215,7 @@
     <div class="tab" id="tab-reports"></div>
     <div class="tab" id="tab-products"></div>
     <div class="tab" id="tab-franchises"></div>
+    <div class="tab" id="tab-franchise_commission"></div>
     <div class="tab" id="tab-rewards"></div>
     <div class="tab" id="tab-cms"></div>
     <div class="tab" id="tab-user_management"></div>
@@ -243,6 +244,7 @@ const TABS = [
   { id: 'reports', label: 'Reports' },
   { id: 'products', label: 'Products' },
   { id: 'franchises', label: 'Franchises' },
+  { id: 'franchise_commission', label: 'Franchise Commission' },
   { id: 'rewards', label: 'Rewards' },
   { id: 'cms', label: 'Content (CMS)' },
   { id: 'user_management', label: 'User Management' },
@@ -260,6 +262,7 @@ const MODULE_KEYS = [
   { key: 'reports', label: 'Reports' },
   { key: 'products', label: 'Products' },
   { key: 'franchises', label: 'Franchises' },
+  { key: 'franchise_commission', label: 'Franchise Commission' },
   { key: 'rewards', label: 'Rewards' },
   { key: 'cms', label: 'Content (CMS)' },
   { key: 'user_management', label: 'User Management' },
@@ -412,7 +415,7 @@ function renderNav() {
 function switchTab(id) {
   document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === id));
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.id === 'tab-' + id));
-  const loaders = { dashboard: loadDashboard, members: loadMembers, masters: loadMasters, commission: loadCommission, payouts: loadPayouts, accounts: loadAccounts, reports: loadReports, products: loadProducts, franchises: loadFranchises, rewards: loadRewards, cms: loadCms, user_management: loadUserManagement };
+  const loaders = { dashboard: loadDashboard, members: loadMembers, masters: loadMasters, commission: loadCommission, payouts: loadPayouts, accounts: loadAccounts, reports: loadReports, products: loadProducts, franchises: loadFranchises, franchise_commission: loadFranchiseCommission, rewards: loadRewards, cms: loadCms, user_management: loadUserManagement };
   if (loaders[id]) loaders[id]();
 }
 
@@ -1028,75 +1031,356 @@ async function loadReports() {
 }
 
 // ---------- Products ----------
+const PRODUCT_CATEGORIES = ['General', 'Mens', 'Women', 'Special Wellness'];
+
 async function loadProducts() {
   const el = document.getElementById('tab-products');
-  el.innerHTML = `<div class="panel"><h2>Products</h2>
+  el.innerHTML = `<div class="panel"><h2>Products <span class="muted" style="font-weight:normal">(Master / Product — mirrors store.airxplus.com)</span></h2>
     <div class="row">
-      <input id="p_sku" placeholder="SKU" style="max-width:120px" />
+      <input id="p_sku" placeholder="SKU" style="max-width:110px" />
       <input id="p_name" placeholder="Name" />
-      <input id="p_dp" placeholder="DP price" type="number" style="max-width:110px" />
-      <input id="p_mrp" placeholder="MRP" type="number" style="max-width:110px" />
-      <input id="p_pv" placeholder="PV" type="number" style="max-width:90px" />
-      <input id="p_bv" placeholder="BV" type="number" style="max-width:90px" />
+      <select id="p_category"><option value="">Category…</option>${PRODUCT_CATEGORIES.map(c => `<option value="${c}">${c}</option>`).join('')}</select>
+      <input id="p_dp" placeholder="DP price" type="number" style="max-width:100px" />
+      <input id="p_mrp" placeholder="MRP" type="number" style="max-width:100px" />
+      <input id="p_pv" placeholder="PV" type="number" style="max-width:80px" />
+      <input id="p_bv" placeholder="BV" type="number" style="max-width:80px" />
       <button id="addProductBtn">+ Add</button>
+      <button class="secondary" id="cancelProductEditBtn" style="display:none">Cancel</button>
     </div>
     <div id="productsTable"><div class="empty">Loading…</div></div>
   </div>`;
+  let editingSku = null;
+  function resetForm() {
+    editingSku = null;
+    ['p_sku', 'p_name', 'p_dp', 'p_mrp', 'p_pv', 'p_bv'].forEach(f => { document.getElementById(f).value = ''; });
+    document.getElementById('p_category').value = '';
+    document.getElementById('p_sku').disabled = false;
+    document.getElementById('addProductBtn').textContent = '+ Add';
+    document.getElementById('cancelProductEditBtn').style.display = 'none';
+  }
+  function fillForm(p) {
+    editingSku = p.sku;
+    document.getElementById('p_sku').value = p.sku;
+    document.getElementById('p_sku').disabled = true; // SKU is the primary key — not editable in place
+    document.getElementById('p_name').value = p.name;
+    document.getElementById('p_category').value = p.category || '';
+    document.getElementById('p_dp').value = p.dp_price;
+    document.getElementById('p_mrp').value = p.mrp_price;
+    document.getElementById('p_pv').value = p.pv;
+    document.getElementById('p_bv').value = p.bv;
+    document.getElementById('addProductBtn').textContent = 'Save changes';
+    document.getElementById('cancelProductEditBtn').style.display = 'inline-block';
+  }
   async function refresh() {
     const products = await api('/api/products');
     document.getElementById('productsTable').innerHTML = products.length
-      ? `<table><thead><tr><th>SKU</th><th>Name</th><th>DP</th><th>MRP</th><th>PV</th><th>BV</th><th>Status</th></tr></thead><tbody>
-          ${products.map(p => `<tr><td>${esc(p.sku)}</td><td>${esc(p.name)}</td><td>₹${p.dp_price}</td><td>₹${p.mrp_price}</td><td>${p.pv}</td><td>${p.bv}</td><td>${esc(p.status)}</td></tr>`).join('')}
+      ? `<table><thead><tr><th>SKU</th><th>Name</th><th>Category</th><th>DP</th><th>MRP</th><th>PV</th><th>BV</th><th>Status</th><th></th></tr></thead><tbody>
+          ${products.map(p => `<tr>
+            <td>${esc(p.sku)}</td><td>${esc(p.name)}</td><td>${esc(p.category) || '—'}</td>
+            <td>₹${p.dp_price}</td><td>₹${p.mrp_price}</td><td>${p.pv}</td><td>${p.bv}</td>
+            <td><span class="badge ${p.status === 'Active' ? 'active' : 'inactive'}">${esc(p.status)}</span></td>
+            <td>
+              <button class="secondary" data-edit="${esc(p.sku)}" style="padding:3px 8px;font-size:11px">Edit</button>
+              <button class="danger" data-del="${esc(p.sku)}" style="padding:3px 8px;font-size:11px">Delete</button>
+            </td>
+          </tr>`).join('')}
         </tbody></table>`
       : '<div class="empty">No products yet.</div>';
+    const bySku = {};
+    products.forEach(p => { bySku[p.sku] = p; });
+    document.querySelectorAll('[data-edit]').forEach(b => b.addEventListener('click', () => fillForm(bySku[b.dataset.edit])));
+    document.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', async () => {
+      try { await api('/api/products/' + encodeURIComponent(b.dataset.del), { method: 'DELETE' }); toast('Product deleted', 'success'); refresh(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
   }
   document.getElementById('addProductBtn').addEventListener('click', async () => {
+    const body = {
+      name: document.getElementById('p_name').value.trim(),
+      category: document.getElementById('p_category').value || undefined,
+      dp_price: Number(document.getElementById('p_dp').value) || 0,
+      mrp_price: Number(document.getElementById('p_mrp').value) || 0,
+      pv: Number(document.getElementById('p_pv').value) || 0,
+      bv: Number(document.getElementById('p_bv').value) || 0,
+    };
     try {
-      await api('/api/products', { method: 'POST', body: JSON.stringify({
-        sku: document.getElementById('p_sku').value.trim(),
-        name: document.getElementById('p_name').value.trim(),
-        dp_price: Number(document.getElementById('p_dp').value) || 0,
-        mrp_price: Number(document.getElementById('p_mrp').value) || 0,
-        pv: Number(document.getElementById('p_pv').value) || 0,
-        bv: Number(document.getElementById('p_bv').value) || 0,
-      })});
-      toast('Product added', 'success'); refresh();
+      if (editingSku) {
+        await api('/api/products/' + encodeURIComponent(editingSku), { method: 'PATCH', body: JSON.stringify(body) });
+        toast('Product updated', 'success');
+      } else {
+        body.sku = document.getElementById('p_sku').value.trim();
+        await api('/api/products', { method: 'POST', body: JSON.stringify(body) });
+        toast('Product added', 'success');
+      }
+      resetForm(); refresh();
     } catch (e) { toast('Failed: ' + e.message, 'error'); }
   });
+  document.getElementById('cancelProductEditBtn').addEventListener('click', resetForm);
   refresh().catch(e => { document.getElementById('productsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
 }
 
 // ---------- Franchises ----------
 async function loadFranchises() {
   const el = document.getElementById('tab-franchises');
-  el.innerHTML = `<div class="panel"><h2>Franchises</h2>
-    <div class="row">
-      <input id="fr_code" placeholder="Franchise code" style="max-width:140px" />
-      <input id="fr_name" placeholder="Name" />
-      <input id="fr_state" placeholder="State" style="max-width:140px" />
-      <button id="addFranchiseBtn">+ Add</button>
+  el.innerHTML = `
+    <div class="panel"><h2>Franchises <span class="muted" style="font-weight:normal">(Franchise details — mirrors store.airxplus.com)</span></h2>
+      <div class="row">
+        <input id="fr_code" placeholder="Franchise code" style="max-width:130px" />
+        <input id="fr_name" placeholder="Name" />
+        <select id="fr_parent"><option value="">No parent (top-level)</option></select>
+        <input id="fr_state" placeholder="State" style="max-width:120px" />
+      </div>
+      <div class="row">
+        <input id="fr_contact_name" placeholder="Contact name" />
+        <input id="fr_contact_mobile" placeholder="Contact mobile" style="max-width:140px" />
+        <input id="fr_address" placeholder="Address" style="flex:1;min-width:200px" />
+      </div>
+      <div class="row">
+        <span class="muted" style="font-size:11px">Bank details (for franchise commission payouts):</span>
+      </div>
+      <div class="row">
+        <input id="fr_bank_name" placeholder="Bank name" style="max-width:150px" />
+        <input id="fr_bank_account" placeholder="Account number" style="max-width:160px" />
+        <input id="fr_bank_ifsc" placeholder="IFSC" style="max-width:110px" />
+        <input id="fr_bank_holder" placeholder="Account holder name" style="max-width:170px" />
+      </div>
+      <div class="row">
+        <button id="addFranchiseBtn">+ Add</button>
+        <button class="secondary" id="cancelFranchiseEditBtn" style="display:none">Cancel</button>
+      </div>
+      <div id="franchisesTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
     </div>
-    <div id="franchisesTable"><div class="empty">Loading…</div></div>
-  </div>`;
-  async function refresh() {
-    const franchises = await api('/api/franchises');
-    document.getElementById('franchisesTable').innerHTML = franchises.length
-      ? `<table><thead><tr><th>Code</th><th>Name</th><th>State</th><th>Status</th></tr></thead><tbody>
-          ${franchises.map(f => `<tr><td>${esc(f.franchise_code)}</td><td>${esc(f.franchise_name)}</td><td>${esc(f.state)}</td><td>${esc(f.status)}</td></tr>`).join('')}
-        </tbody></table>`
-      : '<div class="empty">No franchises yet.</div>';
+    <div class="panel"><h2>Warehouse / Stock <span class="muted" style="font-weight:normal">(per-franchise stock — mirrors warehouse.aspx)</span></h2>
+      <div class="row">
+        <select id="ws_franchise"><option value="">Franchise…</option></select>
+        <select id="ws_sku"><option value="">SKU…</option></select>
+        <input id="ws_qty" placeholder="Set quantity to" type="number" style="max-width:140px" />
+        <button id="setStockBtn">Set stock</button>
+      </div>
+      <div class="row">
+        <select id="ws_adj_franchise"><option value="">Franchise…</option></select>
+        <select id="ws_adj_sku"><option value="">SKU…</option></select>
+        <input id="ws_delta" placeholder="Delta, e.g. 10 or -5" type="number" style="max-width:150px" />
+        <button class="secondary" id="adjustStockBtn">Adjust by delta</button>
+      </div>
+      <div id="stockTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
+    </div>
+  `;
+  let editingCode = null;
+  let franchisesCache = [];
+  function resetForm() {
+    editingCode = null;
+    ['fr_code', 'fr_name', 'fr_state', 'fr_contact_name', 'fr_contact_mobile', 'fr_address', 'fr_bank_name', 'fr_bank_account', 'fr_bank_ifsc', 'fr_bank_holder'].forEach(f => { document.getElementById(f).value = ''; });
+    document.getElementById('fr_parent').value = '';
+    document.getElementById('fr_code').disabled = false;
+    document.getElementById('addFranchiseBtn').textContent = '+ Add';
+    document.getElementById('cancelFranchiseEditBtn').style.display = 'none';
+  }
+  function fillForm(f) {
+    editingCode = f.franchise_code;
+    document.getElementById('fr_code').value = f.franchise_code;
+    document.getElementById('fr_code').disabled = true;
+    document.getElementById('fr_name').value = f.franchise_name;
+    document.getElementById('fr_parent').value = f.parent_franchise_code || '';
+    document.getElementById('fr_state').value = f.state || '';
+    document.getElementById('fr_contact_name').value = f.contact_name || '';
+    document.getElementById('fr_contact_mobile').value = f.contact_mobile || '';
+    document.getElementById('fr_address').value = f.address || '';
+    document.getElementById('fr_bank_name').value = f.bank_name || '';
+    document.getElementById('fr_bank_account').value = f.bank_account_number || '';
+    document.getElementById('fr_bank_ifsc').value = f.bank_ifsc || '';
+    document.getElementById('fr_bank_holder').value = f.bank_account_holder || '';
+    document.getElementById('addFranchiseBtn').textContent = 'Save changes';
+    document.getElementById('cancelFranchiseEditBtn').style.display = 'inline-block';
+  }
+  async function refreshFranchises() {
+    franchisesCache = await api('/api/franchises');
+    const parentOptions = franchisesCache.map(f => `<option value="${esc(f.franchise_code)}">${esc(f.franchise_code)} — ${esc(f.franchise_name)}</option>`).join('');
+    document.getElementById('fr_parent').innerHTML = '<option value="">No parent (top-level)</option>' + parentOptions;
+    ['ws_franchise', 'ws_adj_franchise'].forEach(id => {
+      document.getElementById(id).innerHTML = '<option value="">Franchise…</option>' + parentOptions;
+    });
+    document.getElementById('franchisesTable').innerHTML = franchisesCache.length
+      ? `<table><thead><tr><th>Code</th><th>Name</th><th>Parent</th><th>State</th><th>Contact</th><th>Status</th><th></th></tr></thead><tbody>
+          ${franchisesCache.map(f => `<tr>
+            <td>${esc(f.franchise_code)}</td><td>${esc(f.franchise_name)}</td>
+            <td>${esc(f.parent_franchise_code) || '—'}</td><td>${esc(f.state) || '—'}</td>
+            <td>${esc(f.contact_name) || '—'}${f.contact_mobile ? ' (' + esc(f.contact_mobile) + ')' : ''}</td>
+            <td><span class="badge ${f.status === 'Active' ? 'active' : 'inactive'}">${esc(f.status)}</span></td>
+            <td>
+              <button class="secondary" data-edit="${esc(f.franchise_code)}" style="padding:3px 8px;font-size:11px">Edit</button>
+              <button class="danger" data-del="${esc(f.franchise_code)}" style="padding:3px 8px;font-size:11px">Delete</button>
+            </td>
+          </tr>`).join('')}
+        </tbody></table>` : '<div class="empty">No franchises yet.</div>';
+    const byCode = {};
+    franchisesCache.forEach(f => { byCode[f.franchise_code] = f; });
+    document.querySelectorAll('[data-edit]').forEach(b => b.addEventListener('click', () => fillForm(byCode[b.dataset.edit])));
+    document.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', async () => {
+      try { await api('/api/franchises/' + encodeURIComponent(b.dataset.del), { method: 'DELETE' }); toast('Franchise deleted', 'success'); refreshFranchises(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+  }
+  async function refreshProductOptions() {
+    const products = await api('/api/products');
+    const opts = '<option value="">SKU…</option>' + products.map(p => `<option value="${esc(p.sku)}">${esc(p.sku)} — ${esc(p.name)}</option>`).join('');
+    document.getElementById('ws_sku').innerHTML = opts;
+    document.getElementById('ws_adj_sku').innerHTML = opts;
+  }
+  async function refreshStock() {
+    const rows = await api('/api/franchise-stock');
+    document.getElementById('stockTable').innerHTML = rows.length
+      ? `<table><thead><tr><th>Franchise</th><th>SKU</th><th>Quantity</th><th>Updated</th><th></th></tr></thead><tbody>
+          ${rows.map(r => `<tr>
+            <td>${esc(r.franchise_code)}</td><td>${esc(r.sku)}</td><td>${r.quantity}</td><td>${esc(r.updated_at)}</td>
+            <td><button class="danger" data-del-stock="${esc(r.franchise_code)}:${esc(r.sku)}" style="padding:3px 8px;font-size:11px">Delete</button></td>
+          </tr>`).join('')}
+        </tbody></table>` : '<div class="empty">No warehouse stock recorded yet.</div>';
+    document.querySelectorAll('[data-del-stock]').forEach(b => b.addEventListener('click', async () => {
+      const [fc, sku] = b.dataset.delStock.split(':');
+      try { await api(`/api/franchise-stock/${encodeURIComponent(fc)}/${encodeURIComponent(sku)}`, { method: 'DELETE' }); toast('Stock row deleted', 'success'); refreshStock(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
   }
   document.getElementById('addFranchiseBtn').addEventListener('click', async () => {
+    const body = {
+      franchise_name: document.getElementById('fr_name').value.trim(),
+      parent_franchise_code: document.getElementById('fr_parent').value || undefined,
+      state: document.getElementById('fr_state').value.trim() || undefined,
+      contact_name: document.getElementById('fr_contact_name').value.trim() || undefined,
+      contact_mobile: document.getElementById('fr_contact_mobile').value.trim() || undefined,
+      address: document.getElementById('fr_address').value.trim() || undefined,
+      bank_name: document.getElementById('fr_bank_name').value.trim() || undefined,
+      bank_account_number: document.getElementById('fr_bank_account').value.trim() || undefined,
+      bank_ifsc: document.getElementById('fr_bank_ifsc').value.trim() || undefined,
+      bank_account_holder: document.getElementById('fr_bank_holder').value.trim() || undefined,
+    };
     try {
-      await api('/api/franchises', { method: 'POST', body: JSON.stringify({
-        franchise_code: document.getElementById('fr_code').value.trim(),
-        franchise_name: document.getElementById('fr_name').value.trim(),
-        state: document.getElementById('fr_state').value.trim(),
-      })});
-      toast('Franchise added', 'success'); refresh();
+      if (editingCode) {
+        await api('/api/franchises/' + encodeURIComponent(editingCode), { method: 'PATCH', body: JSON.stringify(body) });
+        toast('Franchise updated', 'success');
+      } else {
+        body.franchise_code = document.getElementById('fr_code').value.trim();
+        await api('/api/franchises', { method: 'POST', body: JSON.stringify(body) });
+        toast('Franchise added', 'success');
+      }
+      resetForm(); refreshFranchises();
     } catch (e) { toast('Failed: ' + e.message, 'error'); }
   });
-  refresh().catch(e => { document.getElementById('franchisesTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+  document.getElementById('cancelFranchiseEditBtn').addEventListener('click', resetForm);
+  document.getElementById('setStockBtn').addEventListener('click', async () => {
+    const franchise_code = document.getElementById('ws_franchise').value;
+    const sku = document.getElementById('ws_sku').value;
+    if (!franchise_code || !sku) { toast('Pick a franchise and SKU', 'error'); return; }
+    try {
+      await api('/api/franchise-stock', { method: 'POST', body: JSON.stringify({ franchise_code, sku, quantity: Number(document.getElementById('ws_qty').value) || 0 }) });
+      toast('Stock set', 'success');
+      document.getElementById('ws_qty').value = '';
+      refreshStock();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+  document.getElementById('adjustStockBtn').addEventListener('click', async () => {
+    const franchise_code = document.getElementById('ws_adj_franchise').value;
+    const sku = document.getElementById('ws_adj_sku').value;
+    const delta = Number(document.getElementById('ws_delta').value);
+    if (!franchise_code || !sku || !delta) { toast('Pick a franchise, SKU and a non-zero delta', 'error'); return; }
+    try {
+      await api(`/api/franchise-stock/${encodeURIComponent(franchise_code)}/${encodeURIComponent(sku)}`, { method: 'PATCH', body: JSON.stringify({ delta }) });
+      toast('Stock adjusted', 'success');
+      document.getElementById('ws_delta').value = '';
+      refreshStock();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+  refreshFranchises().catch(e => { document.getElementById('franchisesTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+  refreshProductOptions().catch(() => {});
+  refreshStock().catch(e => { document.getElementById('stockTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+}
+
+// ---------- Franchise Commission (store.airxplus.com's "Commission" menu:
+// franchise bank details live on the Franchises tab's edit form; this tab
+// covers Payout Detail, Pending Payment (via the status filter) and Payout
+// Transfer Detail — same pattern as the Accounts tab's Fund Requests /
+// Payout Transfer Weekly panels, at franchise granularity instead of
+// member granularity. ----------
+async function loadFranchiseCommission() {
+  const el = document.getElementById('tab-franchise_commission');
+  el.innerHTML = `
+    <div class="panel"><h2>Franchise Payout Detail</h2>
+      <p class="muted">Filter to "Pending" for store.airxplus.com's Pending Payment view.</p>
+      <div class="row">
+        <select id="fp_status_filter"><option value="Pending">Pending</option><option value="">All</option><option value="Paid">Paid</option></select>
+      </div>
+      <div id="franchisePayoutsTable"><div class="empty">Loading…</div></div>
+      <h2 style="margin-top:18px;font-size:13px">New payout entry</h2>
+      <div class="row">
+        <select id="fp_franchise"><option value="">Franchise…</option></select>
+        <input id="fp_period" placeholder="Period label, e.g. WEEK-35-2026" style="max-width:200px" />
+        <input id="fp_amount" placeholder="Amount ₹" type="number" style="max-width:130px" />
+        <input id="fp_note" placeholder="Note (optional)" style="flex:1;min-width:140px" />
+        <button id="addFranchisePayoutBtn">+ Add</button>
+      </div>
+    </div>
+    <div class="panel"><h2>Payout Transfer Detail</h2>
+      <p class="muted">Paid franchise payouts for one period.</p>
+      <div class="row">
+        <input id="fpt_period" placeholder="Period label" style="max-width:220px" />
+        <button class="secondary" id="fpt_btn">Look up</button>
+      </div>
+      <div id="fptResult"></div>
+    </div>
+  `;
+  async function refreshFranchiseOptions() {
+    const franchises = await api('/api/franchises');
+    document.getElementById('fp_franchise').innerHTML = '<option value="">Franchise…</option>' +
+      franchises.map(f => `<option value="${esc(f.franchise_code)}">${esc(f.franchise_code)} — ${esc(f.franchise_name)}</option>`).join('');
+  }
+  async function refreshPayouts() {
+    const status = document.getElementById('fp_status_filter').value;
+    const rows = await api('/api/franchise-payouts' + (status ? '?status=' + encodeURIComponent(status) : ''));
+    document.getElementById('franchisePayoutsTable').innerHTML = rows.length
+      ? `<table><thead><tr><th>Franchise</th><th>Period</th><th>Amount</th><th>Status</th><th>Transfer Ref</th><th>Created</th><th></th></tr></thead><tbody>
+          ${rows.map(r => `<tr>
+            <td>${esc(r.franchise_name)} <span class="muted">(${esc(r.franchise_code)})</span></td>
+            <td>${esc(r.period_label)}</td>
+            <td>₹${r.amount.toLocaleString('en-IN')}</td>
+            <td><span class="badge ${r.status === 'Paid' ? 'active' : 'inactive'}">${esc(r.status)}</span></td>
+            <td>${esc(r.transfer_ref) || '—'}</td>
+            <td>${esc(r.created_at)}</td>
+            <td>${r.status === 'Pending' ? `<button class="secondary" data-mark-paid="${r.id}" style="padding:3px 8px;font-size:11px">Mark Paid</button>` : ''}</td>
+          </tr>`).join('')}
+        </tbody></table>` : '<div class="empty">No franchise payouts.</div>';
+    document.querySelectorAll('[data-mark-paid]').forEach(b => b.addEventListener('click', async () => {
+      const ref = prompt('Transfer reference (optional):') || '';
+      try { await api('/api/franchise-payouts/' + b.dataset.markPaid, { method: 'PATCH', body: JSON.stringify({ status: 'Paid', transfer_ref: ref || undefined }) }); toast('Marked Paid', 'success'); refreshPayouts(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+  }
+  document.getElementById('fp_status_filter').addEventListener('change', refreshPayouts);
+  document.getElementById('addFranchisePayoutBtn').addEventListener('click', async () => {
+    const franchise_code = document.getElementById('fp_franchise').value;
+    const period_label = document.getElementById('fp_period').value.trim();
+    const amount = Number(document.getElementById('fp_amount').value);
+    if (!franchise_code || !period_label || !amount) { toast('Franchise, period and amount are required', 'error'); return; }
+    try {
+      await api('/api/franchise-payouts', { method: 'POST', body: JSON.stringify({ franchise_code, period_label, amount, note: document.getElementById('fp_note').value.trim() || undefined }) });
+      toast('Payout entry added', 'success');
+      document.getElementById('fp_period').value = ''; document.getElementById('fp_amount').value = ''; document.getElementById('fp_note').value = '';
+      refreshPayouts();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+  document.getElementById('fpt_btn').addEventListener('click', async () => {
+    const period = document.getElementById('fpt_period').value.trim();
+    if (!period) return;
+    try {
+      const rows = await api('/api/reports/franchise-payout-transfer?period=' + encodeURIComponent(period));
+      document.getElementById('fptResult').innerHTML = rows.length
+        ? `<table><thead><tr><th>Franchise</th><th>Amount</th><th>Transfer Ref</th><th>Paid At</th></tr></thead><tbody>
+            ${rows.map(r => `<tr><td>${esc(r.franchise_name)} (${esc(r.franchise_code)})</td><td>₹${r.amount.toLocaleString('en-IN')}</td><td>${esc(r.transfer_ref) || '—'}</td><td>${esc(r.paid_at)}</td></tr>`).join('')}
+          </tbody></table>` : '<div class="empty">No paid transfers for that period.</div>';
+    } catch (e) { document.getElementById('fptResult').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; }
+  });
+  refreshFranchiseOptions().catch(() => {});
+  refreshPayouts().catch(e => { document.getElementById('franchisePayoutsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
 }
 
 // ---------- Rewards ----------
