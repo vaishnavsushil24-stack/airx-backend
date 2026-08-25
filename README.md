@@ -1253,6 +1253,31 @@ the same customer doesn't block eligibility on the real first delivery.
 All existing test suites (`test_phase3/6/7/8/9/14/15/16.js`) were re-run
 after this change — zero regressions.
 
+## Phase 18 — automated tests on every push (CI) (2026-08-25)
+
+**Why:** by this point there are 8 pure-logic test files
+(`test_phase3/6/7/8/9/14/15/16/17.js` + `test_migration.js`) covering the
+riskiest logic in the app, but they only ever ran when I happened to run
+them by hand before a push. With 17 phases and growing, that's exactly
+the kind of manual step that eventually gets skipped under time pressure.
+Adding CI needed no new external permission — GitHub Actions is already
+part of a GitHub repo, free for a repo this size, and runs no secrets and
+touches no production data (every test file is a pure-logic
+reimplementation with no server, database, or real API calls — see each
+file's own header comment).
+
+- **`.github/workflows/test.yml`** runs on every push and pull request
+  against `main`: syntax-checks `server.js` and `db.js`
+  (`node -c`), then runs every `test_phase*.js` and `test_migration.js`
+  file in the repo. A future push that breaks any existing test now fails
+  visibly in GitHub (a red ✗ next to the commit) instead of only being
+  discovered after it's already live on Render.
+- Verified by running the exact same steps locally first (syntax checks +
+  all 10 test files) before relying on GitHub's own runner to confirm it.
+
+No admin UI or API changes — this is a repo-level safety net, not a
+feature.
+
 **Next candidates (not yet started), largely growth-focused per the
 founder's Ayurvedic D2C directive:** abandoned-cart recovery for Shopify
 checkouts (blocked on a `read_checkouts` OAuth scope this app's current
