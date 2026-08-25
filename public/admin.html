@@ -1522,10 +1522,26 @@ async function loadOrders() {
         <input id="o_address" placeholder="Address" style="flex:1;min-width:200px" />
         <input id="o_pin" placeholder="PIN" style="max-width:90px" />
         <input id="o_staff" placeholder="Booked by (staff name)" style="max-width:150px" />
+        <input id="o_referredBy" placeholder="Referred by (mobile, optional)" style="max-width:170px" />
         <button id="addOrderBtn">+ Add order</button>
       </div>
     </details>
     <div id="ordersTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
+  </div>
+  <div class="panel"><h2>Referral Bridge <span class="muted" style="font-weight:normal">(retail customers → rewards for referring friends)</span></h2>
+    <p class="muted">Tag an order with "Referred by" (above) and, once a reward is configured here, the referrer becomes eligible the moment that customer's <b>first</b> order is delivered. Reward stays "none" (nothing happens) until you set one — this is a placeholder for the real rule, same as the MLM commission settings.</p>
+    <div class="row" style="flex-wrap:wrap">
+      <select id="rf_type">
+        <option value="none">No reward (off)</option>
+        <option value="flat_credit">Flat ₹ credit</option>
+        <option value="percent_discount">% of referred order</option>
+      </select>
+      <input id="rf_value" type="number" placeholder="Value (₹ or %)" style="max-width:140px" />
+      <input id="rf_min" type="number" placeholder="Min order amount (₹, optional)" style="max-width:170px" />
+      <button id="rf_saveBtn">Save reward settings</button>
+    </div>
+    <div id="referralSettingsNote" class="muted" style="margin-top:6px;font-size:12px"></div>
+    <div id="referralsTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
   </div>`;
   let ordersCache = [];
   function passesFilter(o) {
@@ -1610,17 +1626,67 @@ async function loadOrders() {
       address: document.getElementById('o_address').value.trim(),
       pin: document.getElementById('o_pin').value.trim(),
       staff: document.getElementById('o_staff').value.trim(),
+      referredByMobile: document.getElementById('o_referredBy').value.trim(),
       source: 'whatsapp',
       status: 'new',
     };
     if (!body.name || !body.mobile) return toast('Name and mobile are required', 'error');
     try {
       await api('/api/orders', { method: 'POST', body: JSON.stringify(body) });
-      ['o_name', 'o_mobile', 'o_product', 'o_cod', 'o_address', 'o_pin', 'o_staff'].forEach(f => { document.getElementById(f).value = ''; });
+      ['o_name', 'o_mobile', 'o_product', 'o_cod', 'o_address', 'o_pin', 'o_staff', 'o_referredBy'].forEach(f => { document.getElementById(f).value = ''; });
       toast('Order added', 'success'); refresh();
     } catch (e) { toast('Failed: ' + e.message, 'error'); }
   });
   refresh().catch(e => { document.getElementById('ordersTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+
+  // ---- Referral Bridge (Phase 17) ----
+  async function refreshReferralSettings() {
+    const s = await api('/api/referrals/settings');
+    document.getElementById('rf_type').value = s.rewardType || 'none';
+    document.getElementById('rf_value').value = s.rewardValue || '';
+    document.getElementById('rf_min').value = s.minOrderAmount || '';
+    document.getElementById('referralSettingsNote').textContent = s.rewardType === 'none'
+      ? 'No reward configured — referrals are tracked but nothing becomes eligible yet.'
+      : `Active: ${s.rewardType === 'flat_credit' ? '₹' + s.rewardValue + ' flat credit' : s.rewardValue + '% of the referred order'}${s.minOrderAmount ? `, min order ₹${s.minOrderAmount}` : ''}.`;
+  }
+  document.getElementById('rf_saveBtn').addEventListener('click', async () => {
+    try {
+      await api('/api/referrals/settings', { method: 'PATCH', body: JSON.stringify({
+        rewardType: document.getElementById('rf_type').value,
+        rewardValue: document.getElementById('rf_value').value,
+        minOrderAmount: document.getElementById('rf_min').value,
+      }) });
+      toast('Reward settings saved', 'success');
+      refreshReferralSettings();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+  async function refreshReferrals() {
+    const rows = await api('/api/referrals');
+    document.getElementById('referralsTable').innerHTML = rows.length
+      ? `<table><thead><tr><th>Date</th><th>Referrer</th><th>Referred</th><th>Reward</th><th>Status</th><th></th></tr></thead><tbody>
+          ${rows.map(r => `<tr>
+            <td>${esc((r.createdAt || '').slice(0, 10))}</td>
+            <td>${esc(r.referrerMobile)}</td>
+            <td>${esc(r.referredName) || esc(r.referredMobile)}</td>
+            <td>${r.rewardType === 'flat_credit' ? '₹' + esc(String(r.rewardValue)) : esc(String(r.rewardValue)) + '%'}</td>
+            <td><span class="badge ${r.status === 'paid' ? 'active' : r.status === 'void' ? 'inactive' : ''}">${esc(r.status)}</span></td>
+            <td>
+              ${r.status === 'eligible' ? `<button data-payref="${r.id}" style="padding:3px 8px;font-size:11px">Mark paid</button>
+              <button class="danger" data-voidref="${r.id}" style="padding:3px 8px;font-size:11px">Void</button>` : ''}
+            </td>
+          </tr>`).join('')}
+        </tbody></table>` : '<div class="empty">No referrals yet — tag an order with "Referred by" above.</div>';
+    document.querySelectorAll('[data-payref]').forEach(b => b.addEventListener('click', async () => {
+      try { await api('/api/referrals/' + b.dataset.payref + '/mark-paid', { method: 'POST' }); toast('Marked paid', 'success'); refreshReferrals(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+    document.querySelectorAll('[data-voidref]').forEach(b => b.addEventListener('click', async () => {
+      try { await api('/api/referrals/' + b.dataset.voidref + '/void', { method: 'POST' }); toast('Voided', 'success'); refreshReferrals(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+  }
+  refreshReferralSettings().catch(e => { document.getElementById('referralSettingsNote').textContent = 'Failed: ' + e.message; });
+  refreshReferrals().catch(e => { document.getElementById('referralsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
 }
 
 // ---------- Leads (Meta Lead Ads — captured automatically via /webhook/meta) ----------
