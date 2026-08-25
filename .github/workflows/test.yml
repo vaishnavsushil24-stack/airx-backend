@@ -1,0 +1,40 @@
+name: Tests
+
+# Runs the full test_phase*.js suite on every push and pull request against
+# main - so a regression gets caught by GitHub before it ever reaches
+# Render, instead of only being noticed after a live deploy. These tests
+# are all pure-logic reimplementations (no server, no database, no real
+# API calls - see the comment at the top of each test_phase*.js file for
+# why), so this workflow needs no secrets and can't accidentally touch
+# production data.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Syntax-check server.js
+        run: node -c server.js
+
+      - name: Syntax-check db.js
+        run: node -c db.js
+
+      - name: Run all phase test suites
+        run: |
+          set -e
+          for f in test_phase*.js test_migration.js; do
+            if [ -f "$f" ]; then
+              echo "=== $f ==="
+              node "$f"
+            fi
+          done
