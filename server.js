@@ -1008,6 +1008,9 @@ app.post("/webhook/indiapost/event", (req, res) => {
       orders[idx].indiaPostEvents = orders[idx].indiaPostEvents || [];
       orders[idx].indiaPostEvents.push(event);
       if (event.event_code === "ITEM_DELIVERED" || event.event_description === "Item Delivered") {
+        if (orders[idx].status !== "delivered" && !orders[idx].deliveredAt) {
+          orders[idx].deliveredAt = new Date().toISOString();
+        }
         orders[idx].status = "delivered";
       }
       writeJson(ORDERS_FILE, orders);
@@ -1053,7 +1056,14 @@ app.patch("/api/orders/:id", requireAccess("orders"), (req, res) => {
   const orders = readJson(ORDERS_FILE);
   const idx = orders.findIndex((o) => o.id === req.params.id);
   if (idx === -1) return res.status(404).json({ error: "not found" });
+  const wasDelivered = orders[idx].status === "delivered";
   orders[idx] = { ...orders[idx], ...req.body };
+  // Stamp deliveredAt the first time an order turns "delivered" - the
+  // replenishment-reminder feature (below) uses this to know when a
+  // customer's reorder cycle starts. Doesn't overwrite one that's already set.
+  if (!wasDelivered && orders[idx].status === "delivered" && !orders[idx].deliveredAt) {
+    orders[idx].deliveredAt = new Date().toISOString();
+  }
   writeJson(ORDERS_FILE, orders);
   res.json(orders[idx]);
 });
@@ -1142,6 +1152,7 @@ app.post("/api/inventory", requireAccess("inventory"), (req, res) => {
     lowStockThreshold: Number(req.body.lowStockThreshold) || 5,
     batchNumber: req.body.batchNumber || null,
     expiryDate: req.body.expiryDate || null, // "YYYY-MM-DD"
+    reorderCycleDays: Number(req.body.reorderCycleDays) > 0 ? Number(req.body.reorderCycleDays) : null, // null = use DEFAULT_REORDER_CYCLE_DAYS
   };
   items.push(item);
   writeJson(INVENTORY_FILE, items);
@@ -1189,6 +1200,133 @@ function decrementInventoryForOrder(order) {
   });
   if (changed) writeJson(INVENTORY_FILE, items);
 }
+
+// =====================================================================
+// REPLENISHMENT REMINDERS — repeat-purchase nudges for Ayurvedic
+// formulations, which run out on a fairly predictable cycle. This is
+// entirely code-level (no new Shopify permissions, no WhatsApp account
+// needed to build it) - the "Send reminder" button below reuses the same
+// sendWhatsApp() used elsewhere, which just logs and skips until
+// WHATSAPP_TOKEN/WHATSAPP_PHONE_ID are set, same inert-until-configured
+// pattern as the rest of the WhatsApp automation.
+// =====================================================================
+
+const REPLENISH_DISMISSED_FILE = path.join(JSON_DATA_DIR, "replenish_dismissed.json");
+if (!fs.existsSync(REPLENISH_DISMISSED_FILE)) fs.writeFileSync(REPLENISH_DISMISSED_FILE, "[]");
+// [{ orderId, sku, dismissedAt }] - staff can dismiss a reminder (already
+// contacted some other way, or not applicable) without it reappearing.
+
+// No real per-product consumption data exists yet, so this default is a
+// starting assumption for a typical month's-supply Ayurvedic churna/tablet
+// pack - admin-configurable per item via the Inventory tab's
+// "Reorder cycle" field, same "confirmed vs provisional, tune without a
+// code change" approach used for the Phase 3 commission settings.
+const DEFAULT_REORDER_CYCLE_DAYS = 30;
+
+// Orders store product as free text like "Product A x2, Product B x1"
+// (from Shopify line items or WhatsApp paste) - same parsing
+// decrementInventoryForOrder() above uses, factored out so both share one
+// definition of "which inventory item does this order line refer to."
+function extractOrderProductSegments(productText) {
+  return (productText || "")
+    .split(",")
+    .map((segment) => {
+      const trimmed = segment.trim();
+      const qtyMatch = trimmed.match(/x\s*(\d+)\s*$/i);
+      const qty = qtyMatch ? Number(qtyMatch[1]) : 1;
+      const nameOnly = trimmed.replace(/x\s*\d+\s*$/i, "").trim().toLowerCase();
+      return { nameOnly, qty };
+    })
+    .filter((s) => s.nameOnly);
+}
+
+// Pure function (no I/O beyond the three JSON reads) so it's easy to unit
+// test - see test_phase14.js.
+function computeReplenishmentDue(orders, items, dismissed, now) {
+  now = now || Date.now();
+  const isDismissed = (orderId, sku) => dismissed.some((d) => d.orderId === orderId && d.sku === sku);
+  const due = [];
+
+  orders.forEach((order) => {
+    if (order.status !== "delivered" || !order.mobile) return;
+    const deliveredAt = order.deliveredAt || order.createdAt; // legacy orders predating the deliveredAt stamp
+    if (!deliveredAt) return;
+    const deliveredMs = new Date(deliveredAt).getTime();
+    if (isNaN(deliveredMs)) return;
+
+    extractOrderProductSegments(order.product).forEach(({ nameOnly }) => {
+      const item = items.find((i) => i.name && nameOnly.includes(i.name.toLowerCase()));
+      if (!item) return;
+      if (isDismissed(order.id, item.sku)) return;
+
+      const cycleDays = Number(item.reorderCycleDays) > 0 ? Number(item.reorderCycleDays) : DEFAULT_REORDER_CYCLE_DAYS;
+      const dueMs = deliveredMs + cycleDays * 24 * 60 * 60 * 1000;
+      if (now < dueMs) return; // not due yet
+
+      // Skip if this same customer already has a later order for the same
+      // product - they've already reordered, no need to nudge again.
+      const alreadyReordered = orders.some((o2) => {
+        if (o2.id === order.id || o2.mobile !== order.mobile) return false;
+        const createdMs = new Date(o2.createdAt).getTime();
+        if (isNaN(createdMs) || createdMs <= deliveredMs) return false;
+        return extractOrderProductSegments(o2.product).some((s2) => s2.nameOnly.includes(item.name.toLowerCase()));
+      });
+      if (alreadyReordered) return;
+
+      due.push({
+        orderId: order.id,
+        sku: item.sku,
+        product: item.name,
+        mobile: order.mobile,
+        name: order.name || "",
+        deliveredAt,
+        daysSinceDelivered: Math.floor((now - deliveredMs) / (24 * 60 * 60 * 1000)),
+        reorderCycleDays: cycleDays,
+        daysOverdue: Math.floor((now - dueMs) / (24 * 60 * 60 * 1000)),
+      });
+    });
+  });
+
+  due.sort((a, b) => b.daysOverdue - a.daysOverdue);
+  return due;
+}
+
+app.get("/api/replenishment/due", requireAccess("orders"), (req, res) => {
+  try {
+    const due = computeReplenishmentDue(readJson(ORDERS_FILE), readJson(INVENTORY_FILE), readJson(REPLENISH_DISMISSED_FILE));
+    res.json(due);
+  } catch (err) {
+    console.error("Replenishment due error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/replenishment/dismiss", requireAccess("orders"), (req, res) => {
+  const { orderId, sku } = req.body;
+  if (!orderId || !sku) return res.status(400).json({ error: "orderId and sku required" });
+  const dismissed = readJson(REPLENISH_DISMISSED_FILE);
+  dismissed.push({ orderId, sku, dismissedAt: new Date().toISOString() });
+  writeJson(REPLENISH_DISMISSED_FILE, dismissed);
+  res.json({ dismissed: true });
+});
+
+// Reuses sendWhatsApp() - template name is a placeholder, same as the other
+// three WhatsApp routes above; create+approve "replenishment_reminder" in
+// Meta Business Manager alongside cod_confirmation/tracking_update/
+// delivery_followup once WhatsApp is connected.
+app.post("/api/whatsapp/replenishment-reminder", requireAccess("orders"), async (req, res) => {
+  try {
+    const { mobile, name, product } = req.body;
+    if (!mobile) return res.status(400).json({ error: "mobile required" });
+    const result = await sendWhatsApp(mobile, {
+      template: "replenishment_reminder",
+      templateParams: [name || "", product || ""],
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // =====================================================================
 // STAFF PERFORMANCE — who booked what, so staff stays visible/accountable

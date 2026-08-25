@@ -945,11 +945,79 @@ deployed live on Render; a full end-to-end functional test of real
 answers (not just the graceful-fallback path) is still pending the
 founder actually pasting an API key into Render.
 
+## Phase 14 — replenishment reminders (repeat-purchase nudges) (2026-08-25)
+
+**Why:** Phase 10's README already flagged this as "the single
+highest-leverage lever for an Ayurvedic D2C repeat-purchase business," and
+unlike WhatsApp activation or abandoned-cart recovery (which needs a
+`read_checkouts` Shopify scope this app wasn't granted, so re-authorizing
+it would need an explicit OAuth-consent step), this one needed no new
+external permission at all — it runs entirely on data already in the
+system, so it was built and fully tested end-to-end without waiting on
+anything from outside.
+
+- **`deliveredAt` is now stamped automatically** the first time an order's
+  status flips to `"delivered"` — both from the admin "Mark delivered"
+  button (`PATCH /api/orders/:id`) and from a real India Post delivery-scan
+  webhook event. Orders that were already delivered before this phase have
+  no `deliveredAt`, so the reminder engine falls back to `createdAt` for
+  those (an approximation, not exact, but good enough to not miss them
+  entirely).
+- **`GET /api/replenishment/due`** (`requireAccess("orders")`) computes,
+  on every call (no separate stored "due" table to go stale), which
+  delivered customers are past their product's reorder cycle and haven't
+  already reordered. Matching reuses the exact same free-text product
+  parsing `decrementInventoryForOrder()` already used (comma-separated
+  `"Product x2"` segments, matched by name substring against Inventory) —
+  one definition of "which inventory item does this order line mean,"
+  not two.
+- **Reorder cycle is admin-configurable per inventory item** — a new
+  optional `reorderCycleDays` field (Inventory tab, "Reorder cycle
+  (days)"), defaulting to 30 if left blank. No real per-product
+  consumption data exists yet, so 30 days is a starting assumption for a
+  typical month's-supply pack, the same "confirmed vs provisional, tune
+  without a code change" spirit as the Phase 3 commission settings —
+  correct the number per product as real repeat-purchase timing becomes
+  known.
+- **A customer who already reordered is automatically excluded** — the
+  engine checks for any newer order from the same mobile number
+  containing the same product before surfacing a reminder, so staff never
+  get told to chase someone who's already bought again.
+- **Dashboard banner** (`loadDashboard()` in `admin.html`), same
+  best-effort/fails-silently-without-permission pattern as the Phase
+  11b/12 low-stock and near-expiry banners, sharing the same "don't break
+  the rest of the dashboard" try/catch shape: name, mobile, product,
+  delivery date, days overdue, a **Send reminder** button (reuses
+  `sendWhatsApp()` — logs and returns `{skipped:true}` until
+  `WHATSAPP_TOKEN`/`WHATSAPP_PHONE_ID` are set, same inert-until-configured
+  pattern as the other three WhatsApp routes; needs one more approved
+  template, `replenishment_reminder`, alongside the existing three once
+  WhatsApp is connected), and a **Dismiss** button
+  (`POST /api/replenishment/dismiss`) for a reminder that's not
+  applicable or was already handled some other way.
+
+A functional test (`test_phase14.js`, 12 assertions, pure-logic — no
+server/DB needed) exercises the matching engine directly: an overdue
+order surfaces with the correct days-overdue math, a too-recent order is
+excluded, a custom shorter reorder cycle triggers earlier than the
+default would, a customer who already reordered is excluded, a dismissed
+reminder stays dismissed, an order that was never delivered is excluded
+regardless of age, an order with no mobile number is excluded, a legacy
+order predating the `deliveredAt` stamp falls back to `createdAt`
+correctly, a product with no matching inventory item is safely skipped
+(no crash), and a multi-product order correctly surfaces one reminder per
+matched item. All existing test suites
+(`test_phase3/6/7/8/9.js`) were re-run after this change — zero
+regressions.
+
 **Next candidates (not yet started), largely growth-focused per the
 founder's Ayurvedic D2C directive:** WhatsApp automation activation
-(blocked on Meta Business Manager setup, not code — separately, the
-founder chose to build the AI Agent above before returning to this),
-repeat-purchase/replenishment WhatsApp nudges timed to typical
-Ayurvedic-formulation consumption cycles, abandoned-cart recovery for
-Shopify checkouts, and a retail-customer-to-distributor referral bridge
-tying the D2C storefront into the existing MLM structure.
+(blocked on Meta Business Manager setup, not code), abandoned-cart
+recovery for Shopify checkouts (blocked on a `read_checkouts` OAuth scope
+this app's current Shopify connection doesn't have — re-authorizing needs
+an explicit OAuth-consent click, so this is flagged for the founder
+rather than done silently), and a retail-customer-to-distributor referral
+bridge tying the D2C storefront into the existing MLM structure (needs
+the founder's input on the actual referral/commission rule before
+building, the same reasoning Phase 3 already ran into with the
+compensation plan itself).
