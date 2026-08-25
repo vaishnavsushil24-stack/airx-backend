@@ -22,7 +22,7 @@ few thousand records.
 ## Pending items — only you can do these (updated 2026-08-25)
 
 Everything buildable without new external permissions or business decisions
-has been built, tested, and deployed (through Phase 15 below). These five
+has been built, tested, and deployed (through Phase 16 below). These six
 are genuinely stuck on someone/something outside this server, so they're
 listed here together instead of scattered across sections:
 
@@ -61,6 +61,17 @@ listed here together instead of scattered across sections:
    `MLM_INTEGRATION_PLAN.md`) to confirm the numbers match exactly. This
    wasn't flagged as a pending item before this round — noting it now
    rather than ever cutting distributors over silently.
+6. **Social Media Hub (Phase 16) needs its own Meta permissions** — the
+   current `META_PAGE_ACCESS_TOKEN` only has Lead Ads scopes. Posting,
+   replying to comments/DMs, and running ads each need you to re-authorize
+   the Meta app with additional scopes (`pages_manage_posts`,
+   `pages_read_engagement`, `pages_manage_engagement`, `pages_messaging`,
+   `instagram_basic`, `instagram_content_publish`,
+   `instagram_manage_comments`, `ads_management`, `ads_read`,
+   `business_management`) through Meta's OAuth consent screen, plus
+   setting `META_PAGE_ID`, `META_IG_BUSINESS_ID`, and
+   `META_ADS_ACCOUNT_ID` on Render. Full detail in Phase 16 below. Until
+   then, posts/replies/campaigns all save fine in the admin and just wait.
 
 Also worth a periodic manual check (no diagnostic endpoint for this one):
 Meta Lead Ads' "Standard Access" review on the `leads_retrieval` /
@@ -68,9 +79,11 @@ Meta Lead Ads' "Standard Access" review on the `leads_retrieval` /
 re-confirmed this round.
 
 Everything else — AI Agent (Phase 13), replenishment reminders (Phase 14),
-inventory/batch/expiry tracking, staff performance, multi-user admin auth,
-and the rest of the MLM feature set — is live and already working
-autonomously.
+full data backup/export (Phase 15), the Social Media Hub's post
+composer/scheduler and AI-drafted engagement replies (Phase 16, minus the
+Meta-permission-gated live posting/ads noted above), inventory/batch/expiry
+tracking, staff performance, multi-user admin auth, and the rest of the
+MLM feature set — is live and already working autonomously.
 
 ## 1. Deploy it (10 minutes, free tier is enough to start)
 
@@ -1109,14 +1122,96 @@ non-secret fields (shop domain, barcode sequence) still come through
 correctly. All existing test suites (`test_phase3/6/7/8/9/14.js`) were
 re-run after this change — zero regressions.
 
+## Phase 16 — Social Media Hub: posts, AI-answered engagement, Meta Ads (2026-08-25)
+
+**Why:** the founder asked directly for a one-stop A-to-Z social media
+solution — daily post scheduling, an AI agent that answers comment/DM
+engagement, and proper Meta Ads management, all in one place. This is the
+first phase built specifically to *not* be fully usable the moment it's
+deployed — posting, replying, and running ads all need Meta permissions
+this app's current token doesn't have (see the new pending item below) —
+but every piece of it is real, tested code, not a stub: it starts working
+the instant those permissions exist, no further code changes needed, same
+inert-until-configured pattern as WhatsApp/Shopify/India Post/OpenAI.
+
+- **Post Composer &amp; Calendar** — `GET/POST/PATCH/DELETE
+  /api/social/posts`, `POST /api/social/posts/:id/publish`. Staff write or
+  AI-suggest (`POST /api/social/posts/suggest-caption` — drafts only,
+  reuses the same Knowledge Base + never-invent-claims system prompt as
+  the AI Assistant) a caption, optionally schedule it, and a once-a-minute
+  background check (`setInterval`, not a separate cron service) publishes
+  anything due via `publishSocialPost()` — Facebook via `/​{page}/feed` or
+  `/​{page}/photos`, Instagram via the two-step `/media` +
+  `/media_publish` container flow. Nothing is lost if Meta posting isn't
+  connected yet — a due post just stays "scheduled" and gets picked up on
+  a later tick once it is.
+- **Engagement Inbox (AI-answered comments &amp; DMs)** — the existing
+  `/webhook/meta` handler now also recognizes Facebook Page comments
+  (`feed` change, `item:"comment"`), Instagram comments (`comments`
+  change), and Messenger DMs (the separate `entry.messaging` array), and
+  routes each one through `handleIncomingSocialComment()`: de-duplicated
+  by Meta's own id (webhooks can redeliver), then
+  `generateSocialReplyDraft()` writes a suggested reply using the same
+  Knowledge Base the public AI Assistant uses. **Auto-send stays off by
+  default** — an unreviewed AI reply going out publicly under the brand's
+  name is a real reputational risk, so every draft waits in the Engagement
+  Inbox for a staff member to edit (if needed) and click **Approve &amp;
+  Send** (`POST /api/social/engagement/:id/send`). Setting
+  `AI_AUTO_REPLY_SOCIAL=true` on Render flips individual future replies to
+  fully autonomous once the founder trusts the Knowledge Base coverage and
+  tone — a deliberate opt-in, not the starting default.
+- **Meta Ads Manager** — local-first campaign records
+  (`GET/POST/PATCH/DELETE /api/ads/campaigns`) with a deliberately
+  **two-step** path to actually spending money: **Launch**
+  (`POST /api/ads/campaigns/:id/launch`) only creates the
+  campaign/ad-set/creative/ad in Meta's Marketing API, all with
+  `status:"PAUSED"` — ₹0 spent, reviewable in Meta's own Ads Manager first.
+  A separate **Activate** (`POST /api/ads/campaigns/:id/activate`) is the
+  one that actually starts spending, and requires an explicit
+  `{confirm:true}` in the request body on top of the button click itself —
+  the admin UI additionally asks staff to type `LAUNCH` before it will
+  even send that request. **Pause** is always available and safe/reversible.
+  This module hasn't been exercised against a real Meta Ads account yet
+  (no ad account is connected) — test with a small daily budget first once
+  it is, and keep an eye on Meta Ads Manager directly the first few times.
+- **Admin UI**: a new "Social Media" tab with all three panels — Post
+  Composer &amp; Calendar, Engagement Inbox, and Meta Ads Manager — gated
+  behind a new `social_media` permission module key (Phase 8's role
+  system), so it can be handed to specific staff without giving them
+  every other tab.
+
+A functional test (`test_phase16.js`, 18 assertions) covers the pieces
+most worth protecting from a future regression: the age/gender targeting
+mapping, the scheduler's due-posts filter (past/exactly-now due,
+future/draft/already-published excluded), webhook redelivery
+de-duplication, and — the two guards that matter most here — AI
+auto-reply defaulting to OFF (unset, `"false"`, and an empty draft all
+correctly stay silent; only an explicit `AI_AUTO_REPLY_SOCIAL=true` *and*
+a real draft triggers a send), and ad-campaign activation rejecting
+anything other than a literal boolean `confirm:true` (no accidental
+truthy bypass via the string `"true"`). All existing test suites
+(`test_phase3/6/7/8/9/14/15.js`) were re-run after this change — zero
+regressions.
+
+**What this needs from the founder before it does anything live** (added
+as a 6th pending item below): the current `META_PAGE_ACCESS_TOKEN` was
+issued for Lead Ads only. Posting, replying, and ads each need their own
+scopes that require re-authorizing the Meta app through its OAuth consent
+screen — `pages_manage_posts`, `pages_read_engagement`,
+`pages_manage_engagement`, `pages_messaging`, `instagram_basic`,
+`instagram_content_publish`, `instagram_manage_comments`,
+`ads_management`, `ads_read`, `business_management` — plus setting
+`META_PAGE_ID`, `META_IG_BUSINESS_ID`, and `META_ADS_ACCOUNT_ID` on
+Render once those exist. Exactly the same reasoning as the Shopify
+`read_checkouts` situation: an OAuth consent screen is never something
+this server clicks through on its own.
+
 **Next candidates (not yet started), largely growth-focused per the
-founder's Ayurvedic D2C directive:** WhatsApp automation activation
-(blocked on Meta Business Manager setup, not code), abandoned-cart
-recovery for Shopify checkouts (blocked on a `read_checkouts` OAuth scope
-this app's current Shopify connection doesn't have — re-authorizing needs
-an explicit OAuth-consent click, so this is flagged for the founder
-rather than done silently), and a retail-customer-to-distributor referral
-bridge tying the D2C storefront into the existing MLM structure (needs
-the founder's input on the actual referral/commission rule before
-building, the same reasoning Phase 3 already ran into with the
-compensation plan itself).
+founder's Ayurvedic D2C directive:** abandoned-cart recovery for Shopify
+checkouts (blocked on a `read_checkouts` OAuth scope this app's current
+Shopify connection doesn't have — re-authorizing needs an explicit
+OAuth-consent click, so this is flagged for the founder rather than done
+silently), and a retail-customer-to-distributor referral bridge tying the
+D2C storefront into the existing MLM structure (needs the founder's input
+on the actual referral/commission rule before building, the same
+reasoning Phase 3 already ran into with the compensation plan itself).

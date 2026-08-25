@@ -127,6 +127,7 @@ const MODULE_KEYS = [
   "inventory",
   "staff",
   "ai_assistant",
+  "social_media",
 ];
 
 function hashPassword(password) {
@@ -220,11 +221,53 @@ app.post("/webhook/meta", async (req, res) => {
     for (const entry of entries) {
       const changes = entry.changes || [];
       for (const change of changes) {
-        if (change.field !== "leadgen") continue;
-        const leadgenId = change.value.leadgen_id;
-        const formId = change.value.form_id;
-        const pageId = change.value.page_id;
-        await fetchAndStoreLead(leadgenId, { formId, pageId });
+        try {
+          if (change.field === "leadgen") {
+            const leadgenId = change.value.leadgen_id;
+            const formId = change.value.form_id;
+            const pageId = change.value.page_id;
+            await fetchAndStoreLead(leadgenId, { formId, pageId });
+          } else if (change.field === "feed" && change.value && change.value.item === "comment" && change.value.verb === "add") {
+            // Facebook Page comment (Phase 16 — Social Media Hub).
+            await handleIncomingSocialComment({
+              platform: "facebook",
+              externalId: change.value.comment_id,
+              postId: change.value.post_id,
+              fromName: (change.value.from && change.value.from.name) || "",
+              message: change.value.message || "",
+            });
+          } else if (change.field === "comments" && change.value) {
+            // Instagram comment (Phase 16 — Social Media Hub).
+            await handleIncomingSocialComment({
+              platform: "instagram",
+              externalId: change.value.id,
+              postId: (change.value.media && change.value.media.id) || "",
+              fromName: (change.value.from && change.value.from.username) || "",
+              message: change.value.text || "",
+            });
+          }
+        } catch (err) {
+          console.error("Meta webhook: failed to process one change entry:", err);
+        }
+      }
+      // Messenger DMs arrive as a separate top-level `messaging` array, not
+      // inside `changes` (Phase 16 — Social Media Hub).
+      const messagingEvents = entry.messaging || [];
+      for (const event of messagingEvents) {
+        try {
+          if (event.message && event.message.text && event.sender && event.sender.id) {
+            await handleIncomingSocialComment({
+              platform: "facebook",
+              type: "dm",
+              externalId: event.message.mid || `${event.sender.id}-${event.timestamp}`,
+              postId: event.sender.id, // for a DM this is the sender PSID, needed to reply
+              fromName: "",
+              message: event.message.text,
+            });
+          }
+        } catch (err) {
+          console.error("Meta webhook: failed to process one messaging event:", err);
+        }
       }
     }
   } catch (err) {
@@ -3831,6 +3874,544 @@ app.get("/api/backup/export", requireAccess("user_management"), (req, res) => {
     console.error("Backup export error:", err);
     res.status(500).json({ error: "backup export failed" });
   }
+});
+
+// ---------------------------------------------------------------------
+// Phase 16 — Social Media Hub: post scheduler, AI-answered engagement,
+// Meta Ads manager (2026-08-25)
+// ---------------------------------------------------------------------
+// "One-stop A-to-Z social media solution" per the founder's request: daily
+// post scheduling, an AI agent that answers comments/DMs, and Meta Ads
+// campaign management, all from this admin. Same inert-until-configured
+// pattern as WhatsApp/Shopify/India Post/OpenAI — every piece here works
+// today for drafting/planning, and starts actually talking to Meta's live
+// APIs the moment the right env vars + token scopes exist, with no code
+// changes needed then either.
+//
+// IMPORTANT - what this needs that it doesn't have yet (see README "Pending
+// items"): the current META_PAGE_ACCESS_TOKEN was issued for Lead Ads only
+// (leads_retrieval, pages_manage_metadata). Posting, replying to comments/
+// DMs, and running ads each need their own scopes - pages_manage_posts,
+// pages_read_engagement, pages_manage_engagement, pages_messaging,
+// instagram_basic, instagram_content_publish, instagram_manage_comments,
+// ads_management, ads_read, business_management - which means the founder
+// re-authorizing the Meta app through its OAuth consent screen (same
+// reasoning as the Shopify read_checkouts situation - an OAuth grant is
+// never something this server does on its own). Until then every route
+// below responds honestly with `{configured:false}` instead of pretending
+// to have worked.
+const SOCIAL_POSTS_FILE = path.join(JSON_DATA_DIR, "social_posts.json");
+const SOCIAL_ENGAGEMENT_FILE = path.join(JSON_DATA_DIR, "social_engagement.json");
+const AD_CAMPAIGNS_FILE = path.join(JSON_DATA_DIR, "ad_campaigns.json");
+if (!fs.existsSync(SOCIAL_POSTS_FILE)) fs.writeFileSync(SOCIAL_POSTS_FILE, "[]");
+if (!fs.existsSync(SOCIAL_ENGAGEMENT_FILE)) fs.writeFileSync(SOCIAL_ENGAGEMENT_FILE, "[]");
+if (!fs.existsSync(AD_CAMPAIGNS_FILE)) fs.writeFileSync(AD_CAMPAIGNS_FILE, "[]");
+
+// Generic Graph API caller shared by posting, comment replies, DMs and ads
+// (ads calls just pass an act_<id>/... path). Never throws on a missing
+// token - returns {configured:false} the same way sendWhatsApp() does, so
+// every caller below can handle "not set up yet" without its own try/catch.
+async function callMetaGraphAPI(pathSuffix, { method = "GET", body, accessTokenOverride } = {}) {
+  const token = accessTokenOverride || process.env.META_PAGE_ACCESS_TOKEN;
+  if (!token) return { configured: false };
+  try {
+    const sep = pathSuffix.includes("?") ? "&" : "?";
+    const url = `https://graph.facebook.com/v21.0/${pathSuffix}${sep}access_token=${token}`;
+    const resp = await fetchFn(url, {
+      method,
+      headers: body ? { "Content-Type": "application/json" } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await resp.json();
+    return { configured: true, ok: resp.ok && !data.error, data };
+  } catch (err) {
+    return { configured: true, ok: false, data: { error: { message: err.message } } };
+  }
+}
+
+// ---- Post composer & scheduler ----
+
+async function publishSocialPost(post) {
+  if (post.platform === "facebook") {
+    const pageId = process.env.META_PAGE_ID;
+    if (!pageId) return { configured: false };
+    const endpoint = post.mediaUrl ? `${pageId}/photos` : `${pageId}/feed`;
+    const body = post.mediaUrl ? { caption: post.caption, url: post.mediaUrl } : { message: post.caption };
+    const result = await callMetaGraphAPI(endpoint, { method: "POST", body });
+    if (!result.configured) return { configured: false };
+    if (!result.ok) return { ok: false, error: (result.data.error && result.data.error.message) || "unknown error" };
+    return { ok: true, externalPostId: result.data.post_id || result.data.id };
+  }
+  if (post.platform === "instagram") {
+    const igId = process.env.META_IG_BUSINESS_ID;
+    if (!igId || !post.mediaUrl) return { configured: false }; // Instagram posts require an image/video - no text-only posts.
+    const container = await callMetaGraphAPI(`${igId}/media`, { method: "POST", body: { caption: post.caption, image_url: post.mediaUrl } });
+    if (!container.configured) return { configured: false };
+    if (!container.ok) return { ok: false, error: (container.data.error && container.data.error.message) || "unknown error creating media container" };
+    const publish = await callMetaGraphAPI(`${igId}/media_publish`, { method: "POST", body: { creation_id: container.data.id } });
+    if (!publish.ok) return { ok: false, error: (publish.data.error && publish.data.error.message) || "unknown error publishing" };
+    return { ok: true, externalPostId: publish.data.id };
+  }
+  return { ok: false, error: `unknown platform "${post.platform}"` };
+}
+
+app.get("/api/social/posts", requireAccess("social_media"), (req, res) => {
+  res.json(readJson(SOCIAL_POSTS_FILE).sort((a, b) => (b.scheduledAt || b.createdAt || "").localeCompare(a.scheduledAt || a.createdAt || "")));
+});
+
+app.post("/api/social/posts", requireAccess("social_media"), (req, res) => {
+  const { platform, caption, mediaUrl, scheduledAt } = req.body;
+  if (!platform || !caption) return res.status(400).json({ error: "platform and caption required" });
+  const posts = readJson(SOCIAL_POSTS_FILE);
+  const post = {
+    id: "post_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8),
+    platform,
+    caption,
+    mediaUrl: mediaUrl || "",
+    scheduledAt: scheduledAt || null,
+    status: scheduledAt ? "scheduled" : "draft",
+    publishedAt: null,
+    externalPostId: null,
+    error: null,
+    createdAt: new Date().toISOString(),
+  };
+  posts.unshift(post);
+  writeJson(SOCIAL_POSTS_FILE, posts);
+  res.json(post);
+});
+
+app.patch("/api/social/posts/:id", requireAccess("social_media"), (req, res) => {
+  const posts = readJson(SOCIAL_POSTS_FILE);
+  const idx = posts.findIndex((p) => p.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: "not found" });
+  if (posts[idx].status === "published") return res.status(400).json({ error: "already published - can't edit" });
+  const { caption, mediaUrl, scheduledAt } = req.body;
+  if (caption !== undefined) posts[idx].caption = caption;
+  if (mediaUrl !== undefined) posts[idx].mediaUrl = mediaUrl;
+  if (scheduledAt !== undefined) {
+    posts[idx].scheduledAt = scheduledAt;
+    posts[idx].status = scheduledAt ? "scheduled" : "draft";
+  }
+  writeJson(SOCIAL_POSTS_FILE, posts);
+  res.json(posts[idx]);
+});
+
+app.delete("/api/social/posts/:id", requireAccess("social_media"), (req, res) => {
+  const posts = readJson(SOCIAL_POSTS_FILE);
+  const filtered = posts.filter((p) => p.id !== req.params.id);
+  writeJson(SOCIAL_POSTS_FILE, filtered);
+  res.json({ deleted: filtered.length !== posts.length });
+});
+
+app.post("/api/social/posts/:id/publish", requireAccess("social_media"), async (req, res) => {
+  const posts = readJson(SOCIAL_POSTS_FILE);
+  const idx = posts.findIndex((p) => p.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: "not found" });
+  try {
+    const result = await publishSocialPost(posts[idx]);
+    if (result.configured === false) {
+      return res.json({ configured: false, message: "Meta posting isn't connected yet - see README Phase 16 for the scopes needed." });
+    }
+    if (result.ok) {
+      posts[idx].status = "published";
+      posts[idx].publishedAt = new Date().toISOString();
+      posts[idx].externalPostId = result.externalPostId;
+      posts[idx].error = null;
+    } else {
+      posts[idx].status = "failed";
+      posts[idx].error = result.error;
+    }
+    writeJson(SOCIAL_POSTS_FILE, posts);
+    res.json(posts[idx]);
+  } catch (err) {
+    console.error("Social post publish error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// AI-drafts a caption suggestion - never saved/posted on its own, staff
+// reviews and edits it into an actual post via POST /api/social/posts.
+app.post("/api/social/posts/suggest-caption", requireAccess("social_media"), async (req, res) => {
+  try {
+    const { platform, topic, productName } = req.body;
+    const inventory = readJson(INVENTORY_FILE);
+    const product = productName ? inventory.find((i) => i.name && i.name.toLowerCase().includes(String(productName).toLowerCase())) : null;
+    const system = `You write short, warm ${platform === "instagram" ? "Instagram" : "Facebook"} captions in Hindi/Hinglish for
+AIRX PLUS Healthcare, an Ayurvedic D2C brand. Never invent product claims, dosages, or health/medical benefits you aren't
+given. Include 3-5 relevant hashtags at the end. Keep it under 60 words. Output ONLY the caption text, nothing else.`;
+    const userMsg = `Write a social caption.${topic ? `\nTopic/occasion: ${topic}` : ""}${
+      product ? `\nFeatured product: ${product.name}${product.description ? " - " + product.description : ""}` : ""
+    }`;
+    const result = await callAI({ messages: [{ role: "system", content: system }, { role: "user", content: userMsg }], max_tokens: 300 });
+    res.json({ configured: result.configured, caption: result.text || "" });
+  } catch (err) {
+    console.error("Suggest-caption error:", err);
+    res.status(500).json({ error: "assistant temporarily unavailable" });
+  }
+});
+
+// Scheduler - checks once a minute for scheduled posts whose time has come
+// and attempts to publish them, exactly like a staff member clicking
+// "Publish now" would. Silently does nothing per-post if Meta posting isn't
+// configured yet (stays "scheduled" until it is - nothing is lost).
+setInterval(async () => {
+  try {
+    const posts = readJson(SOCIAL_POSTS_FILE);
+    const now = Date.now();
+    const due = posts.filter((p) => p.status === "scheduled" && p.scheduledAt && new Date(p.scheduledAt).getTime() <= now);
+    for (const post of due) {
+      try {
+        const result = await publishSocialPost(post);
+        if (result.configured === false) continue; // leave it scheduled - nothing to retry differently yet
+        const idx = posts.findIndex((p) => p.id === post.id);
+        if (result.ok) {
+          posts[idx].status = "published";
+          posts[idx].publishedAt = new Date().toISOString();
+          posts[idx].externalPostId = result.externalPostId;
+        } else {
+          posts[idx].status = "failed";
+          posts[idx].error = result.error;
+        }
+      } catch (err) {
+        console.error("Scheduled social post publish failed:", post.id, err.message);
+      }
+    }
+    if (due.length) writeJson(SOCIAL_POSTS_FILE, posts);
+  } catch (err) {
+    console.error("Social post scheduler tick failed:", err.message);
+  }
+}, 60 * 1000);
+
+// ---- Engagement inbox: AI drafts replies to comments/DMs ----
+
+async function generateSocialReplyDraft(item) {
+  try {
+    const kb = readJson(KB_FILE);
+    const kbText = kb.length
+      ? kb.map((k) => `[${k.category}] ${k.title}\n${k.content}`).join("\n\n")
+      : "(no knowledge base articles added yet)";
+    const system = `You reply to public ${item.type === "dm" ? "Instagram/Facebook DMs" : "Facebook/Instagram comments"} for AIRX PLUS
+Healthcare, an Ayurvedic D2C brand. Use ONLY the knowledge base below - never invent product claims, dosages, or medical
+advice. For any health/medication/pregnancy/dosage question, tell them to consult a doctor/Ayurvedic practitioner - don't
+guess. Keep it short, warm, and public-appropriate (this may be visible to everyone). Reply in the same language/script
+the customer used. Output ONLY the reply text.\n\nKnowledge base:\n${kbText}`;
+    const result = await callAI({
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: `${item.fromName ? item.fromName + " wrote: " : ""}"${item.message}"` },
+      ],
+      max_tokens: 300,
+    });
+    return result.configured ? result.text || "" : "";
+  } catch (err) {
+    console.error("generateSocialReplyDraft failed:", err.message);
+    return "";
+  }
+}
+
+async function sendSocialReply(item, message) {
+  if (item.type === "dm") {
+    // Messenger Send API - item.postId holds the sender PSID for DMs (see
+    // handleIncomingSocialComment below).
+    const result = await callMetaGraphAPI(`me/messages`, {
+      method: "POST",
+      body: { recipient: { id: item.postId }, message: { text: message }, messaging_type: "RESPONSE" },
+    });
+    return result;
+  }
+  // Facebook and Instagram both expose the same shape for replying to a
+  // comment: POST /{comment_id}/comments with a message body.
+  return callMetaGraphAPI(`${item.externalId}/comments`, { method: "POST", body: { message } });
+}
+
+async function handleIncomingSocialComment({ platform, type = "comment", externalId, postId, fromName, message }) {
+  if (!message) return;
+  const engagement = readJson(SOCIAL_ENGAGEMENT_FILE);
+  if (engagement.some((e) => e.externalId === externalId)) return; // Meta can redeliver webhooks - de-dupe.
+  const item = {
+    id: "eng_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8),
+    platform,
+    type,
+    externalId,
+    postId,
+    fromName: fromName || "",
+    message,
+    aiDraftReply: "",
+    status: "pending", // pending -> approved_sent | auto_sent | dismissed
+    receivedAt: new Date().toISOString(),
+    respondedAt: null,
+  };
+  item.aiDraftReply = await generateSocialReplyDraft(item);
+
+  // Auto-send stays OFF unless the founder explicitly opts in via env var -
+  // an unreviewed AI reply going out publicly under the brand's name is a
+  // real reputational risk, so the safe default is "draft only, staff
+  // clicks Approve & Send" (same reasoning as the WhatsApp follow-up
+  // drafter). Flip AI_AUTO_REPLY_SOCIAL=true only once you trust the KB
+  // coverage and tone.
+  if (process.env.AI_AUTO_REPLY_SOCIAL === "true" && item.aiDraftReply) {
+    const sendResult = await sendSocialReply(item, item.aiDraftReply);
+    if (sendResult.configured && sendResult.ok) {
+      item.status = "auto_sent";
+      item.respondedAt = new Date().toISOString();
+    }
+  }
+
+  engagement.unshift(item);
+  writeJson(SOCIAL_ENGAGEMENT_FILE, engagement);
+}
+
+app.get("/api/social/engagement", requireAccess("social_media"), (req, res) => {
+  const { status } = req.query;
+  let rows = readJson(SOCIAL_ENGAGEMENT_FILE);
+  if (status) rows = rows.filter((r) => r.status === status);
+  res.json(rows);
+});
+
+app.post("/api/social/engagement/:id/draft", requireAccess("social_media"), async (req, res) => {
+  const rows = readJson(SOCIAL_ENGAGEMENT_FILE);
+  const idx = rows.findIndex((r) => r.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: "not found" });
+  rows[idx].aiDraftReply = await generateSocialReplyDraft(rows[idx]);
+  writeJson(SOCIAL_ENGAGEMENT_FILE, rows);
+  res.json(rows[idx]);
+});
+
+app.post("/api/social/engagement/:id/send", requireAccess("social_media"), async (req, res) => {
+  const rows = readJson(SOCIAL_ENGAGEMENT_FILE);
+  const idx = rows.findIndex((r) => r.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: "not found" });
+  const message = String(req.body.message || rows[idx].aiDraftReply || "").trim();
+  if (!message) return res.status(400).json({ error: "message required" });
+  try {
+    const result = await sendSocialReply(rows[idx], message);
+    if (result.configured === false) {
+      return res.json({ configured: false, message: "Meta reply-sending isn't connected yet - see README Phase 16 for the scopes needed." });
+    }
+    if (result.ok) {
+      rows[idx].status = "approved_sent";
+      rows[idx].respondedAt = new Date().toISOString();
+      rows[idx].aiDraftReply = message;
+      writeJson(SOCIAL_ENGAGEMENT_FILE, rows);
+      res.json(rows[idx]);
+    } else {
+      res.status(502).json({ error: (result.data.error && result.data.error.message) || "send failed" });
+    }
+  } catch (err) {
+    console.error("Social reply send error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/social/engagement/:id/dismiss", requireAccess("social_media"), (req, res) => {
+  const rows = readJson(SOCIAL_ENGAGEMENT_FILE);
+  const idx = rows.findIndex((r) => r.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: "not found" });
+  rows[idx].status = "dismissed";
+  writeJson(SOCIAL_ENGAGEMENT_FILE, rows);
+  res.json(rows[idx]);
+});
+
+// ---- Meta Ads manager ----
+// Deliberately two-step: "Launch" only ever CREATES the campaign/adset/ad
+// in Meta with status PAUSED (zero spend), so the founder can review it in
+// Meta's own Ads Manager before anything goes live. A separate "Activate"
+// step (which actually starts spending) requires an explicit
+// {confirm:true} body, on top of the button click itself, as a deliberate
+// extra guard against spending real money by accident. This module hasn't
+// been exercised against a real Meta Ads account (no ad account has been
+// connected yet) - test with a small daily budget first once it is.
+
+app.get("/api/ads/campaigns", requireAccess("social_media"), (req, res) => {
+  res.json(readJson(AD_CAMPAIGNS_FILE).sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || "")));
+});
+
+app.post("/api/ads/campaigns", requireAccess("social_media"), (req, res) => {
+  const { name, objective, dailyBudget, caption, mediaUrl, ageMin, ageMax, genders, locations } = req.body;
+  if (!name || !objective || !dailyBudget) return res.status(400).json({ error: "name, objective and dailyBudget required" });
+  const campaigns = readJson(AD_CAMPAIGNS_FILE);
+  const campaign = {
+    id: "camp_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8),
+    name,
+    objective, // e.g. "OUTCOME_TRAFFIC" | "OUTCOME_ENGAGEMENT" | "OUTCOME_SALES"
+    dailyBudget: Number(dailyBudget),
+    creative: { caption: caption || "", mediaUrl: mediaUrl || "" },
+    targeting: {
+      ageMin: Number(ageMin) || 18,
+      ageMax: Number(ageMax) || 65,
+      genders: genders || "all",
+      locations: locations || "India",
+    },
+    status: "draft", // draft -> created_paused -> active -> paused (or failed)
+    metaCampaignId: null,
+    metaAdSetId: null,
+    metaAdId: null,
+    error: null,
+    createdAt: new Date().toISOString(),
+    launchedAt: null,
+    activatedAt: null,
+  };
+  campaigns.unshift(campaign);
+  writeJson(AD_CAMPAIGNS_FILE, campaigns);
+  res.json(campaign);
+});
+
+app.patch("/api/ads/campaigns/:id", requireAccess("social_media"), (req, res) => {
+  const campaigns = readJson(AD_CAMPAIGNS_FILE);
+  const idx = campaigns.findIndex((c) => c.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: "not found" });
+  if (campaigns[idx].status !== "draft") return res.status(400).json({ error: "only draft campaigns can be edited - pause it in Meta Ads Manager directly for live changes" });
+  const { name, objective, dailyBudget, caption, mediaUrl, ageMin, ageMax, genders, locations } = req.body;
+  if (name !== undefined) campaigns[idx].name = name;
+  if (objective !== undefined) campaigns[idx].objective = objective;
+  if (dailyBudget !== undefined) campaigns[idx].dailyBudget = Number(dailyBudget);
+  if (caption !== undefined) campaigns[idx].creative.caption = caption;
+  if (mediaUrl !== undefined) campaigns[idx].creative.mediaUrl = mediaUrl;
+  if (ageMin !== undefined) campaigns[idx].targeting.ageMin = Number(ageMin);
+  if (ageMax !== undefined) campaigns[idx].targeting.ageMax = Number(ageMax);
+  if (genders !== undefined) campaigns[idx].targeting.genders = genders;
+  if (locations !== undefined) campaigns[idx].targeting.locations = locations;
+  writeJson(AD_CAMPAIGNS_FILE, campaigns);
+  res.json(campaigns[idx]);
+});
+
+app.delete("/api/ads/campaigns/:id", requireAccess("social_media"), (req, res) => {
+  const campaigns = readJson(AD_CAMPAIGNS_FILE);
+  const target = campaigns.find((c) => c.id === req.params.id);
+  if (target && target.status !== "draft") return res.status(400).json({ error: "can't delete a campaign already created in Meta - pause/delete it in Meta Ads Manager" });
+  const filtered = campaigns.filter((c) => c.id !== req.params.id);
+  writeJson(AD_CAMPAIGNS_FILE, filtered);
+  res.json({ deleted: filtered.length !== campaigns.length });
+});
+
+function metaGenders(genders) {
+  if (genders === "male") return [1];
+  if (genders === "female") return [2];
+  return undefined; // omitted = all genders
+}
+
+app.post("/api/ads/campaigns/:id/launch", requireAccess("social_media"), async (req, res) => {
+  const campaigns = readJson(AD_CAMPAIGNS_FILE);
+  const idx = campaigns.findIndex((c) => c.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: "not found" });
+  const campaign = campaigns[idx];
+  if (campaign.status !== "draft") return res.status(400).json({ error: `campaign is already "${campaign.status}"` });
+  const adAccount = process.env.META_ADS_ACCOUNT_ID;
+  if (!adAccount) return res.json({ configured: false, message: "Meta Ads isn't connected yet - see README Phase 16 for the scopes/account ID needed." });
+
+  try {
+    const campResult = await callMetaGraphAPI(`act_${adAccount}/campaigns`, {
+      method: "POST",
+      body: { name: campaign.name, objective: campaign.objective, status: "PAUSED", special_ad_categories: [] },
+    });
+    if (!campResult.ok) throw new Error((campResult.data.error && campResult.data.error.message) || "campaign creation failed");
+    const metaCampaignId = campResult.data.id;
+
+    const adsetResult = await callMetaGraphAPI(`act_${adAccount}/adsets`, {
+      method: "POST",
+      body: {
+        name: campaign.name + " - Ad Set",
+        campaign_id: metaCampaignId,
+        daily_budget: Math.round(campaign.dailyBudget * 100), // smallest currency unit
+        billing_event: "IMPRESSIONS",
+        optimization_goal: "REACH",
+        bid_strategy: "LOWEST_COST_WITHOUT_CAP",
+        targeting: {
+          geo_locations: { countries: ["IN"] },
+          age_min: campaign.targeting.ageMin,
+          age_max: campaign.targeting.ageMax,
+          genders: metaGenders(campaign.targeting.genders),
+        },
+        status: "PAUSED",
+      },
+    });
+    if (!adsetResult.ok) throw new Error((adsetResult.data.error && adsetResult.data.error.message) || "ad set creation failed");
+    const metaAdSetId = adsetResult.data.id;
+
+    const pageId = process.env.META_PAGE_ID;
+    const creativeResult = await callMetaGraphAPI(`act_${adAccount}/adcreatives`, {
+      method: "POST",
+      body: {
+        name: campaign.name + " - Creative",
+        object_story_spec: {
+          page_id: pageId,
+          link_data: { message: campaign.creative.caption, link: process.env.PUBLIC_URL || "https://airxplus.com", picture: campaign.creative.mediaUrl || undefined },
+        },
+      },
+    });
+    if (!creativeResult.ok) throw new Error((creativeResult.data.error && creativeResult.data.error.message) || "ad creative creation failed");
+
+    const adResult = await callMetaGraphAPI(`act_${adAccount}/ads`, {
+      method: "POST",
+      body: { name: campaign.name + " - Ad", adset_id: metaAdSetId, creative: { creative_id: creativeResult.data.id }, status: "PAUSED" },
+    });
+    if (!adResult.ok) throw new Error((adResult.data.error && adResult.data.error.message) || "ad creation failed");
+
+    campaign.metaCampaignId = metaCampaignId;
+    campaign.metaAdSetId = metaAdSetId;
+    campaign.metaAdId = adResult.data.id;
+    campaign.status = "created_paused";
+    campaign.launchedAt = new Date().toISOString();
+    campaign.error = null;
+    writeJson(AD_CAMPAIGNS_FILE, campaigns);
+    res.json(campaign);
+  } catch (err) {
+    campaign.status = "failed";
+    campaign.error = err.message;
+    writeJson(AD_CAMPAIGNS_FILE, campaigns);
+    console.error("Ad campaign launch error:", err);
+    res.status(502).json({ error: err.message, campaign });
+  }
+});
+
+app.post("/api/ads/campaigns/:id/activate", requireAccess("social_media"), async (req, res) => {
+  if (req.body.confirm !== true) return res.status(400).json({ error: "resend with {confirm:true} - this starts real ad spend" });
+  const campaigns = readJson(AD_CAMPAIGNS_FILE);
+  const idx = campaigns.findIndex((c) => c.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: "not found" });
+  const campaign = campaigns[idx];
+  if (campaign.status !== "created_paused" && campaign.status !== "paused") return res.status(400).json({ error: `campaign must be created first (currently "${campaign.status}")` });
+  try {
+    const result = await callMetaGraphAPI(campaign.metaCampaignId, { method: "POST", body: { status: "ACTIVE" } });
+    if (result.configured === false) return res.json({ configured: false });
+    if (!result.ok) throw new Error((result.data.error && result.data.error.message) || "activate failed");
+    campaign.status = "active";
+    campaign.activatedAt = new Date().toISOString();
+    writeJson(AD_CAMPAIGNS_FILE, campaigns);
+    res.json(campaign);
+  } catch (err) {
+    console.error("Ad campaign activate error:", err);
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.post("/api/ads/campaigns/:id/pause", requireAccess("social_media"), async (req, res) => {
+  const campaigns = readJson(AD_CAMPAIGNS_FILE);
+  const idx = campaigns.findIndex((c) => c.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: "not found" });
+  const campaign = campaigns[idx];
+  if (!campaign.metaCampaignId) return res.status(400).json({ error: "campaign was never created in Meta" });
+  try {
+    const result = await callMetaGraphAPI(campaign.metaCampaignId, { method: "POST", body: { status: "PAUSED" } });
+    if (result.configured === false) return res.json({ configured: false });
+    if (!result.ok) throw new Error((result.data.error && result.data.error.message) || "pause failed");
+    campaign.status = "paused";
+    writeJson(AD_CAMPAIGNS_FILE, campaigns);
+    res.json(campaign);
+  } catch (err) {
+    console.error("Ad campaign pause error:", err);
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.get("/api/ads/campaigns/:id/insights", requireAccess("social_media"), async (req, res) => {
+  const campaigns = readJson(AD_CAMPAIGNS_FILE);
+  const campaign = campaigns.find((c) => c.id === req.params.id);
+  if (!campaign) return res.status(404).json({ error: "not found" });
+  if (!campaign.metaCampaignId) return res.json({ configured: false, message: "not launched yet" });
+  const result = await callMetaGraphAPI(`${campaign.metaCampaignId}/insights?fields=spend,impressions,clicks,reach`);
+  if (result.configured === false) return res.json({ configured: false });
+  res.json(result.ok ? result.data : { error: result.data.error });
 });
 
 app.get("/health", (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
