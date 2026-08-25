@@ -113,6 +113,7 @@ const MODULE_KEYS = [
   "rewards",
   "cms",
   "user_management",
+  "franchise_commission",
 ];
 
 function hashPassword(password) {
@@ -1314,6 +1315,10 @@ app.post("/api/franchises", requireAccess("franchises"), (req, res) => {
     address,
     state,
     status,
+    bank_name,
+    bank_account_number,
+    bank_ifsc,
+    bank_account_holder,
   } = req.body;
   if (!franchise_code || !franchise_name) {
     return res.status(400).json({ error: "franchise_code and franchise_name are required" });
@@ -1329,8 +1334,9 @@ app.post("/api/franchises", requireAccess("franchises"), (req, res) => {
   try {
     db.prepare(
       `INSERT INTO franchises
-       (franchise_code, franchise_name, parent_franchise_code, contact_name, contact_mobile, address, state, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+       (franchise_code, franchise_name, parent_franchise_code, contact_name, contact_mobile, address, state, status,
+        bank_name, bank_account_number, bank_ifsc, bank_account_holder)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       franchise_code,
       franchise_name,
@@ -1339,7 +1345,11 @@ app.post("/api/franchises", requireAccess("franchises"), (req, res) => {
       contact_mobile || null,
       address || null,
       state || null,
-      status || "Active"
+      status || "Active",
+      bank_name || null,
+      bank_account_number || null,
+      bank_ifsc || null,
+      bank_account_holder || null
     );
   } catch (err) {
     if (String(err.message).includes("UNIQUE")) {
@@ -1357,9 +1367,13 @@ app.patch("/api/franchises/:code", requireAccess("franchises"), (req, res) => {
     .get(req.params.code);
   if (!existing) return res.status(404).json({ error: "not found" });
   const merged = { ...existing, ...req.body };
+  if (merged.parent_franchise_code && merged.parent_franchise_code === req.params.code) {
+    return res.status(400).json({ error: "a franchise cannot be its own parent" });
+  }
   db.prepare(
     `UPDATE franchises SET franchise_name=?, parent_franchise_code=?, contact_name=?,
-     contact_mobile=?, address=?, state=?, status=?, updated_at=datetime('now')
+     contact_mobile=?, address=?, state=?, status=?, bank_name=?, bank_account_number=?,
+     bank_ifsc=?, bank_account_holder=?, updated_at=datetime('now')
      WHERE franchise_code=?`
   ).run(
     merged.franchise_name,
@@ -1369,6 +1383,10 @@ app.patch("/api/franchises/:code", requireAccess("franchises"), (req, res) => {
     merged.address,
     merged.state,
     merged.status,
+    merged.bank_name,
+    merged.bank_account_number,
+    merged.bank_ifsc,
+    merged.bank_account_holder,
     req.params.code
   );
   const row = db
@@ -1377,7 +1395,27 @@ app.patch("/api/franchises/:code", requireAccess("franchises"), (req, res) => {
   res.json(row);
 });
 
+// Same guard-and-explain pattern as the Phase 6 member delete fix: with
+// PRAGMA foreign_keys = ON, deleting a franchise that anything else still
+// points at (child franchises, warehouse stock, payout history) used to be
+// a latent raw-500 waiting to happen the first time someone tried it. Block
+// with a clear 409 instead.
 app.delete("/api/franchises/:code", requireAccess("franchises"), (req, res) => {
+  const existing = db.prepare("SELECT franchise_code FROM franchises WHERE franchise_code = ?").get(req.params.code);
+  if (!existing) return res.json({ deleted: false });
+  const blockers = [
+    ["franchises", "parent_franchise_code", "has child franchises under it"],
+    ["franchise_stock", "franchise_code", "has warehouse stock recorded"],
+    ["franchise_payouts", "franchise_code", "has payout history"],
+  ];
+  for (const [table, col, reason] of blockers) {
+    const row = db.prepare(`SELECT 1 FROM ${table} WHERE ${col} = ? LIMIT 1`).get(req.params.code);
+    if (row) {
+      return res.status(409).json({
+        error: `cannot delete "${req.params.code}" — ${reason}. Reassign/clear those first, or set status to Inactive instead.`,
+      });
+    }
+  }
   const result = db.prepare("DELETE FROM franchises WHERE franchise_code = ?").run(req.params.code);
   res.json({ deleted: result.changes > 0 });
 });
@@ -1388,7 +1426,7 @@ app.delete("/api/franchises/:code", requireAccess("franchises"), (req, res) => {
 // tracks stock PER FRANCHISE WAREHOUSE, matching store.airxplus.com's
 // warehouseView.aspx / warehouse.aspx.)
 
-app.get("/api/franchise-stock", requireApiKey, (req, res) => {
+app.get("/api/franchise-stock", requireAccess("franchises"), (req, res) => {
   const { franchise_code } = req.query;
   const rows = franchise_code
     ? db
@@ -1398,7 +1436,7 @@ app.get("/api/franchise-stock", requireApiKey, (req, res) => {
   res.json(rows);
 });
 
-app.post("/api/franchise-stock", requireApiKey, (req, res) => {
+app.post("/api/franchise-stock", requireAccess("franchises"), (req, res) => {
   const { franchise_code, sku, quantity } = req.body;
   if (!franchise_code || !sku) {
     return res.status(400).json({ error: "franchise_code and sku are required" });
@@ -1425,7 +1463,7 @@ app.post("/api/franchise-stock", requireApiKey, (req, res) => {
 
 // Adjust stock by a delta (positive = stock in, negative = stock out) —
 // convenient for "dispatch N units to franchise X" style calls later.
-app.patch("/api/franchise-stock/:franchise_code/:sku", requireApiKey, (req, res) => {
+app.patch("/api/franchise-stock/:franchise_code/:sku", requireAccess("franchises"), (req, res) => {
   const { franchise_code, sku } = req.params;
   const existing = db
     .prepare("SELECT * FROM franchise_stock WHERE franchise_code = ? AND sku = ?")
@@ -1441,6 +1479,98 @@ app.patch("/api/franchise-stock/:franchise_code/:sku", requireApiKey, (req, res)
     .prepare("SELECT * FROM franchise_stock WHERE franchise_code = ? AND sku = ?")
     .get(franchise_code, sku);
   res.json(row);
+});
+
+app.delete("/api/franchise-stock/:franchise_code/:sku", requireAccess("franchises"), (req, res) => {
+  const { franchise_code, sku } = req.params;
+  const result = db
+    .prepare("DELETE FROM franchise_stock WHERE franchise_code = ? AND sku = ?")
+    .run(franchise_code, sku);
+  res.json({ deleted: result.changes > 0 });
+});
+
+// ---------- Franchise-level Commission (store.airxplus.com's "Commission"
+// menu: franchise bank details — see franchises.bank_* columns above —
+// franchise payout detail, pending payment, payout transfer detail).
+// Distinct from the distributor compensation engine (commission_settings /
+// /api/payouts/*, keyed by member_code) built in Phase 3. ----------
+
+app.get("/api/franchise-payouts", requireAccess("franchise_commission"), (req, res) => {
+  const { franchise_code, status } = req.query;
+  const clauses = [];
+  const params = [];
+  if (franchise_code) {
+    clauses.push("franchise_payouts.franchise_code = ?");
+    params.push(franchise_code);
+  }
+  if (status) {
+    clauses.push("franchise_payouts.status = ?");
+    params.push(status);
+  }
+  const where = clauses.length ? "WHERE " + clauses.join(" AND ") : "";
+  const rows = db
+    .prepare(
+      `SELECT franchise_payouts.*, franchises.franchise_name
+       FROM franchise_payouts JOIN franchises ON franchises.franchise_code = franchise_payouts.franchise_code
+       ${where} ORDER BY franchise_payouts.created_at DESC`
+    )
+    .all(...params);
+  res.json(rows);
+});
+
+app.post("/api/franchise-payouts", requireAccess("franchise_commission"), (req, res) => {
+  const { franchise_code, period_label, amount, note } = req.body;
+  if (!franchise_code || !period_label || amount === undefined) {
+    return res.status(400).json({ error: "franchise_code, period_label and amount are required" });
+  }
+  const franchise = db.prepare("SELECT franchise_code FROM franchises WHERE franchise_code = ?").get(franchise_code);
+  if (!franchise) return res.status(400).json({ error: `unknown franchise_code "${franchise_code}"` });
+  const result = db
+    .prepare("INSERT INTO franchise_payouts (franchise_code, period_label, amount, note) VALUES (?, ?, ?, ?)")
+    .run(franchise_code, period_label, Number(amount) || 0, note || null);
+  res.json(db.prepare("SELECT * FROM franchise_payouts WHERE id = ?").get(result.lastInsertRowid));
+});
+
+// Mark a pending payout as Paid (with a transfer reference) — this same
+// data, filtered by status, answers both "Pending Payment" (status=Pending)
+// and "Payout Detail" (no filter). Re-processing an already-Paid row is
+// blocked, same pattern as the fund-requests approve route.
+app.patch("/api/franchise-payouts/:id", requireAccess("franchise_commission"), (req, res) => {
+  const existing = db.prepare("SELECT * FROM franchise_payouts WHERE id = ?").get(req.params.id);
+  if (!existing) return res.status(404).json({ error: "not found" });
+  if (req.body.status === "Paid") {
+    if (existing.status === "Paid") {
+      return res.status(409).json({ error: `franchise payout #${req.params.id} is already marked Paid` });
+    }
+    db.prepare(
+      "UPDATE franchise_payouts SET status='Paid', transfer_ref=?, paid_at=datetime('now') WHERE id=?"
+    ).run(req.body.transfer_ref || null, req.params.id);
+  } else {
+    const merged = { ...existing, ...req.body };
+    db.prepare("UPDATE franchise_payouts SET period_label=?, amount=?, note=? WHERE id=?").run(
+      merged.period_label,
+      Number(merged.amount) || 0,
+      merged.note,
+      req.params.id
+    );
+  }
+  res.json(db.prepare("SELECT * FROM franchise_payouts WHERE id = ?").get(req.params.id));
+});
+
+// "Payout Transfer Detail" — Paid franchise payouts for one period, mirrors
+// the distributor-level GET /api/reports/payout-transfer-weekly.
+app.get("/api/reports/franchise-payout-transfer", requireAccess("franchise_commission"), (req, res) => {
+  const { period } = req.query;
+  if (!period) return res.status(400).json({ error: "period query param is required" });
+  const rows = db
+    .prepare(
+      `SELECT franchise_payouts.*, franchises.franchise_name
+       FROM franchise_payouts JOIN franchises ON franchises.franchise_code = franchise_payouts.franchise_code
+       WHERE franchise_payouts.period_label = ? AND franchise_payouts.status = 'Paid'
+       ORDER BY franchise_payouts.paid_at DESC`
+    )
+    .all(period);
+  res.json(rows);
 });
 
 // =====================================================================

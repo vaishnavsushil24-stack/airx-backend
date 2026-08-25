@@ -606,3 +606,100 @@ complexity rules beyond an 8-character minimum, and an audit trail of
 the caller supplies, it doesn't yet look up `req.identity.user.username`
 automatically. That's a natural small follow-up once staff accounts are
 actually in daily use, not assumed here.
+
+## Phase 9 — store.airxplus.com's own features (2026-08-25)
+
+store.airxplus.com is a *separate* legacy system from admin.airxplus.com
+— a Product/Franchise/Warehouse ERP, not the distributor compensation
+engine (see `MLM_INTEGRATION_PLAN.md` lines 10-21). It was 0
+products/0 franchises when we reviewed it directly, so unlike the Phase 5
+member migration there's no historical data to reconcile against here —
+this phase is pure feature-parity build-out. Its confirmed menu
+structure: **Master/Product** (Product Report, categories: General/Mens/
+Women/Special Wellness), **Franchise** (franchise details, Warehouse),
+**Commission** (franchise bank details, payout detail, pending payment,
+payout transfer detail), **Admin/User** (user creation, groups,
+permissions — already covered by Phase 8's unified auth system, built
+generically rather than duplicated per legacy system), **Dashboard/Logout**
+(already covered by the existing Dashboard tab + Disconnect button).
+
+**What already existed vs. what Phase 9 added.** A repo audit found the
+Product and Franchise *backend* (tables + full CRUD API) already existed
+from early phases — `products.category` and `franchises.parent_franchise_code`
+were already there — but `public/admin.html` only exposed an add-only
+form for each with no category field, no edit/delete, and none of the
+franchise contact/address/hierarchy fields visible. `franchise_stock`
+(the Warehouse) had a complete backend (`GET/POST/PATCH /api/franchise-stock`)
+but **zero UI** — never wired into admin.html at all. Franchise-level
+Commission (bank details, payout tracking) didn't exist anywhere —
+confirmed via grep, zero matches for franchise+commission/payout/bank in
+both server.js and db.js.
+
+**Schema** (`db.js`): `franchises` gained four columns via the same
+`PRAGMA table_info` + `ALTER TABLE` migration pattern used for `members`
+in earlier phases (`bank_name`, `bank_account_number`, `bank_ifsc`,
+`bank_account_holder` — kept on the franchises table itself rather than
+a separate table, since it's a simple 1:1 relation, same reasoning as
+the member bank fields). New table `franchise_payouts` (franchise_code,
+period_label, amount, status Pending/Paid, transfer_ref, note,
+created_at, paid_at) — franchise-level payout tracking, entirely
+separate from the member-level `payouts`/`commission_settings` tables
+built in Phase 3.
+
+**Routes**: `franchise-stock`'s three routes were switched from the bare
+`requireApiKey` to `requireAccess("franchises")` (they'd been left on
+the master-key-only check since Phase 1, before the Phase 8 permission
+system existed — now consistent with the rest of the Franchises module),
+plus a new `DELETE /api/franchise-stock/:franchise_code/:sku` for
+cleanup. `POST`/`PATCH /api/franchises` extended to accept the four bank
+fields, plus a new guard rejecting a franchise naming itself as its own
+parent. New module key `franchise_commission` (added to `MODULE_KEYS` in
+both server.js and admin.html) gates `GET/POST /api/franchise-payouts`,
+`PATCH /api/franchise-payouts/:id` (mark Paid + transfer_ref; blocks
+re-processing an already-Paid row, same pattern as fund-requests), and
+`GET /api/reports/franchise-payout-transfer?period=` (the dedicated
+"Payout Transfer Detail" report — "Pending Payment" and "Payout Detail"
+are both served by the same `GET /api/franchise-payouts` with an
+optional `?status=` filter, rather than three overlapping endpoints).
+
+**Bug found and fixed proactively, before it shipped:** `DELETE
+/api/franchises/:code` had the exact same latent flaw the Phase 6 member
+delete-guard fixed — with `PRAGMA foreign_keys = ON`, deleting a
+franchise that anything else pointed at (a child franchise, warehouse
+stock, payout history) would throw a raw, unhandled foreign-key error
+(500) the first time anyone actually tried it. Caught by code review
+while adding `franchise_payouts`' and `franchise_stock`'s FKs onto
+`franchises`, not by a live failure this time — fixed with the same
+guard-and-explain `409` pattern, and covered in `test_phase9.js` (a raw
+delete against a franchise with a child franchise, and separately one
+with warehouse stock, both correctly throw; a clean franchise still
+deletes fine).
+
+**`public/admin.html`**: Products tab gained a category dropdown (the
+exact four store.airxplus.com categories), a full products table with
+Edit (populates the form, "Save changes" instead of "+ Add") and Delete.
+Franchises tab gained parent-franchise selection, contact/address
+fields, the bank-details fields, Edit/Delete, and a new **Warehouse /
+Stock** panel (set stock, delta-adjust, per-row delete) — all backed by
+the exact franchise-stock endpoints that already existed with no UI. New
+**Franchise Commission** tab: a status-filtered payout table (Pending by
+default — this is the Pending Payment view), a new-payout-entry form, a
+Mark Paid action per pending row, and a period-lookup Payout Transfer
+Detail panel — deliberately mirroring the Accounts tab's Fund
+Requests / Payout Transfer Weekly panels (same interaction pattern, just
+franchise-scoped instead of member-scoped) rather than inventing a new one.
+
+A functional test (`test_phase9.js`, 19 assertions) exercises the exact
+SQL each route uses: product category storage/update, franchise bank
+details + hierarchy (parent/children query), the self-parent guard, the
+new franchise delete-guard (raw delete against a franchise with a child,
+and separately one with stock, both correctly throw an FK error; a
+clean one deletes fine), stock set/delta-adjust and the negative-quantity
+guard, and the full franchise-payout lifecycle (create Pending → filter
+by status → mark Paid with a transfer ref → payout-transfer-detail
+report joins the franchise name correctly). All existing test suites
+(`test_phase3/6/7/8.js`, `test_migration.js`) were re-run after every
+change in this phase — zero regressions. Every new/changed endpoint was
+also re-verified live against the deployed Render API after push,
+including confirming the master `x-api-key` still reaches every
+newly-rewired `franchise-stock` route exactly as before.

@@ -393,6 +393,46 @@ CREATE TABLE IF NOT EXISTS admin_sessions (
   last_seen_at TEXT,
   FOREIGN KEY (user_id) REFERENCES admin_users(id)
 );
+
+-- Phase 9: the rest of store.airxplus.com's own menu structure (see
+-- MLM_INTEGRATION_PLAN.md lines 10-21) — its "Commission" menu (franchise
+-- bank details, franchise payout detail, pending payment, payout transfer
+-- detail). This is franchise-level payout tracking, distinct from the
+-- individual-distributor compensation engine (commission_settings/payouts,
+-- keyed by member_code) built in Phase 3. store.airxplus.com had 0
+-- franchises/payouts when we reviewed it, so there's no historical data to
+-- reconcile against here (unlike the Phase 3 distributor numbers).
+CREATE TABLE IF NOT EXISTS franchise_payouts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  franchise_code TEXT NOT NULL,
+  period_label TEXT NOT NULL,
+  amount REAL NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'Pending',
+  transfer_ref TEXT,
+  note TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  paid_at TEXT,
+  FOREIGN KEY (franchise_code) REFERENCES franchises(franchise_code)
+);
 `);
+
+// ---------------------------------------------------------------------
+// Migration: franchise bank details (store.airxplus.com's "Commission >
+// Franchise bank details"), added onto the existing franchises table
+// rather than a separate table since it's a simple 1:1 relation, same
+// reasoning as members.bank_name/bank_account_number/bank_ifsc.
+// ---------------------------------------------------------------------
+const franchiseCols = db.prepare("PRAGMA table_info(franchises)").all().map((c) => c.name);
+const franchiseMigrations = [
+  ["bank_name", "TEXT"],
+  ["bank_account_number", "TEXT"],
+  ["bank_ifsc", "TEXT"],
+  ["bank_account_holder", "TEXT"],
+];
+for (const [col, type] of franchiseMigrations) {
+  if (!franchiseCols.includes(col)) {
+    db.exec(`ALTER TABLE franchises ADD COLUMN ${col} ${type}`);
+  }
+}
 
 module.exports = { db };
