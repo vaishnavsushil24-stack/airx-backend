@@ -871,10 +871,85 @@ confirmed the Dashboard's near-expiry banner rendered both correctly
 for the near-dated one), then deleted both test items and confirmed
 inventory returned to empty — 6/6 checks passed.
 
+## Phase 13 — AI Agent: sales, support & education, across the whole system (2026-08-25)
+
+**Why:** the founder asked to defer Meta/WhatsApp integration and instead
+build an AI agent that manages sales, support, education, and the wider
+system — so this phase adds one AI layer with three separate surfaces,
+built to work the moment an API key exists, with zero effect on anything
+else while it doesn't.
+
+- **Public customer assistant** — `POST /api/public/assistant` (outside
+  `requireAccess`, same reasoning as Phase 11's tracking page: customers
+  have no login) + the new `public/assistant.html` chat page. Answers
+  product/usage/order questions. Optionally takes a `mobile` field to pull
+  that customer's own order status into context (same minimal, PII-light
+  order fields as `/api/public/track`). A visible disclaimer tells the
+  customer to consult a doctor for anything the assistant can't answer
+  confidently — the assistant is instructed to answer **only** from
+  staff-authored Knowledge Base content, never to invent dosage/health
+  claims. Rate-limited the same way as `/api/public/track` (hand-rolled
+  in-memory per-IP limiter, 15 requests / 10 minutes, keyed on the first
+  IP in the `x-forwarded-for` chain — reusing the exact fix Phase 11 had
+  to make, not repeating the original bug).
+- **Staff system copilot** — `POST /api/ai/ask` (`requireAccess("ai_assistant")`)
+  + a new **AI Assistant** tab in `public/admin.html` with a chat panel.
+  Unlike the public assistant, this one can call tools to look at live
+  system data: low-stock items, batches nearing/past expiry, a leads
+  summary, an orders summary, and a staff performance summary — so a staff
+  member can ask "which items are low on stock?" or "how are we doing on
+  leads this week?" in plain language instead of clicking through tabs.
+  Runs a bounded tool-calling loop (up to 5 rounds: ask the model, run
+  whatever tools it requested, feed the results back, repeat) rather than
+  a single fixed prompt.
+- **Sales follow-up drafter** — `POST /api/ai/draft-followup`
+  (`requireAccess("leads")`), wired into the Leads tab as an "AI: Draft
+  follow-up" button per lead. Drafts a short WhatsApp-style follow-up
+  message for that lead using their captured details — the staff member
+  reviews/edits/copies it, nothing is sent automatically.
+- **Knowledge Base** — `GET/POST/PATCH/DELETE /api/kb`
+  (`requireAccess("ai_assistant")`), a flat, staff-authored
+  category/title/content store, plus a KB panel next to the chat in the
+  AI Assistant tab. Deliberately kept separate from anything AI-generated:
+  the public assistant's system prompt is built **only** from KB content
+  it's told to answer from, so product/health claims stay under staff
+  control rather than model improvisation — the right call for an
+  Ayurvedic product line where dosage/health claims carry real liability.
+- **Provider-agnostic by design, inert until configured.** The founder
+  found Anthropic's console shows a $5 minimum credit purchase with no
+  free tier, and asked to use an existing OpenAI (ChatGPT) API key
+  instead. Rather than swap one provider for the other, `callAI()` in
+  `server.js` normalizes messages/tool-calls into one shape and picks a
+  provider at boot: `OPENAI_API_KEY` first, `ANTHROPIC_API_KEY` as a
+  fallback, and if neither is set, every AI route replies with a clean
+  "not configured yet" message instead of crashing — the same
+  inert-until-configured pattern the WhatsApp routes already use. Model
+  defaults: `OPENAI_MODEL` (default `gpt-4o-mini`) / `ANTHROPIC_MODEL`
+  (default `claude-sonnet-4-5-20250929`), both overridable via Render env
+  vars with no code change if a different model is preferred.
+
+**To turn the AI Agent on:** put either `OPENAI_API_KEY` (recommended,
+since that's the key already on hand) or `ANTHROPIC_API_KEY` into Render's
+environment variables — no other setup needed, and no Meta/WhatsApp
+account required for this phase. All three surfaces (public assistant,
+staff copilot, follow-up drafter) go live the moment the key is saved and
+the service restarts.
+
+Live-verified pre-key (Anthropic-shaped build): 9/9 checks — all three new
+routes correctly require the expected auth (or none, for the public one),
+and all correctly return a graceful "not configured" response instead of a
+500 with no key set. Visually confirmed both the public `assistant.html`
+page and the admin AI Assistant tab render correctly. The OpenAI-provider
+refactor was then verified with `node -c server.js` (syntax) and confirmed
+deployed live on Render; a full end-to-end functional test of real
+answers (not just the graceful-fallback path) is still pending the
+founder actually pasting an API key into Render.
+
 **Next candidates (not yet started), largely growth-focused per the
 founder's Ayurvedic D2C directive:** WhatsApp automation activation
-(blocked on Meta Business Manager setup, not code), repeat-purchase/
-replenishment WhatsApp nudges timed to typical Ayurvedic-formulation
-consumption cycles, abandoned-cart recovery for Shopify checkouts, and
-a retail-customer-to-distributor referral bridge tying the D2C
-storefront into the existing MLM structure.
+(blocked on Meta Business Manager setup, not code — separately, the
+founder chose to build the AI Agent above before returning to this),
+repeat-purchase/replenishment WhatsApp nudges timed to typical
+Ayurvedic-formulation consumption cycles, abandoned-cart recovery for
+Shopify checkouts, and a retail-customer-to-distributor referral bridge
+tying the D2C storefront into the existing MLM structure.
