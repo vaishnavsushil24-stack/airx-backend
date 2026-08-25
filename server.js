@@ -1084,7 +1084,12 @@ function isRateLimited(ip) {
 }
 
 app.get("/api/public/track", (req, res) => {
-  const ip = req.header("x-forwarded-for") || req.socket.remoteAddress || "unknown";
+  // x-forwarded-for can be a multi-hop chain ("client, proxy1, proxy2") and
+  // Render's edge may vary the proxy hops per request even for the same
+  // client — so key the limiter on just the first (client) IP, not the
+  // raw header string, or the limiter never matches the same visitor twice.
+  const forwardedFor = req.header("x-forwarded-for");
+  const ip = (forwardedFor ? forwardedFor.split(",")[0].trim() : "") || req.socket.remoteAddress || "unknown";
   if (isRateLimited(ip)) {
     return res.status(429).json({ error: "Too many lookups — please try again in a few minutes." });
   }
