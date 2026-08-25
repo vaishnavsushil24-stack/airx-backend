@@ -1123,7 +1123,10 @@ const INVENTORY_FILE = path.join(JSON_DATA_DIR, "inventory.json");
 if (!fs.existsSync(INVENTORY_FILE)) {
   fs.writeFileSync(INVENTORY_FILE, "[]");
 }
-// Each item: { sku, name, stock, lowStockThreshold }
+// Each item: { sku, name, stock, lowStockThreshold, batchNumber, expiryDate }
+// batchNumber/expiryDate are optional (Ayurvedic formulations are batch-
+// manufactured with a shelf life; older stock without a recorded batch just
+// shows no expiry info rather than breaking anything).
 
 app.get("/api/inventory", requireAccess("inventory"), (req, res) => {
   res.json(readJson(INVENTORY_FILE));
@@ -1136,6 +1139,8 @@ app.post("/api/inventory", requireAccess("inventory"), (req, res) => {
     name: req.body.name || "",
     stock: Number(req.body.stock) || 0,
     lowStockThreshold: Number(req.body.lowStockThreshold) || 5,
+    batchNumber: req.body.batchNumber || null,
+    expiryDate: req.body.expiryDate || null, // "YYYY-MM-DD"
   };
   items.push(item);
   writeJson(INVENTORY_FILE, items);
