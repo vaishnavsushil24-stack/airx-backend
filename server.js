@@ -3240,16 +3240,20 @@ app.delete("/api/admin/users/:id", requireAccess("user_management"), (req, res) 
 // AI AGENT — sales support, customer education, and a system copilot
 // =====================================================================
 //
-// Powered by the Anthropic Claude API via a plain fetch() call (Node 22
-// has global fetch — no SDK/npm install needed, consistent with this
-// project's "npm install is blocked in this environment" constraint).
+// Provider-agnostic — supports OpenAI (ChatGPT API) or Anthropic (Claude
+// API), whichever key is set, via a plain fetch() call (Node 22 has global
+// fetch — no SDK/npm install needed, consistent with this project's "npm
+// install is blocked in this environment" constraint). OpenAI is checked
+// first since that's the key AIRX already had on hand.
 //
-// Needs one env var to activate:
-//   ANTHROPIC_API_KEY   - from console.anthropic.com
-// Optional:
-//   ANTHROPIC_MODEL     - defaults to "claude-sonnet-4-5-20250929"
+// Needs ONE of these env vars to activate:
+//   OPENAI_API_KEY      - from platform.openai.com (checked first)
+//   ANTHROPIC_API_KEY   - from console.anthropic.com (used if no OpenAI key)
+// Optional model overrides:
+//   OPENAI_MODEL         - defaults to "gpt-4o-mini"
+//   ANTHROPIC_MODEL       - defaults to "claude-sonnet-4-5-20250929"
 //
-// Until ANTHROPIC_API_KEY is set, every route below returns a clean
+// Until one of the API keys is set, every route below returns a clean
 // "not configured yet" response instead of crashing — the same
 // inert-until-configured pattern used for WhatsApp above.
 //
@@ -3273,20 +3277,93 @@ const KB_FILE = path.join(JSON_DATA_DIR, "kb.json");
 if (!fs.existsSync(KB_FILE)) fs.writeFileSync(KB_FILE, "[]");
 // Each entry: { id, category: "product_education"|"faq"|"policy", title, content }
 
+const AI_PROVIDER = process.env.OPENAI_API_KEY ? "openai" : process.env.ANTHROPIC_API_KEY ? "anthropic" : null;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5-20250929";
 
-async function callClaude({ system, messages, tools, max_tokens = 1024 }) {
-  const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) {
+// Normalized message shape every caller below uses, regardless of provider:
+//   { role: "system"|"user"|"assistant"|"tool", content: string,
+//     tool_calls?: [{ id, name, arguments: object }],   // only on assistant messages
+//     tool_call_id?: string }                            // only on tool messages
+// Normalized tool shape: { name, description, parameters: <JSON schema> }
+// Always returns { configured, text, toolCalls: [{ id, name, input }] } —
+// callers never need to know which provider actually answered.
+async function callAI({ messages, tools, max_tokens = 1024 }) {
+  if (!AI_PROVIDER) {
     return {
       configured: false,
-      text: "The AI assistant isn't set up yet — ask the AIRX team to add an Anthropic API key.",
+      text: "The AI assistant isn't set up yet — ask the AIRX team to add an OpenAI or Anthropic API key.",
+      toolCalls: [],
     };
   }
+
+  if (AI_PROVIDER === "openai") {
+    const body = {
+      model: OPENAI_MODEL,
+      max_tokens,
+      messages: messages.map((m) => {
+        if (m.role === "assistant" && m.tool_calls) {
+          return {
+            role: "assistant",
+            content: m.content || null,
+            tool_calls: m.tool_calls.map((tc) => ({
+              id: tc.id,
+              type: "function",
+              function: { name: tc.name, arguments: JSON.stringify(tc.arguments || {}) },
+            })),
+          };
+        }
+        if (m.role === "tool") {
+          return { role: "tool", tool_call_id: m.tool_call_id, content: m.content };
+        }
+        return { role: m.role, content: m.content };
+      }),
+      ...(tools
+        ? { tools: tools.map((t) => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.parameters } })) }
+        : {}),
+    };
+    const resp = await fetchFn("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error.message || "OpenAI API error");
+    const msg = (data.choices && data.choices[0] && data.choices[0].message) || {};
+    const toolCalls = (msg.tool_calls || []).map((tc) => {
+      let input = {};
+      try {
+        input = JSON.parse(tc.function.arguments || "{}");
+      } catch (e) {
+        input = {};
+      }
+      return { id: tc.id, name: tc.function.name, input };
+    });
+    return { configured: true, text: msg.content || "", toolCalls };
+  }
+
+  // Anthropic path — translates the same normalized messages/tools into
+  // Anthropic's shape (separate top-level `system`, content-block messages).
+  const system = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n\n");
+  const anthMessages = [];
+  messages
+    .filter((m) => m.role !== "system")
+    .forEach((m) => {
+      if (m.role === "assistant" && m.tool_calls) {
+        const content = [];
+        if (m.content) content.push({ type: "text", text: m.content });
+        m.tool_calls.forEach((tc) => content.push({ type: "tool_use", id: tc.id, name: tc.name, input: tc.arguments || {} }));
+        anthMessages.push({ role: "assistant", content });
+      } else if (m.role === "tool") {
+        anthMessages.push({ role: "user", content: [{ type: "tool_result", tool_use_id: m.tool_call_id, content: m.content }] });
+      } else {
+        anthMessages.push({ role: m.role, content: m.content });
+      }
+    });
   const resp = await fetchFn("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
-      "x-api-key": key,
+      "x-api-key": process.env.ANTHROPIC_API_KEY,
       "anthropic-version": "2023-06-01",
       "Content-Type": "application/json",
     },
@@ -3294,13 +3371,19 @@ async function callClaude({ system, messages, tools, max_tokens = 1024 }) {
       model: ANTHROPIC_MODEL,
       max_tokens,
       system,
-      messages,
-      ...(tools ? { tools } : {}),
+      messages: anthMessages,
+      ...(tools ? { tools: tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters })) } : {}),
     }),
   });
   const data = await resp.json();
   if (data.error) throw new Error(data.error.message || "Anthropic API error");
-  return { configured: true, ...data };
+  const textBlocks = (data.content || []).filter((b) => b.type === "text");
+  const toolUseBlocks = (data.content || []).filter((b) => b.type === "tool_use");
+  return {
+    configured: true,
+    text: textBlocks.map((b) => b.text).join("\n"),
+    toolCalls: toolUseBlocks.map((b) => ({ id: b.id, name: b.name, input: b.input })),
+  };
 }
 
 // ---- Knowledge Base CRUD (staff-managed content the agent grounds itself in) ----
@@ -3382,10 +3465,15 @@ to the team.
 Knowledge base:
 ${kbText}${orderContext}`;
 
-    const result = await callClaude({ system, messages: [{ role: "user", content: question }], max_tokens: 600 });
+    const result = await callAI({
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: question },
+      ],
+      max_tokens: 600,
+    });
     if (!result.configured) return res.json({ answer: result.text, configured: false });
-    const textBlock = (result.content || []).find((b) => b.type === "text");
-    res.json({ answer: textBlock ? textBlock.text : "Sorry, I couldn't find an answer to that.", configured: true });
+    res.json({ answer: result.text || "Sorry, I couldn't find an answer to that.", configured: true });
   } catch (err) {
     console.error("AI assistant error:", err);
     res.status(500).json({ error: "assistant temporarily unavailable" });
@@ -3445,11 +3533,11 @@ function aiTool_getStaffSummary() {
 }
 
 const AI_TOOLS = [
-  { name: "get_low_stock", description: "Get D2C inventory items at or below their low-stock threshold.", input_schema: { type: "object", properties: {} } },
-  { name: "get_near_expiry", description: "Get inventory batches expiring within 60 days or already expired.", input_schema: { type: "object", properties: {} } },
-  { name: "get_leads_summary", description: "Get a summary of Meta lead ads leads by status, plus the 10 most recent.", input_schema: { type: "object", properties: {} } },
-  { name: "get_orders_summary", description: "Get order counts by status and total sales value.", input_schema: { type: "object", properties: {} } },
-  { name: "get_staff_summary", description: "Get per-staff order counts, sales, delivered/pending breakdown.", input_schema: { type: "object", properties: {} } },
+  { name: "get_low_stock", description: "Get D2C inventory items at or below their low-stock threshold.", parameters: { type: "object", properties: {} } },
+  { name: "get_near_expiry", description: "Get inventory batches expiring within 60 days or already expired.", parameters: { type: "object", properties: {} } },
+  { name: "get_leads_summary", description: "Get a summary of Meta lead ads leads by status, plus the 10 most recent.", parameters: { type: "object", properties: {} } },
+  { name: "get_orders_summary", description: "Get order counts by status and total sales value.", parameters: { type: "object", properties: {} } },
+  { name: "get_staff_summary", description: "Get per-staff order counts, sales, delivered/pending breakdown.", parameters: { type: "object", properties: {} } },
 ];
 const AI_TOOL_IMPL = {
   get_low_stock: aiTool_getLowStock,
@@ -3466,37 +3554,41 @@ app.post("/api/ai/ask", requireAccess("ai_assistant"), async (req, res) => {
     const system = `You are the AIRX Ops internal system copilot for staff. You can call tools to look up live data
 about inventory, leads, orders, and staff performance. Always call a tool rather than guessing when the question is
 about current data. Answer concisely, in plain language, with numbers where relevant.`;
-    let messages = [{ role: "user", content: question }];
+    let messages = [
+      { role: "system", content: system },
+      { role: "user", content: question },
+    ];
     let finalText = "";
     let configured = true;
 
     for (let round = 0; round < 5; round++) {
-      const result = await callClaude({ system, messages, tools: AI_TOOLS, max_tokens: 800 });
+      const result = await callAI({ messages, tools: AI_TOOLS, max_tokens: 800 });
       if (!result.configured) {
         finalText = result.text;
         configured = false;
         break;
       }
-      const toolUses = (result.content || []).filter((b) => b.type === "tool_use");
-      const textBlocks = (result.content || []).filter((b) => b.type === "text");
-      if (!toolUses.length) {
-        finalText = textBlocks.map((b) => b.text).join("\n");
+      if (!result.toolCalls.length) {
+        finalText = result.text;
         break;
       }
-      messages.push({ role: "assistant", content: result.content });
-      const toolResults = toolUses.map((tu) => {
-        const impl = AI_TOOL_IMPL[tu.name];
+      messages.push({
+        role: "assistant",
+        content: result.text || "",
+        tool_calls: result.toolCalls.map((tc) => ({ id: tc.id, name: tc.name, arguments: tc.input })),
+      });
+      result.toolCalls.forEach((tc) => {
+        const impl = AI_TOOL_IMPL[tc.name];
         let output;
         try {
           output = impl ? impl() : { error: "unknown tool" };
         } catch (e) {
           output = { error: e.message };
         }
-        return { type: "tool_result", tool_use_id: tu.id, content: JSON.stringify(output) };
+        messages.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify(output) });
       });
-      messages.push({ role: "user", content: toolResults });
       if (round === 4) {
-        finalText = textBlocks.map((b) => b.text).join("\n") || "I looked into it but couldn't finish — try rephrasing your question.";
+        finalText = result.text || "I looked into it but couldn't finish — try rephrasing your question.";
       }
     }
     res.json({ answer: finalText, configured });
@@ -3517,10 +3609,15 @@ prices you aren't given. Keep it under 40 words. Output ONLY the message text, n
     const userMsg = `Draft a follow-up WhatsApp message for this lead:\nName: ${name || "unknown"}\nStatus: ${status || "new"}\n${
       product ? `Interested in: ${product}\n` : ""
     }Goal: move them toward placing an order, politely, no pressure.`;
-    const result = await callClaude({ system, messages: [{ role: "user", content: userMsg }], max_tokens: 300 });
+    const result = await callAI({
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: userMsg },
+      ],
+      max_tokens: 300,
+    });
     if (!result.configured) return res.json({ draft: result.text, configured: false });
-    const textBlock = (result.content || []).find((b) => b.type === "text");
-    res.json({ draft: textBlock ? textBlock.text : "", configured: true });
+    res.json({ draft: result.text || "", configured: true });
   } catch (err) {
     console.error("AI draft-followup error:", err);
     res.status(500).json({ error: "assistant temporarily unavailable" });
