@@ -446,10 +446,11 @@ async function loadDashboard() {
       api('/api/reports/payout-health'),
     ]);
 
-    // Low-stock banner: best-effort — a staff user without the "inventory"
-    // module permission will get a 403 here, which we swallow quietly
-    // (the banner just doesn't show, rather than breaking the dashboard).
+    // Low-stock / near-expiry banners: best-effort — a staff user without
+    // the "inventory" module permission will get a 403 here, which we
+    // swallow quietly (banners just don't show, dashboard still renders).
     let lowStockBanner = '';
+    let expiryBanner = '';
     try {
       const inventory = await api('/api/inventory');
       const lowItems = (inventory || []).filter(i => Number(i.stock) <= Number(i.lowStockThreshold));
@@ -462,12 +463,25 @@ async function loadDashboard() {
             </tbody></table>
           </div>`;
       }
+      const expiryItems = (inventory || [])
+        .map(i => ({ ...i, daysLeft: daysUntil(i.expiryDate) }))
+        .filter(i => i.daysLeft !== null && i.daysLeft <= NEAR_EXPIRY_DAYS);
+      if (expiryItems.length) {
+        expiryBanner = `
+          <div class="panel" style="background:rgba(220,150,20,0.13);border:1px solid rgba(220,150,20,0.4)">
+            <h2 style="margin-top:0">⏳ Batches nearing/past expiry — ${expiryItems.length} item${expiryItems.length > 1 ? 's' : ''}</h2>
+            <table><thead><tr><th>SKU</th><th>Name</th><th>Batch</th><th>Expiry</th><th>Status</th></tr></thead><tbody>
+              ${expiryItems.map(i => `<tr><td>${esc(i.sku)}</td><td>${esc(i.name)}</td><td>${esc(i.batchNumber) || '—'}</td><td>${esc(i.expiryDate)}</td><td>${i.daysLeft < 0 ? '⛔ expired' : `${i.daysLeft} day(s) left`}</td></tr>`).join('')}
+            </tbody></table>
+          </div>`;
+      }
     } catch (invErr) {
-      // no inventory access or inventory fetch failed — skip the banner silently
+      // no inventory access or inventory fetch failed — skip both banners silently
     }
 
     el.innerHTML = `
       ${lowStockBanner}
+      ${expiryBanner}
       <div class="cards">
         <div class="card"><div class="label">Total Members</div><div class="value">${dummySummary.total_members}</div></div>
         <div class="card"><div class="label">Likely Real</div><div class="value accent">${dummySummary.likely_real}</div></div>
@@ -1576,6 +1590,14 @@ async function loadLeads() {
 }
 
 // ---------- D2C Inventory (storefront SKU stock — separate from franchise warehouse stock) ----------
+const NEAR_EXPIRY_DAYS = 60; // Ayurvedic formulations — flag batches expiring within this window
+function daysUntil(dateStr) {
+  if (!dateStr) return null;
+  const d = new Date(dateStr + 'T00:00:00');
+  if (isNaN(d)) return null;
+  return Math.ceil((d.getTime() - Date.now()) / (24 * 60 * 60 * 1000));
+}
+
 async function loadInventory() {
   const el = document.getElementById('tab-inventory');
   el.innerHTML = `<div class="panel"><h2>D2C Inventory <span class="muted" style="font-weight:normal">(storefront stock — auto-decrements when an order is booked)</span></h2>
@@ -1584,6 +1606,8 @@ async function loadInventory() {
       <input id="inv_name" placeholder="Name (must match product name for auto-decrement)" style="flex:1;min-width:200px" />
       <input id="inv_stock" placeholder="Stock" type="number" style="max-width:100px" />
       <input id="inv_threshold" placeholder="Low-stock alert at" type="number" style="max-width:130px" />
+      <input id="inv_batch" placeholder="Batch number (optional)" style="max-width:150px" />
+      <input id="inv_expiry" placeholder="Expiry date" type="date" style="max-width:150px" title="Expiry date (optional)" />
       <button id="addInventoryBtn">+ Add</button>
     </div>
     <div id="inventoryTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
@@ -1591,13 +1615,22 @@ async function loadInventory() {
   async function refresh() {
     const items = await api('/api/inventory');
     document.getElementById('inventoryTable').innerHTML = items.length
-      ? `<table><thead><tr><th>SKU</th><th>Name</th><th>Stock</th><th>Alert at</th><th></th></tr></thead><tbody>
-          ${items.map(i => `<tr ${Number(i.stock) <= Number(i.lowStockThreshold) ? 'style="background:rgba(220,80,80,0.12)"' : ''}>
+      ? `<table><thead><tr><th>SKU</th><th>Name</th><th>Stock</th><th>Alert at</th><th>Batch</th><th>Expiry</th><th></th></tr></thead><tbody>
+          ${items.map(i => {
+            const low = Number(i.stock) <= Number(i.lowStockThreshold);
+            const dLeft = daysUntil(i.expiryDate);
+            const nearExpiry = dLeft !== null && dLeft <= NEAR_EXPIRY_DAYS;
+            const expired = dLeft !== null && dLeft < 0;
+            const rowStyle = expired ? 'background:rgba(120,40,140,0.18)' : (nearExpiry ? 'background:rgba(220,150,20,0.15)' : (low ? 'background:rgba(220,80,80,0.12)' : ''));
+            return `<tr ${rowStyle ? `style="${rowStyle}"` : ''}>
             <td>${esc(i.sku)}</td><td>${esc(i.name)}</td>
-            <td>${i.stock}${Number(i.stock) <= Number(i.lowStockThreshold) ? ' ⚠️ low' : ''}</td>
+            <td>${i.stock}${low ? ' ⚠️ low' : ''}</td>
             <td>${i.lowStockThreshold}</td>
+            <td>${esc(i.batchNumber) || '—'}</td>
+            <td>${i.expiryDate ? esc(i.expiryDate) + (expired ? ' ⛔ expired' : nearExpiry ? ` ⏳ ${dLeft}d left` : '') : '—'}</td>
             <td><button class="danger" data-del-inv="${esc(i.sku)}" style="padding:3px 8px;font-size:11px">Delete</button></td>
-          </tr>`).join('')}
+          </tr>`;
+          }).join('')}
         </tbody></table>`
       : '<div class="empty">No inventory items yet.</div>';
     document.querySelectorAll('[data-del-inv]').forEach(b => b.addEventListener('click', async () => {
@@ -1611,11 +1644,13 @@ async function loadInventory() {
       name: document.getElementById('inv_name').value.trim(),
       stock: Number(document.getElementById('inv_stock').value) || 0,
       lowStockThreshold: Number(document.getElementById('inv_threshold').value) || 5,
+      batchNumber: document.getElementById('inv_batch').value.trim() || null,
+      expiryDate: document.getElementById('inv_expiry').value || null,
     };
     if (!body.name) return toast('Name is required', 'error');
     try {
       await api('/api/inventory', { method: 'POST', body: JSON.stringify(body) });
-      ['inv_sku', 'inv_name', 'inv_stock', 'inv_threshold'].forEach(f => { document.getElementById(f).value = ''; });
+      ['inv_sku', 'inv_name', 'inv_stock', 'inv_threshold', 'inv_batch', 'inv_expiry'].forEach(f => { document.getElementById(f).value = ''; });
       toast('Inventory item added', 'success'); refresh();
     } catch (e) { toast('Failed: ' + e.message, 'error'); }
   });
