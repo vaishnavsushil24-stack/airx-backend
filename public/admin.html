@@ -216,6 +216,10 @@
     <div class="tab" id="tab-products"></div>
     <div class="tab" id="tab-franchises"></div>
     <div class="tab" id="tab-franchise_commission"></div>
+    <div class="tab" id="tab-orders"></div>
+    <div class="tab" id="tab-leads"></div>
+    <div class="tab" id="tab-inventory"></div>
+    <div class="tab" id="tab-staff"></div>
     <div class="tab" id="tab-rewards"></div>
     <div class="tab" id="tab-cms"></div>
     <div class="tab" id="tab-user_management"></div>
@@ -245,6 +249,10 @@ const TABS = [
   { id: 'products', label: 'Products' },
   { id: 'franchises', label: 'Franchises' },
   { id: 'franchise_commission', label: 'Franchise Commission' },
+  { id: 'orders', label: 'Orders' },
+  { id: 'leads', label: 'Leads' },
+  { id: 'inventory', label: 'D2C Inventory' },
+  { id: 'staff', label: 'Staff Performance' },
   { id: 'rewards', label: 'Rewards' },
   { id: 'cms', label: 'Content (CMS)' },
   { id: 'user_management', label: 'User Management' },
@@ -263,6 +271,10 @@ const MODULE_KEYS = [
   { key: 'products', label: 'Products' },
   { key: 'franchises', label: 'Franchises' },
   { key: 'franchise_commission', label: 'Franchise Commission' },
+  { key: 'orders', label: 'Orders' },
+  { key: 'leads', label: 'Leads' },
+  { key: 'inventory', label: 'D2C Inventory' },
+  { key: 'staff', label: 'Staff Performance' },
   { key: 'rewards', label: 'Rewards' },
   { key: 'cms', label: 'Content (CMS)' },
   { key: 'user_management', label: 'User Management' },
@@ -415,7 +427,7 @@ function renderNav() {
 function switchTab(id) {
   document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === id));
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.id === 'tab-' + id));
-  const loaders = { dashboard: loadDashboard, members: loadMembers, masters: loadMasters, commission: loadCommission, payouts: loadPayouts, accounts: loadAccounts, reports: loadReports, products: loadProducts, franchises: loadFranchises, franchise_commission: loadFranchiseCommission, rewards: loadRewards, cms: loadCms, user_management: loadUserManagement };
+  const loaders = { dashboard: loadDashboard, members: loadMembers, masters: loadMasters, commission: loadCommission, payouts: loadPayouts, accounts: loadAccounts, reports: loadReports, products: loadProducts, franchises: loadFranchises, franchise_commission: loadFranchiseCommission, orders: loadOrders, leads: loadLeads, inventory: loadInventory, staff: loadStaff, rewards: loadRewards, cms: loadCms, user_management: loadUserManagement };
   if (loaders[id]) loaders[id]();
 }
 
@@ -1381,6 +1393,227 @@ async function loadFranchiseCommission() {
   });
   refreshFranchiseOptions().catch(() => {});
   refreshPayouts().catch(e => { document.getElementById('franchisePayoutsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+}
+
+// ---------- Orders (D2C: Shopify + WhatsApp-sourced, India Post booking, WhatsApp automation) ----------
+async function loadOrders() {
+  const el = document.getElementById('tab-orders');
+  el.innerHTML = `<div class="panel"><h2>Orders <span class="muted" style="font-weight:normal">(Shopify + WhatsApp-sourced — one list for both)</span></h2>
+    <div class="row">
+      <button id="syncShopifyBtn">⟳ Sync from Shopify</button>
+      <span class="muted" id="autoSyncNote" style="font-size:11px">Auto-syncs every 5 minutes on its own too.</span>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <input id="ord_search" placeholder="Search name / mobile / product…" style="flex:1;min-width:200px" />
+      <select id="ord_status_filter">
+        <option value="">All statuses</option>
+        <option value="new">New</option>
+        <option value="booked">Booked</option>
+        <option value="delivered">Delivered</option>
+      </select>
+      <select id="ord_source_filter">
+        <option value="">All sources</option>
+        <option value="shopify">Shopify</option>
+        <option value="whatsapp">WhatsApp / manual</option>
+      </select>
+    </div>
+    <details style="margin-top:8px"><summary style="cursor:pointer;color:var(--accent)">+ Add order manually (WhatsApp-sourced)</summary>
+      <div class="row" style="margin-top:8px">
+        <input id="o_name" placeholder="Customer name" />
+        <input id="o_mobile" placeholder="Mobile" style="max-width:130px" />
+        <input id="o_product" placeholder="Product (e.g. Ashwagandha x2)" style="flex:1;min-width:180px" />
+        <input id="o_cod" placeholder="COD amount" type="number" style="max-width:110px" />
+        <input id="o_address" placeholder="Address" style="flex:1;min-width:200px" />
+        <input id="o_pin" placeholder="PIN" style="max-width:90px" />
+        <input id="o_staff" placeholder="Booked by (staff name)" style="max-width:150px" />
+        <button id="addOrderBtn">+ Add order</button>
+      </div>
+    </details>
+    <div id="ordersTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
+  </div>`;
+  let ordersCache = [];
+  function passesFilter(o) {
+    const q = document.getElementById('ord_search').value.trim().toLowerCase();
+    const statusF = document.getElementById('ord_status_filter').value;
+    const sourceF = document.getElementById('ord_source_filter').value;
+    if (statusF && o.status !== statusF) return false;
+    if (sourceF === 'shopify' && o.source !== 'shopify') return false;
+    if (sourceF === 'whatsapp' && o.source === 'shopify') return false;
+    if (q) {
+      const hay = `${o.name || ''} ${o.mobile || ''} ${o.product || ''}`.toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  }
+  async function refresh() {
+    ordersCache = await api('/api/orders');
+    render();
+  }
+  function render() {
+    const rows = ordersCache.filter(passesFilter);
+    document.getElementById('ordersTable').innerHTML = rows.length
+      ? `<table><thead><tr><th>Date</th><th>Source</th><th>Name</th><th>Mobile</th><th>Product</th><th>COD</th><th>Status</th><th>Shipment</th><th></th></tr></thead><tbody>
+          ${rows.map(o => `<tr>
+            <td>${esc((o.createdAt || '').slice(0, 10))}</td>
+            <td><span class="badge ${o.source === 'shopify' ? 'active' : 'inactive'}">${esc(o.source || 'manual')}</span></td>
+            <td>${esc(o.name)}</td><td>${esc(o.mobile)}</td>
+            <td style="max-width:220px">${esc(o.product)}</td>
+            <td>₹${o.codAmount || 0}</td>
+            <td>${esc(o.status)}</td>
+            <td>${o.indiaPostBarcode ? esc(o.indiaPostBarcode) : '—'}</td>
+            <td style="white-space:nowrap">
+              ${!o.indiaPostBarcode ? `<button class="secondary" data-book="${esc(o.id)}" style="padding:3px 8px;font-size:11px">Book (India Post)</button>` : ''}
+              ${o.status !== 'delivered' ? `<button class="secondary" data-deliver="${esc(o.id)}" style="padding:3px 8px;font-size:11px">Mark delivered</button>` : ''}
+              <button class="secondary" data-wa-cod="${esc(o.id)}" style="padding:3px 8px;font-size:11px" title="Send COD confirmation via WhatsApp">WA: COD confirm</button>
+              <button class="secondary" data-wa-track="${esc(o.id)}" style="padding:3px 8px;font-size:11px" title="Send tracking update via WhatsApp">WA: Tracking</button>
+              <button class="secondary" data-wa-followup="${esc(o.id)}" style="padding:3px 8px;font-size:11px" title="Send delivery follow-up / reorder nudge via WhatsApp">WA: Follow-up</button>
+            </td>
+          </tr>`).join('')}
+        </tbody></table>`
+      : '<div class="empty">No orders match.</div>';
+    const byId = {};
+    ordersCache.forEach(o => { byId[o.id] = o; });
+    document.querySelectorAll('[data-book]').forEach(b => b.addEventListener('click', async () => {
+      try { const r = await api('/api/indiapost/book', { method: 'POST', body: JSON.stringify({ orderId: b.dataset.book }) }); toast('Booked — barcode ' + r.barcode, 'success'); refresh(); }
+      catch (e) { toast('Booking failed: ' + e.message, 'error'); }
+    }));
+    document.querySelectorAll('[data-deliver]').forEach(b => b.addEventListener('click', async () => {
+      try { await api('/api/orders/' + encodeURIComponent(b.dataset.deliver), { method: 'PATCH', body: JSON.stringify({ status: 'delivered' }) }); toast('Marked delivered', 'success'); refresh(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+    document.querySelectorAll('[data-wa-cod]').forEach(b => b.addEventListener('click', async () => {
+      const o = byId[b.dataset.waCod];
+      try { await api('/api/whatsapp/confirm-cod', { method: 'POST', body: JSON.stringify({ mobile: o.mobile, name: o.name, product: o.product, codAmount: o.codAmount }) }); toast('COD confirmation sent (or logged if WhatsApp not yet activated)', 'success'); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+    document.querySelectorAll('[data-wa-track]').forEach(b => b.addEventListener('click', async () => {
+      const o = byId[b.dataset.waTrack];
+      if (!o.indiaPostBarcode) return toast('Book with India Post first — tracking needs a barcode.', 'error');
+      try { await api('/api/whatsapp/tracking-update', { method: 'POST', body: JSON.stringify({ mobile: o.mobile, name: o.name, barcode: o.indiaPostBarcode }) }); toast('Tracking update sent (or logged)', 'success'); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+    document.querySelectorAll('[data-wa-followup]').forEach(b => b.addEventListener('click', async () => {
+      const o = byId[b.dataset.waFollowup];
+      try { await api('/api/whatsapp/delivery-followup', { method: 'POST', body: JSON.stringify({ mobile: o.mobile, name: o.name }) }); toast('Follow-up / reorder nudge sent (or logged)', 'success'); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+  }
+  document.getElementById('ord_search').addEventListener('input', render);
+  document.getElementById('ord_status_filter').addEventListener('change', render);
+  document.getElementById('ord_source_filter').addEventListener('change', render);
+  document.getElementById('syncShopifyBtn').addEventListener('click', async () => {
+    try { const r = await api('/api/shopify/sync-orders', { method: 'POST' }); toast(`Synced ${r.synced} new order(s) (${r.total} total)`, 'success'); refresh(); }
+    catch (e) { toast('Sync failed: ' + e.message, 'error'); }
+  });
+  document.getElementById('addOrderBtn').addEventListener('click', async () => {
+    const body = {
+      name: document.getElementById('o_name').value.trim(),
+      mobile: document.getElementById('o_mobile').value.trim(),
+      product: document.getElementById('o_product').value.trim(),
+      codAmount: Number(document.getElementById('o_cod').value) || 0,
+      address: document.getElementById('o_address').value.trim(),
+      pin: document.getElementById('o_pin').value.trim(),
+      staff: document.getElementById('o_staff').value.trim(),
+      source: 'whatsapp',
+      status: 'new',
+    };
+    if (!body.name || !body.mobile) return toast('Name and mobile are required', 'error');
+    try {
+      await api('/api/orders', { method: 'POST', body: JSON.stringify(body) });
+      ['o_name', 'o_mobile', 'o_product', 'o_cod', 'o_address', 'o_pin', 'o_staff'].forEach(f => { document.getElementById(f).value = ''; });
+      toast('Order added', 'success'); refresh();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+  refresh().catch(e => { document.getElementById('ordersTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+}
+
+// ---------- Leads (Meta Lead Ads — captured automatically via /webhook/meta) ----------
+async function loadLeads() {
+  const el = document.getElementById('tab-leads');
+  el.innerHTML = `<div class="panel"><h2>Leads <span class="muted" style="font-weight:normal">(Meta / Facebook Lead Ads — captured automatically)</span></h2>
+    <div id="leadsTable"><div class="empty">Loading…</div></div>
+  </div>`;
+  const STATUSES = ['new', 'contacted', 'converted', 'lost'];
+  async function refresh() {
+    const leads = await api('/api/leads');
+    document.getElementById('leadsTable').innerHTML = leads.length
+      ? `<table><thead><tr><th>Date</th><th>Name</th><th>Phone</th><th>Email</th><th>Status</th></tr></thead><tbody>
+          ${leads.map(l => `<tr>
+            <td>${esc((l.createdAt || '').slice(0, 10))}</td>
+            <td>${esc(l.name) || '—'}</td><td>${esc(l.phone) || '—'}</td><td>${esc(l.email) || '—'}</td>
+            <td><select data-lead="${esc(l.id)}">${STATUSES.map(s => `<option value="${s}" ${l.status === s ? 'selected' : ''}>${s}</option>`).join('')}</select></td>
+          </tr>`).join('')}
+        </tbody></table>`
+      : '<div class="empty">No leads yet — they will appear here automatically once Meta Lead Ads is sending webhooks.</div>';
+    document.querySelectorAll('[data-lead]').forEach(sel => sel.addEventListener('change', async () => {
+      try { await api('/api/leads/' + encodeURIComponent(sel.dataset.lead), { method: 'PATCH', body: JSON.stringify({ status: sel.value }) }); toast('Lead updated', 'success'); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+  }
+  refresh().catch(e => { document.getElementById('leadsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+}
+
+// ---------- D2C Inventory (storefront SKU stock — separate from franchise warehouse stock) ----------
+async function loadInventory() {
+  const el = document.getElementById('tab-inventory');
+  el.innerHTML = `<div class="panel"><h2>D2C Inventory <span class="muted" style="font-weight:normal">(storefront stock — auto-decrements when an order is booked)</span></h2>
+    <div class="row">
+      <input id="inv_sku" placeholder="SKU" style="max-width:120px" />
+      <input id="inv_name" placeholder="Name (must match product name for auto-decrement)" style="flex:1;min-width:200px" />
+      <input id="inv_stock" placeholder="Stock" type="number" style="max-width:100px" />
+      <input id="inv_threshold" placeholder="Low-stock alert at" type="number" style="max-width:130px" />
+      <button id="addInventoryBtn">+ Add</button>
+    </div>
+    <div id="inventoryTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
+  </div>`;
+  async function refresh() {
+    const items = await api('/api/inventory');
+    document.getElementById('inventoryTable').innerHTML = items.length
+      ? `<table><thead><tr><th>SKU</th><th>Name</th><th>Stock</th><th>Alert at</th><th></th></tr></thead><tbody>
+          ${items.map(i => `<tr ${Number(i.stock) <= Number(i.lowStockThreshold) ? 'style="background:rgba(220,80,80,0.12)"' : ''}>
+            <td>${esc(i.sku)}</td><td>${esc(i.name)}</td>
+            <td>${i.stock}${Number(i.stock) <= Number(i.lowStockThreshold) ? ' ⚠️ low' : ''}</td>
+            <td>${i.lowStockThreshold}</td>
+            <td><button class="danger" data-del-inv="${esc(i.sku)}" style="padding:3px 8px;font-size:11px">Delete</button></td>
+          </tr>`).join('')}
+        </tbody></table>`
+      : '<div class="empty">No inventory items yet.</div>';
+    document.querySelectorAll('[data-del-inv]').forEach(b => b.addEventListener('click', async () => {
+      try { await api('/api/inventory/' + encodeURIComponent(b.dataset.delInv), { method: 'DELETE' }); toast('Deleted', 'success'); refresh(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+  }
+  document.getElementById('addInventoryBtn').addEventListener('click', async () => {
+    const body = {
+      sku: document.getElementById('inv_sku').value.trim(),
+      name: document.getElementById('inv_name').value.trim(),
+      stock: Number(document.getElementById('inv_stock').value) || 0,
+      lowStockThreshold: Number(document.getElementById('inv_threshold').value) || 5,
+    };
+    if (!body.name) return toast('Name is required', 'error');
+    try {
+      await api('/api/inventory', { method: 'POST', body: JSON.stringify(body) });
+      ['inv_sku', 'inv_name', 'inv_stock', 'inv_threshold'].forEach(f => { document.getElementById(f).value = ''; });
+      toast('Inventory item added', 'success'); refresh();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+  refresh().catch(e => { document.getElementById('inventoryTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+}
+
+// ---------- Staff Performance ----------
+async function loadStaff() {
+  const el = document.getElementById('tab-staff');
+  el.innerHTML = `<div class="panel"><h2>Staff Performance <span class="muted" style="font-weight:normal">(who booked what — from Orders)</span></h2>
+    <div id="staffTable"><div class="empty">Loading…</div></div>
+  </div>`;
+  try {
+    const rows = await api('/api/staff/summary');
+    document.getElementById('staffTable').innerHTML = rows.length
+      ? `<table><thead><tr><th>Staff</th><th>Orders</th><th>Total Sales</th><th>Delivered</th><th>Booked</th><th>Pending</th></tr></thead><tbody>
+          ${rows.map(r => `<tr><td>${esc(r.staff)}</td><td>${r.orders}</td><td>₹${r.totalSales.toLocaleString('en-IN')}</td><td>${r.delivered}</td><td>${r.booked}</td><td>${r.pending}</td></tr>`).join('')}
+        </tbody></table>`
+      : '<div class="empty">No orders recorded yet.</div>';
+  } catch (e) { document.getElementById('staffTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; }
 }
 
 // ---------- Rewards ----------
