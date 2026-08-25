@@ -445,7 +445,29 @@ async function loadDashboard() {
       api('/api/reports/dummy-summary'),
       api('/api/reports/payout-health'),
     ]);
+
+    // Low-stock banner: best-effort — a staff user without the "inventory"
+    // module permission will get a 403 here, which we swallow quietly
+    // (the banner just doesn't show, rather than breaking the dashboard).
+    let lowStockBanner = '';
+    try {
+      const inventory = await api('/api/inventory');
+      const lowItems = (inventory || []).filter(i => Number(i.stock) <= Number(i.lowStockThreshold));
+      if (lowItems.length) {
+        lowStockBanner = `
+          <div class="panel" style="background:rgba(220,80,80,0.12);border:1px solid rgba(220,80,80,0.35)">
+            <h2 style="margin-top:0">⚠️ Low stock — ${lowItems.length} item${lowItems.length > 1 ? 's' : ''} need reordering</h2>
+            <table><thead><tr><th>SKU</th><th>Name</th><th>Stock</th><th>Alert at</th></tr></thead><tbody>
+              ${lowItems.map(i => `<tr><td>${esc(i.sku)}</td><td>${esc(i.name)}</td><td>${i.stock}</td><td>${i.lowStockThreshold}</td></tr>`).join('')}
+            </tbody></table>
+          </div>`;
+      }
+    } catch (invErr) {
+      // no inventory access or inventory fetch failed — skip the banner silently
+    }
+
     el.innerHTML = `
+      ${lowStockBanner}
       <div class="cards">
         <div class="card"><div class="label">Total Members</div><div class="value">${dummySummary.total_members}</div></div>
         <div class="card"><div class="label">Likely Real</div><div class="value accent">${dummySummary.likely_real}</div></div>
