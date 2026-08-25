@@ -114,6 +114,10 @@ const MODULE_KEYS = [
   "cms",
   "user_management",
   "franchise_commission",
+  "orders",
+  "leads",
+  "inventory",
+  "staff",
 ];
 
 function hashPassword(password) {
@@ -369,50 +373,76 @@ async function shopifyFetch(pathAndQuery, options = {}) {
 
 // Pull recent Shopify orders into our own orders list, so they show up in
 // AIRX Ops next to WhatsApp-sourced orders instead of only living in Shopify.
-app.post("/api/shopify/sync-orders", requireApiKey, async (req, res) => {
-  try {
-    const data = await shopifyFetch("/orders.json?status=any&limit=50");
-    const orders = readJson(ORDERS_FILE);
-    let added = 0;
-    (data.orders || []).forEach((so) => {
-      const existingId = "shopify-" + so.id;
-      if (orders.some((o) => o.id === existingId)) return;
-      orders.unshift({
-        id: existingId,
-        source: "shopify",
-        shopifyOrderId: so.id,
-        createdAt: so.created_at,
-        name: so.shipping_address
-          ? `${so.shipping_address.first_name || ""} ${so.shipping_address.last_name || ""}`.trim()
-          : so.customer
-          ? `${so.customer.first_name || ""} ${so.customer.last_name || ""}`.trim()
-          : "",
-        mobile: (so.shipping_address && so.shipping_address.phone) || so.phone || "",
-        address: so.shipping_address
-          ? [so.shipping_address.address1, so.shipping_address.city, so.shipping_address.province, so.shipping_address.pin]
-              .filter(Boolean)
-              .join(", ")
-          : "",
-        pin: so.shipping_address ? so.shipping_address.zip : "",
-        product: (so.line_items || []).map((li) => `${li.title} x${li.quantity}`).join(", "),
-        codAmount: so.total_price,
-        fulfillmentStatus: so.fulfillment_status || "unfulfilled",
-        status: "new",
-      });
-      added++;
+// Factored out of the route handler so the auto-sync interval below (and any
+// future scheduled job) can call the exact same logic the manual button uses.
+async function syncShopifyOrders() {
+  const data = await shopifyFetch("/orders.json?status=any&limit=50");
+  const orders = readJson(ORDERS_FILE);
+  let added = 0;
+  (data.orders || []).forEach((so) => {
+    const existingId = "shopify-" + so.id;
+    if (orders.some((o) => o.id === existingId)) return;
+    orders.unshift({
+      id: existingId,
+      source: "shopify",
+      shopifyOrderId: so.id,
+      createdAt: so.created_at,
+      name: so.shipping_address
+        ? `${so.shipping_address.first_name || ""} ${so.shipping_address.last_name || ""}`.trim()
+        : so.customer
+        ? `${so.customer.first_name || ""} ${so.customer.last_name || ""}`.trim()
+        : "",
+      mobile: (so.shipping_address && so.shipping_address.phone) || so.phone || "",
+      address: so.shipping_address
+        ? [so.shipping_address.address1, so.shipping_address.city, so.shipping_address.province, so.shipping_address.pin]
+            .filter(Boolean)
+            .join(", ")
+        : "",
+      pin: so.shipping_address ? so.shipping_address.zip : "",
+      product: (so.line_items || []).map((li) => `${li.title} x${li.quantity}`).join(", "),
+      codAmount: so.total_price,
+      fulfillmentStatus: so.fulfillment_status || "unfulfilled",
+      status: "new",
     });
-    writeJson(ORDERS_FILE, orders);
-    res.json({ synced: added, total: orders.length });
+    added++;
+  });
+  writeJson(ORDERS_FILE, orders);
+  return { synced: added, total: orders.length };
+}
+
+app.post("/api/shopify/sync-orders", requireAccess("orders"), async (req, res) => {
+  try {
+    const result = await syncShopifyOrders();
+    res.json(result);
   } catch (err) {
     console.error("Shopify sync error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
+// Auto-sync: pull new Shopify orders in on a timer instead of waiting for
+// someone to click the manual "Sync from Shopify" button. Only runs once
+// the OAuth handshake has actually happened (SHOP_FILE has a stored
+// accessToken) — until then it silently no-ops so a fresh deploy with
+// Shopify not yet connected doesn't spam the logs with errors.
+const SHOPIFY_AUTO_SYNC_MS = 5 * 60 * 1000; // every 5 minutes
+setInterval(async () => {
+  try {
+    const { shop, accessToken } = readJson(SHOP_FILE);
+    if (!shop || !accessToken) return; // not connected yet — skip quietly
+    const result = await syncShopifyOrders();
+    if (result.synced > 0) {
+      console.log(`[Shopify auto-sync] pulled ${result.synced} new order(s), total ${result.total}`);
+    }
+  } catch (err) {
+    console.error("[Shopify auto-sync] error:", err.message);
+  }
+}, SHOPIFY_AUTO_SYNC_MS);
+
 // Once an order is booked with India Post, call this so Shopify stops
 // showing it as "Unfulfilled" forever - this closes the gap we found where
 // all 262 orders sat unfulfilled even though they'd actually shipped.
-app.post("/api/shopify/fulfill", requireApiKey, async (req, res) => {
+app.post("/api/shopify/fulfill", requireAccess("orders"), async (req, res) => {
   try {
     const { shopifyOrderId, trackingNumber, trackingCompany } = req.body;
     if (!shopifyOrderId) return res.status(400).json({ error: "shopifyOrderId required" });
@@ -834,7 +864,7 @@ function nextBarcode() {
 
 // Looks up a delivery post office for a PIN code - used to resolve the
 // customer's own PIN to a specific office_id where needed.
-app.get("/api/indiapost/pincode/:pincode", requireApiKey, async (req, res) => {
+app.get("/api/indiapost/pincode/:pincode", requireAccess("orders"), async (req, res) => {
   try {
     const data = await indiaPostFetch(
       `/bemasterdata/v1/offices/limited-details?pincode=${req.params.pincode}&limit=50&office-type=post`
@@ -849,7 +879,7 @@ app.get("/api/indiapost/pincode/:pincode", requireApiKey, async (req, res) => {
 // Body: { orderId } to pull from our own orders.json, OR pass the order
 // fields directly: { name, address, city, state, pincode, mobile, product,
 // weightGrams, codAmount }.
-app.post("/api/indiapost/book", requireApiKey, async (req, res) => {
+app.post("/api/indiapost/book", requireAccess("orders"), async (req, res) => {
   try {
     let order = req.body;
     if (req.body.orderId) {
@@ -940,7 +970,7 @@ app.post("/api/indiapost/book", requireApiKey, async (req, res) => {
 });
 
 // Tracking for up to 500 barcodes at once.
-app.post("/api/indiapost/track", requireApiKey, async (req, res) => {
+app.post("/api/indiapost/track", requireAccess("orders"), async (req, res) => {
   try {
     const barcodes = req.body.barcodes;
     if (!Array.isArray(barcodes) || !barcodes.length) {
@@ -985,11 +1015,11 @@ app.post("/webhook/indiapost/event", (req, res) => {
 // SIMPLE API for the AIRX Ops dashboard (leads + orders)
 // =====================================================================
 
-app.get("/api/leads", requireApiKey, (req, res) => {
+app.get("/api/leads", requireAccess("leads"), (req, res) => {
   res.json(readJson(LEADS_FILE));
 });
 
-app.patch("/api/leads/:id", requireApiKey, (req, res) => {
+app.patch("/api/leads/:id", requireAccess("leads"), (req, res) => {
   const leads = readJson(LEADS_FILE);
   const idx = leads.findIndex((l) => l.id === req.params.id);
   if (idx === -1) return res.status(404).json({ error: "not found" });
@@ -998,11 +1028,11 @@ app.patch("/api/leads/:id", requireApiKey, (req, res) => {
   res.json(leads[idx]);
 });
 
-app.get("/api/orders", requireApiKey, (req, res) => {
+app.get("/api/orders", requireAccess("orders"), (req, res) => {
   res.json(readJson(ORDERS_FILE));
 });
 
-app.post("/api/orders", requireApiKey, (req, res) => {
+app.post("/api/orders", requireAccess("orders"), (req, res) => {
   const orders = readJson(ORDERS_FILE);
   const order = { id: "o" + Date.now(), createdAt: new Date().toISOString(), ...req.body };
   orders.unshift(order);
@@ -1010,7 +1040,7 @@ app.post("/api/orders", requireApiKey, (req, res) => {
   res.json(order);
 });
 
-app.patch("/api/orders/:id", requireApiKey, (req, res) => {
+app.patch("/api/orders/:id", requireAccess("orders"), (req, res) => {
   const orders = readJson(ORDERS_FILE);
   const idx = orders.findIndex((o) => o.id === req.params.id);
   if (idx === -1) return res.status(404).json({ error: "not found" });
@@ -1029,11 +1059,11 @@ if (!fs.existsSync(INVENTORY_FILE)) {
 }
 // Each item: { sku, name, stock, lowStockThreshold }
 
-app.get("/api/inventory", requireApiKey, (req, res) => {
+app.get("/api/inventory", requireAccess("inventory"), (req, res) => {
   res.json(readJson(INVENTORY_FILE));
 });
 
-app.post("/api/inventory", requireApiKey, (req, res) => {
+app.post("/api/inventory", requireAccess("inventory"), (req, res) => {
   const items = readJson(INVENTORY_FILE);
   const item = {
     sku: req.body.sku || "sku" + Date.now(),
@@ -1046,7 +1076,7 @@ app.post("/api/inventory", requireApiKey, (req, res) => {
   res.json(item);
 });
 
-app.patch("/api/inventory/:sku", requireApiKey, (req, res) => {
+app.patch("/api/inventory/:sku", requireAccess("inventory"), (req, res) => {
   const items = readJson(INVENTORY_FILE);
   const idx = items.findIndex((i) => i.sku === req.params.sku);
   if (idx === -1) return res.status(404).json({ error: "not found" });
@@ -1055,7 +1085,7 @@ app.patch("/api/inventory/:sku", requireApiKey, (req, res) => {
   res.json(items[idx]);
 });
 
-app.delete("/api/inventory/:sku", requireApiKey, (req, res) => {
+app.delete("/api/inventory/:sku", requireAccess("inventory"), (req, res) => {
   const items = readJson(INVENTORY_FILE);
   const filtered = items.filter((i) => i.sku !== req.params.sku);
   writeJson(INVENTORY_FILE, filtered);
@@ -1092,7 +1122,7 @@ function decrementInventoryForOrder(order) {
 // STAFF PERFORMANCE — who booked what, so staff stays visible/accountable
 // =====================================================================
 
-app.get("/api/staff/summary", requireApiKey, (req, res) => {
+app.get("/api/staff/summary", requireAccess("staff"), (req, res) => {
   const orders = readJson(ORDERS_FILE);
   const byStaff = {};
   orders.forEach((o) => {
@@ -1166,7 +1196,7 @@ async function sendWhatsApp(toPhone, { text, template, templateParams } = {}) {
 // Send a COD confirmation request before booking (reduces RTO / fake orders).
 // Template name is a placeholder - create+approve one in Meta Business
 // Manager named "cod_confirmation" (or change the name below to match).
-app.post("/api/whatsapp/confirm-cod", requireApiKey, async (req, res) => {
+app.post("/api/whatsapp/confirm-cod", requireAccess("orders"), async (req, res) => {
   try {
     const { mobile, name, product, codAmount } = req.body;
     if (!mobile) return res.status(400).json({ error: "mobile required" });
@@ -1181,7 +1211,7 @@ app.post("/api/whatsapp/confirm-cod", requireApiKey, async (req, res) => {
 });
 
 // Send tracking info once booked - reuses whatever India Post barcode exists.
-app.post("/api/whatsapp/tracking-update", requireApiKey, async (req, res) => {
+app.post("/api/whatsapp/tracking-update", requireAccess("orders"), async (req, res) => {
   try {
     const { mobile, name, barcode } = req.body;
     if (!mobile || !barcode) return res.status(400).json({ error: "mobile and barcode required" });
@@ -1196,7 +1226,7 @@ app.post("/api/whatsapp/tracking-update", requireApiKey, async (req, res) => {
 });
 
 // Send a post-delivery follow-up (review / reorder nudge).
-app.post("/api/whatsapp/delivery-followup", requireApiKey, async (req, res) => {
+app.post("/api/whatsapp/delivery-followup", requireAccess("orders"), async (req, res) => {
   try {
     const { mobile, name } = req.body;
     if (!mobile) return res.status(400).json({ error: "mobile required" });
