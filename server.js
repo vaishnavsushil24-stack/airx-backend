@@ -1054,6 +1054,7 @@ app.post("/webhook/indiapost/event", (req, res) => {
         if (orders[idx].status !== "delivered" && !orders[idx].deliveredAt) {
           orders[idx].deliveredAt = new Date().toISOString();
         }
+        processReferralOnDelivery(orders[idx], orders); // Phase 17 - referral bridge
         orders[idx].status = "delivered";
       }
       writeJson(ORDERS_FILE, orders);
@@ -1106,6 +1107,9 @@ app.patch("/api/orders/:id", requireAccess("orders"), (req, res) => {
   // customer's reorder cycle starts. Doesn't overwrite one that's already set.
   if (!wasDelivered && orders[idx].status === "delivered" && !orders[idx].deliveredAt) {
     orders[idx].deliveredAt = new Date().toISOString();
+  }
+  if (!wasDelivered && orders[idx].status === "delivered") {
+    processReferralOnDelivery(orders[idx], orders); // Phase 17 - referral bridge
   }
   writeJson(ORDERS_FILE, orders);
   res.json(orders[idx]);
@@ -4412,6 +4416,120 @@ app.get("/api/ads/campaigns/:id/insights", requireAccess("social_media"), async 
   const result = await callMetaGraphAPI(`${campaign.metaCampaignId}/insights?fields=spend,impressions,clicks,reach`);
   if (result.configured === false) return res.json({ configured: false });
   res.json(result.ok ? result.data : { error: result.data.error });
+});
+
+// ---------------------------------------------------------------------
+// Phase 17 — retail-customer-to-distributor referral bridge (2026-08-25)
+// ---------------------------------------------------------------------
+// Flagged since Phase 14/15/16 as needing the founder's own input on the
+// actual referral/commission rule before it could be built correctly - the
+// same situation Phase 3 ran into with the MLM compensation plan itself.
+// Rather than leave it fully unbuilt while waiting, this follows the exact
+// same pattern Phase 3 used there: build the tracking + admin-configurable
+// reward settings now, default the reward to "none" (so nothing happens
+// until the founder actually sets a rule), and let the real number be
+// tuned later with zero code changes.
+//
+// Deliberately a flat JSON ledger, NOT the MLM SQLite wallet_transactions
+// table - a retail D2C customer who refers a friend isn't automatically a
+// distributor, and folding them into the distributor wallet schema would
+// quietly make that business-model decision on the founder's behalf. This
+// stays a separate, simple record until the founder decides whether/how
+// referred customers should ever cross into the MLM side.
+const REFERRAL_SETTINGS_FILE = path.join(JSON_DATA_DIR, "referral_settings.json");
+const REFERRALS_FILE = path.join(JSON_DATA_DIR, "referrals.json");
+if (!fs.existsSync(REFERRAL_SETTINGS_FILE)) fs.writeFileSync(REFERRAL_SETTINGS_FILE, JSON.stringify({ rewardType: "none", rewardValue: 0, minOrderAmount: 0, updatedAt: null }));
+if (!fs.existsSync(REFERRALS_FILE)) fs.writeFileSync(REFERRALS_FILE, "[]");
+
+function computeReferralEligibility(order, allOrders, settings) {
+  if (!settings || settings.rewardType === "none" || !settings.rewardValue) return { eligible: false, reason: "no reward configured yet" };
+  if (!order.referredByMobile) return { eligible: false, reason: "no referrer tagged on this order" };
+  const referrer = String(order.referredByMobile).replace(/\D/g, "");
+  const referred = String(order.mobile || "").replace(/\D/g, "");
+  if (!referred) return { eligible: false, reason: "order has no customer mobile" };
+  if (!referrer) return { eligible: false, reason: "referrer mobile is invalid" };
+  if (referrer === referred) return { eligible: false, reason: "self-referral not allowed" };
+  const amount = Number(order.codAmount || order.cod || 0);
+  if (settings.minOrderAmount && amount < settings.minOrderAmount) return { eligible: false, reason: "order below the configured minimum amount" };
+  const orderDeliveredMs = new Date(order.deliveredAt || order.createdAt).getTime();
+  const isFirstDelivered = !allOrders.some((o) => {
+    if (o.id === order.id || String(o.mobile || "").replace(/\D/g, "") !== referred || o.status !== "delivered") return false;
+    const otherMs = new Date(o.deliveredAt || o.createdAt).getTime();
+    return !isNaN(otherMs) && otherMs < orderDeliveredMs;
+  });
+  if (!isFirstDelivered) return { eligible: false, reason: "not the referred customer's first delivered order" };
+  const rewardValue = settings.rewardType === "percent_discount" ? round2(amount * (Number(settings.rewardValue) / 100)) : Number(settings.rewardValue);
+  return { eligible: true, rewardType: settings.rewardType, rewardValue };
+}
+
+function processReferralOnDelivery(order, allOrders) {
+  try {
+    const referrals = readJson(REFERRALS_FILE);
+    if (referrals.some((r) => r.orderId === order.id)) return; // already processed - don't double-credit on a re-save
+    const settings = readJson(REFERRAL_SETTINGS_FILE);
+    const result = computeReferralEligibility(order, allOrders, settings);
+    if (!result.eligible) return;
+    referrals.unshift({
+      id: "ref_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8),
+      orderId: order.id,
+      referrerMobile: String(order.referredByMobile).replace(/\D/g, ""),
+      referredMobile: String(order.mobile).replace(/\D/g, ""),
+      referredName: order.name || "",
+      rewardType: result.rewardType,
+      rewardValue: result.rewardValue,
+      status: "eligible", // eligible -> paid | void
+      createdAt: new Date().toISOString(),
+      paidAt: null,
+      note: null,
+    });
+    writeJson(REFERRALS_FILE, referrals);
+  } catch (err) {
+    console.error("processReferralOnDelivery failed for order", order.id, ":", err.message);
+  }
+}
+
+app.get("/api/referrals/settings", requireAccess("orders"), (req, res) => {
+  res.json(readJson(REFERRAL_SETTINGS_FILE));
+});
+
+app.patch("/api/referrals/settings", requireAccess("orders"), (req, res) => {
+  const { rewardType, rewardValue, minOrderAmount } = req.body;
+  if (rewardType && !["none", "flat_credit", "percent_discount"].includes(rewardType)) {
+    return res.status(400).json({ error: 'rewardType must be "none", "flat_credit", or "percent_discount"' });
+  }
+  const settings = readJson(REFERRAL_SETTINGS_FILE);
+  if (rewardType !== undefined) settings.rewardType = rewardType;
+  if (rewardValue !== undefined) settings.rewardValue = Number(rewardValue) || 0;
+  if (minOrderAmount !== undefined) settings.minOrderAmount = Number(minOrderAmount) || 0;
+  settings.updatedAt = new Date().toISOString();
+  writeJson(REFERRAL_SETTINGS_FILE, settings);
+  res.json(settings);
+});
+
+app.get("/api/referrals", requireAccess("orders"), (req, res) => {
+  res.json(readJson(REFERRALS_FILE).sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || "")));
+});
+
+app.post("/api/referrals/:id/mark-paid", requireAccess("orders"), (req, res) => {
+  const referrals = readJson(REFERRALS_FILE);
+  const idx = referrals.findIndex((r) => r.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: "not found" });
+  if (referrals[idx].status !== "eligible") return res.status(400).json({ error: `referral is already "${referrals[idx].status}"` });
+  referrals[idx].status = "paid";
+  referrals[idx].paidAt = new Date().toISOString();
+  referrals[idx].note = req.body.note || referrals[idx].note;
+  writeJson(REFERRALS_FILE, referrals);
+  res.json(referrals[idx]);
+});
+
+app.post("/api/referrals/:id/void", requireAccess("orders"), (req, res) => {
+  const referrals = readJson(REFERRALS_FILE);
+  const idx = referrals.findIndex((r) => r.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: "not found" });
+  referrals[idx].status = "void";
+  referrals[idx].note = req.body.note || referrals[idx].note;
+  writeJson(REFERRALS_FILE, referrals);
+  res.json(referrals[idx]);
 });
 
 app.get("/health", (req, res) => res.json({ ok: true, time: new Date().toISOString() }));

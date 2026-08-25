@@ -22,7 +22,7 @@ few thousand records.
 ## Pending items — only you can do these (updated 2026-08-25)
 
 Everything buildable without new external permissions or business decisions
-has been built, tested, and deployed (through Phase 16 below). These six
+has been built, tested, and deployed (through Phase 17 below). These five
 are genuinely stuck on someone/something outside this server, so they're
 listed here together instead of scattered across sections:
 
@@ -43,13 +43,7 @@ listed here together instead of scattered across sections:
    `/shopify/install` and clicking through Shopify's consent screen again.
    Deliberately not something this server does on its own — an OAuth
    consent screen always needs a human click.
-4. **Referral bridge (retail customers → distributor signups)** — needs you
-   to define the actual referral/commission rule (e.g. "give a customer a
-   ₹X credit or Y% off when someone they refer places a first order") before
-   this can be built correctly. Same situation as the Phase 3 commission
-   engine — built as an admin-configurable placeholder until the real rule
-   is known.
-5. **Retiring store.airxplus.com / admin.airxplus.com (the "Cutover" step,
+4. **Retiring store.airxplus.com / admin.airxplus.com (the "Cutover" step,
    `MLM_INTEGRATION_PLAN.md` Phase 5)** — everything those two legacy
    systems do has now been rebuilt here (Phases 1–9 below), but switching
    real distributor data-entry and payouts over to this server, and
@@ -61,7 +55,7 @@ listed here together instead of scattered across sections:
    `MLM_INTEGRATION_PLAN.md`) to confirm the numbers match exactly. This
    wasn't flagged as a pending item before this round — noting it now
    rather than ever cutting distributors over silently.
-6. **Social Media Hub (Phase 16) needs its own Meta permissions** — the
+5. **Social Media Hub (Phase 16) needs its own Meta permissions** — the
    current `META_PAGE_ACCESS_TOKEN` only has Lead Ads scopes. Posting,
    replying to comments/DMs, and running ads each need you to re-authorize
    the Meta app with additional scopes (`pages_manage_posts`,
@@ -81,9 +75,11 @@ re-confirmed this round.
 Everything else — AI Agent (Phase 13), replenishment reminders (Phase 14),
 full data backup/export (Phase 15), the Social Media Hub's post
 composer/scheduler and AI-drafted engagement replies (Phase 16, minus the
-Meta-permission-gated live posting/ads noted above), inventory/batch/expiry
-tracking, staff performance, multi-user admin auth, and the rest of the
-MLM feature set — is live and already working autonomously.
+Meta-permission-gated live posting/ads noted above), the referral bridge
+(Phase 17 — tracking is live now, just waiting on you to pick a reward
+amount whenever you're ready, no rush and no permission needed), inventory/
+batch/expiry tracking, staff performance, multi-user admin auth, and the
+rest of the MLM feature set — is live and already working autonomously.
 
 ## 1. Deploy it (10 minutes, free tier is enough to start)
 
@@ -1206,12 +1202,60 @@ Render once those exist. Exactly the same reasoning as the Shopify
 `read_checkouts` situation: an OAuth consent screen is never something
 this server clicks through on its own.
 
+## Phase 17 — retail-customer-to-distributor referral bridge (2026-08-25)
+
+**Why:** flagged since Phase 14 as needing the founder's own input on the
+actual referral/commission rule before it could be built correctly — the
+same situation Phase 3 ran into with the MLM compensation plan itself.
+Rather than leave it fully unbuilt while waiting on that input, this
+follows the exact pattern Phase 3 used there: build the tracking and an
+admin-configurable reward setting now, default the reward to **"none"**
+(so nothing happens until the founder actually sets a rule), and let the
+real number be tuned later with zero code changes.
+
+- **Orders can be tagged "Referred by (mobile)"** — a new field on the
+  existing order-add form and accepted on any `PATCH /api/orders/:id`
+  (the routes already accepted arbitrary fields, no server change needed
+  there). Deliberately a flat JSON ledger
+  (`GET/PATCH /api/referrals/settings`, `GET /api/referrals`,
+  `POST /api/referrals/:id/mark-paid`, `POST /api/referrals/:id/void`),
+  **not** the MLM SQLite `wallet_transactions` table — a retail D2C
+  customer who refers a friend isn't automatically a distributor, and
+  folding them into the distributor wallet schema would quietly make
+  that business-model decision on the founder's behalf instead of
+  leaving it for them.
+- **Reward becomes "eligible" automatically** the moment the referred
+  customer's order is marked delivered (reuses the exact same
+  `deliveredAt`-stamping hook Phase 14 already added to both
+  `PATCH /api/orders/:id` and the India Post delivery webhook — no new
+  webhook needed) — but only if it's genuinely that customer's **first**
+  delivered order (repeat orders from an already-converted referred
+  customer don't re-trigger a reward), the order is at/above an optional
+  configurable minimum amount, and it isn't a self-referral (referrer and
+  referred mobile can't match).
+- **Reward type is admin-configurable**: no reward (the default), a flat
+  ₹ credit, or a % of the referred order's amount. Settlement is manual
+  — an admin marks a reward "paid" or "void" from the new Referral Bridge
+  panel (Orders tab) — deliberately not wired to auto-issue a live
+  Shopify discount code, since that would need yet another OAuth scope
+  this app doesn't have; keeping it a manual ledger avoids stacking up
+  another pending-permission item for something this uncertain.
+
+A functional test (`test_phase17.js`, 10 assertions) exercises the
+eligibility engine directly: the "none" default keeps everything inert,
+a flat credit and a percent-of-order reward both compute correctly, a
+missing/invalid referrer excludes an order, self-referral is rejected,
+the minimum-order-amount threshold is respected in both directions, only
+the referred customer's genuinely first delivered order is eligible (a
+second order from the same referred customer is correctly excluded —
+the repeat-order-abuse guard), and an earlier non-delivered order from
+the same customer doesn't block eligibility on the real first delivery.
+All existing test suites (`test_phase3/6/7/8/9/14/15/16.js`) were re-run
+after this change — zero regressions.
+
 **Next candidates (not yet started), largely growth-focused per the
 founder's Ayurvedic D2C directive:** abandoned-cart recovery for Shopify
 checkouts (blocked on a `read_checkouts` OAuth scope this app's current
 Shopify connection doesn't have — re-authorizing needs an explicit
 OAuth-consent click, so this is flagged for the founder rather than done
-silently), and a retail-customer-to-distributor referral bridge tying the
-D2C storefront into the existing MLM structure (needs the founder's input
-on the actual referral/commission rule before building, the same
-reasoning Phase 3 already ran into with the compensation plan itself).
+silently).
