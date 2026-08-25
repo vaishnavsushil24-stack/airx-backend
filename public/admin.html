@@ -486,9 +486,39 @@ async function loadDashboard() {
       // no inventory access or inventory fetch failed — skip both banners silently
     }
 
+    // Replenishment due: customers whose last delivered order is past its
+    // product's reorder cycle and who haven't reordered since. Best-effort
+    // same as above — needs the "orders" permission, fails silently if not.
+    let replenishBanner = '';
+    try {
+      const due = await api('/api/replenishment/due');
+      if (due.length) {
+        replenishBanner = `
+          <div class="panel" style="background:rgba(30,140,110,0.10);border:1px solid rgba(30,140,110,0.35)">
+            <h2 style="margin-top:0">🔁 Replenishment due — ${due.length} customer${due.length > 1 ? 's' : ''} likely ready to reorder</h2>
+            <table><thead><tr><th>Name</th><th>Mobile</th><th>Product</th><th>Delivered</th><th>Overdue by</th><th></th></tr></thead><tbody>
+              ${due.map(d => `<tr data-replenish-row="${esc(d.orderId)}|${esc(d.sku)}">
+                <td>${esc(d.name) || '—'}</td>
+                <td>${esc(d.mobile)}</td>
+                <td>${esc(d.product)}</td>
+                <td>${esc((d.deliveredAt || '').slice(0, 10))}</td>
+                <td>${d.daysOverdue}d</td>
+                <td>
+                  <button class="secondary" data-remind="${esc(d.orderId)}|${esc(d.sku)}|${esc(d.mobile)}|${esc(d.name)}|${esc(d.product)}" style="padding:3px 8px;font-size:11px">Send reminder</button>
+                  <button class="secondary" data-dismiss-replenish="${esc(d.orderId)}|${esc(d.sku)}" style="padding:3px 8px;font-size:11px">Dismiss</button>
+                </td>
+              </tr>`).join('')}
+            </tbody></table>
+          </div>`;
+      }
+    } catch (repErr) {
+      // no orders access or replenishment fetch failed — skip the banner silently
+    }
+
     el.innerHTML = `
       ${lowStockBanner}
       ${expiryBanner}
+      ${replenishBanner}
       <div class="cards">
         <div class="card"><div class="label">Total Members</div><div class="value">${dummySummary.total_members}</div></div>
         <div class="card"><div class="label">Likely Real</div><div class="value accent">${dummySummary.likely_real}</div></div>
@@ -507,6 +537,23 @@ async function loadDashboard() {
         <p class="muted">Reminder: this dashboard reflects AIRX Ops' own database, migrated from admin.airxplus.com's member roster (verified: Active count and Total count match exactly). Historical PV/BV/payout data could not be recovered from the legacy system — it isn't stored anywhere accessible there — so incoming/outgoing above reflects only activity recorded going forward in this system.</p>
       </div>
     `;
+    document.querySelectorAll('[data-remind]').forEach(b => b.addEventListener('click', async () => {
+      const [orderId, sku, mobile, name, product] = b.dataset.remind.split('|');
+      b.disabled = true;
+      try {
+        const result = await api('/api/whatsapp/replenishment-reminder', { method: 'POST', body: JSON.stringify({ mobile, name, product }) });
+        toast(result.skipped ? 'WhatsApp not connected yet — nothing sent' : 'Reminder sent', result.skipped ? 'error' : 'success');
+      } catch (e) { toast('Failed: ' + e.message, 'error'); }
+      b.disabled = false;
+    }));
+    document.querySelectorAll('[data-dismiss-replenish]').forEach(b => b.addEventListener('click', async () => {
+      const [orderId, sku] = b.dataset.dismissReplenish.split('|');
+      try {
+        await api('/api/replenishment/dismiss', { method: 'POST', body: JSON.stringify({ orderId, sku }) });
+        toast('Dismissed', 'success');
+        loadDashboard();
+      } catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
   } catch (e) {
     el.innerHTML = `<div class="empty">Failed to load: ${esc(e.message)}</div>`;
   }
@@ -1650,6 +1697,7 @@ async function loadInventory() {
       <input id="inv_threshold" placeholder="Low-stock alert at" type="number" style="max-width:130px" />
       <input id="inv_batch" placeholder="Batch number (optional)" style="max-width:150px" />
       <input id="inv_expiry" placeholder="Expiry date" type="date" style="max-width:150px" title="Expiry date (optional)" />
+      <input id="inv_reorder" placeholder="Reorder cycle (days)" type="number" style="max-width:150px" title="How many days a pack typically lasts before a customer needs to reorder - defaults to 30 if left blank" />
       <button id="addInventoryBtn">+ Add</button>
     </div>
     <div id="inventoryTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
@@ -1657,7 +1705,7 @@ async function loadInventory() {
   async function refresh() {
     const items = await api('/api/inventory');
     document.getElementById('inventoryTable').innerHTML = items.length
-      ? `<table><thead><tr><th>SKU</th><th>Name</th><th>Stock</th><th>Alert at</th><th>Batch</th><th>Expiry</th><th></th></tr></thead><tbody>
+      ? `<table><thead><tr><th>SKU</th><th>Name</th><th>Stock</th><th>Alert at</th><th>Batch</th><th>Expiry</th><th>Reorder cycle</th><th></th></tr></thead><tbody>
           ${items.map(i => {
             const low = Number(i.stock) <= Number(i.lowStockThreshold);
             const dLeft = daysUntil(i.expiryDate);
@@ -1670,6 +1718,7 @@ async function loadInventory() {
             <td>${i.lowStockThreshold}</td>
             <td>${esc(i.batchNumber) || '—'}</td>
             <td>${i.expiryDate ? esc(i.expiryDate) + (expired ? ' ⛔ expired' : nearExpiry ? ` ⏳ ${dLeft}d left` : '') : '—'}</td>
+            <td>${i.reorderCycleDays ? i.reorderCycleDays + 'd' : '30d (default)'}</td>
             <td><button class="danger" data-del-inv="${esc(i.sku)}" style="padding:3px 8px;font-size:11px">Delete</button></td>
           </tr>`;
           }).join('')}
@@ -1688,11 +1737,12 @@ async function loadInventory() {
       lowStockThreshold: Number(document.getElementById('inv_threshold').value) || 5,
       batchNumber: document.getElementById('inv_batch').value.trim() || null,
       expiryDate: document.getElementById('inv_expiry').value || null,
+      reorderCycleDays: Number(document.getElementById('inv_reorder').value) || null,
     };
     if (!body.name) return toast('Name is required', 'error');
     try {
       await api('/api/inventory', { method: 'POST', body: JSON.stringify(body) });
-      ['inv_sku', 'inv_name', 'inv_stock', 'inv_threshold', 'inv_batch', 'inv_expiry'].forEach(f => { document.getElementById(f).value = ''; });
+      ['inv_sku', 'inv_name', 'inv_stock', 'inv_threshold', 'inv_batch', 'inv_expiry', 'inv_reorder'].forEach(f => { document.getElementById(f).value = ''; });
       toast('Inventory item added', 'success'); refresh();
     } catch (e) { toast('Failed: ' + e.message, 'error'); }
   });
