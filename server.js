@@ -32,9 +32,18 @@ const { db } = require("./db.js");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const LEADS_FILE = path.join(__dirname, "data", "leads.json");
-const ORDERS_FILE = path.join(__dirname, "data", "orders.json");
-const SHOP_FILE = path.join(__dirname, "data", "shopify.json");
+// Same DATA_DIR the SQLite database (db.js) uses — the Render Persistent
+// Disk mount path when one is attached, __dirname/data otherwise. These
+// flat JSON files predate the SQLite migration and were left pointed at
+// __dirname/data (the container's own ephemeral filesystem), which meant
+// every deploy silently wiped orders/leads/inventory AND the Shopify OAuth
+// connection — found when a post-deploy smoke test showed 14 synced orders
+// had vanished and Shopify reported "not connected" right after a push.
+// Fixed by pointing these at DATA_DIR too, exactly like db.js already does.
+const JSON_DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
+const LEADS_FILE = path.join(JSON_DATA_DIR, "leads.json");
+const ORDERS_FILE = path.join(JSON_DATA_DIR, "orders.json");
+const SHOP_FILE = path.join(JSON_DATA_DIR, "shopify.json");
 
 // CORS — needed so the legacy-data migration (Phase 5) can run fetch()
 // calls directly from admin.airxplus.com's own page context straight into
@@ -70,8 +79,7 @@ app.get("/admin", (req, res) => res.redirect("/admin.html"));
 
 // ---------- tiny file-based storage ----------
 function ensureDataFiles() {
-  const dir = path.join(__dirname, "data");
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  if (!fs.existsSync(JSON_DATA_DIR)) fs.mkdirSync(JSON_DATA_DIR, { recursive: true });
   if (!fs.existsSync(LEADS_FILE)) fs.writeFileSync(LEADS_FILE, "[]");
   if (!fs.existsSync(ORDERS_FILE)) fs.writeFileSync(ORDERS_FILE, "[]");
   if (!fs.existsSync(SHOP_FILE)) fs.writeFileSync(SHOP_FILE, "{}");
@@ -485,7 +493,7 @@ app.post("/api/shopify/fulfill", requireAccess("orders"), async (req, res) => {
 // Render's environment variables - never typed here, never seen by Claude -
 // same pattern as SHOPIFY_API_SECRET.
 
-const INDIAPOST_FILE = path.join(__dirname, "data", "indiapost.json");
+const INDIAPOST_FILE = path.join(JSON_DATA_DIR, "indiapost.json");
 if (!fs.existsSync(INDIAPOST_FILE)) {
   fs.writeFileSync(
     INDIAPOST_FILE,
@@ -601,7 +609,7 @@ function tcpProbe(host, port, timeoutMs = 5000) {
 // Where the droplet's cloud-init script "phones home" with tinyproxy's status
 // (systemctl is-active, ss -tlnp output, journal tail) so we can see what
 // happened at boot without ever needing SSH access to the droplet itself.
-const PROXY_STATUS_FILE = path.join(__dirname, "data", "proxy-status-reports.json");
+const PROXY_STATUS_FILE = path.join(JSON_DATA_DIR, "proxy-status-reports.json");
 if (!fs.existsSync(PROXY_STATUS_FILE)) {
   fs.writeFileSync(PROXY_STATUS_FILE, "[]");
 }
@@ -1053,7 +1061,7 @@ app.patch("/api/orders/:id", requireAccess("orders"), (req, res) => {
 // INVENTORY — stock tracking, auto-decrement on booking
 // =====================================================================
 
-const INVENTORY_FILE = path.join(__dirname, "data", "inventory.json");
+const INVENTORY_FILE = path.join(JSON_DATA_DIR, "inventory.json");
 if (!fs.existsSync(INVENTORY_FILE)) {
   fs.writeFileSync(INVENTORY_FILE, "[]");
 }
