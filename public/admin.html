@@ -2025,6 +2025,10 @@ async function loadUserManagement() {
       <div id="rolePermsChecks" class="row" style="flex-wrap:wrap;gap:6px 16px;margin-top:6px"></div>
       <div id="rolesTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
     </div>
+    <div class="panel"><h2>Data Backup</h2>
+      <p class="muted">Download a single JSON file with all leads, orders, inventory, knowledge base, and MLM data (products/franchises/members/etc.) for an off-Render copy or for an accountant. Live Shopify/India Post secrets are never included — only whether each is connected.</p>
+      <div class="row"><button id="downloadBackupBtn">Download full backup (.json)</button></div>
+    </div>
     <div class="panel"><h2>Admin Users</h2>
       <p class="muted">Individual staff logins. Each one signs in with a username/password (separate from the shared API key) and only sees the tabs their role permits.</p>
       <div class="row">
@@ -2042,6 +2046,32 @@ async function loadUserManagement() {
   ).join('');
   document.getElementById('role_all').addEventListener('change', (e) => {
     document.querySelectorAll('.role-perm-check').forEach(c => { c.disabled = e.target.checked; if (e.target.checked) c.checked = false; });
+  });
+
+  document.getElementById('downloadBackupBtn').addEventListener('click', async () => {
+    const btn = document.getElementById('downloadBackupBtn');
+    btn.disabled = true;
+    btn.textContent = 'Preparing…';
+    try {
+      const authHeader = SESSION_TOKEN ? { 'Authorization': 'Bearer ' + SESSION_TOKEN } : { 'x-api-key': API_KEY };
+      const res = await fetch(API_BASE + '/api/backup/export', { headers: authHeader });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `airx-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast('Backup downloaded', 'success');
+    } catch (e) {
+      toast('Backup failed: ' + e.message, 'error');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Download full backup (.json)';
+    }
   });
 
   function permLabel(key) {
