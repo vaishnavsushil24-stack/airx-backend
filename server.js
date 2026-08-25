@@ -1058,6 +1058,59 @@ app.patch("/api/orders/:id", requireAccess("orders"), (req, res) => {
 });
 
 // =====================================================================
+// PUBLIC ORDER TRACKING — no login, so customers self-serve "where is my
+// order" instead of messaging staff. Serves the "less staff" goal directly.
+//
+// Deliberately simple threat model for a small COD-first D2C business:
+// looked up by the customer's own mobile number, same number their
+// delivery already goes to. No password, no order-ID hunting. To raise
+// the bar above "guess a random 10-digit number," a small in-memory
+// per-IP throttle below caps lookups — not bulletproof (resets on
+// restart, doesn't survive multiple server instances), but proportionate
+// for this business's actual risk (COD grocery-sized orders, not
+// financial data) rather than adding a login system that would just
+// push customers back to messaging staff, defeating the point.
+// =====================================================================
+
+const trackingAttempts = new Map(); // ip -> [timestamps]
+const TRACKING_RATE_LIMIT = 15; // lookups
+const TRACKING_RATE_WINDOW_MS = 10 * 60 * 1000; // per 10 minutes
+function isRateLimited(ip) {
+  const now = Date.now();
+  const attempts = (trackingAttempts.get(ip) || []).filter((t) => now - t < TRACKING_RATE_WINDOW_MS);
+  attempts.push(now);
+  trackingAttempts.set(ip, attempts);
+  return attempts.length > TRACKING_RATE_LIMIT;
+}
+
+app.get("/api/public/track", (req, res) => {
+  const ip = req.header("x-forwarded-for") || req.socket.remoteAddress || "unknown";
+  if (isRateLimited(ip)) {
+    return res.status(429).json({ error: "Too many lookups — please try again in a few minutes." });
+  }
+  const mobile = String(req.query.mobile || "").replace(/\D/g, "").slice(-10);
+  if (mobile.length !== 10) {
+    return res.status(400).json({ error: "Enter a valid 10-digit mobile number." });
+  }
+  const orders = readJson(ORDERS_FILE);
+  const matches = orders
+    .filter((o) => String(o.mobile || "").replace(/\D/g, "").slice(-10) === mobile)
+    .slice(0, 5)
+    .map((o) => ({
+      createdAt: o.createdAt,
+      product: o.product,
+      status: o.status,
+      codAmount: o.codAmount,
+      trackingBarcode: o.indiaPostBarcode || null,
+      latestEvent:
+        o.indiaPostEvents && o.indiaPostEvents.length
+          ? o.indiaPostEvents[o.indiaPostEvents.length - 1].event_description || null
+          : null,
+    }));
+  res.json({ orders: matches });
+});
+
+// =====================================================================
 // INVENTORY — stock tracking, auto-decrement on booking
 // =====================================================================
 
