@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Ask AIRX PLUS — Product & Order Help</title>
+<style>
+  :root {
+    --green: #14532d;
+    --green-light: #16a34a;
+    --bg: #f6f8f4;
+    --card: #ffffff;
+    --border: #e2e8dd;
+    --text: #1f2a1f;
+    --muted: #6b7a6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 24px 16px 60px;
+  }
+  .wrap { max-width: 560px; margin: 0 auto; }
+  .brand { text-align: center; margin-bottom: 20px; }
+  .brand h1 { font-size: 22px; margin: 0 0 4px; color: var(--green); letter-spacing: 0.5px; }
+  .brand p { margin: 0; color: var(--muted); font-size: 14px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 16px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    margin-bottom: 14px;
+  }
+  .disclaimer {
+    font-size: 12px;
+    color: var(--muted);
+    background: #fffbeb;
+    border: 1px solid #fde68a;
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin-bottom: 14px;
+  }
+  #log { min-height: 120px; max-height: 50vh; overflow-y: auto; margin-bottom: 12px; }
+  .msg { margin-bottom: 10px; padding: 10px 12px; border-radius: 10px; white-space: pre-wrap; font-size: 14px; line-height: 1.4; }
+  .msg.user { background: rgba(22,163,74,0.10); margin-left: 15%; }
+  .msg.bot { background: #f1f5f1; margin-right: 15%; }
+  .empty { color: var(--muted); font-size: 14px; text-align: center; padding: 20px 0; }
+  label { display: block; font-size: 12px; font-weight: 600; margin-bottom: 5px; color: var(--muted); }
+  .row { display: flex; gap: 8px; }
+  input[type="text"], input[type="tel"] {
+    flex: 1;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    font-size: 15px;
+    outline: none;
+    font-family: inherit;
+  }
+  input:focus { border-color: var(--green-light); }
+  button {
+    background: var(--green);
+    color: #fff;
+    border: none;
+    padding: 12px 18px;
+    border-radius: 10px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.6; cursor: not-allowed; }
+  button:hover:not(:disabled) { background: var(--green-light); }
+  .mobile-field { margin-bottom: 10px; }
+  .hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .footer { text-align: center; font-size: 12px; color: var(--muted); margin-top: 20px; }
+  .footer a { color: var(--green); }
+  .spinner {
+    display: inline-block; width: 14px; height: 14px;
+    border: 2px solid rgba(255,255,255,0.5); border-top-color: #fff;
+    border-radius: 50%; animation: spin 0.7s linear infinite; vertical-align: middle; margin-right: 6px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">
+    <h1>AIRX PLUS</h1>
+    <p>Ask about your order, our products, or how to use them</p>
+  </div>
+
+  <div class="disclaimer">
+    This assistant answers from AIRX PLUS's own product information. For any health condition, medication, pregnancy,
+    or dosage question it can't answer confidently, please consult a qualified doctor or Ayurvedic practitioner.
+  </div>
+
+  <div class="card">
+    <div class="mobile-field">
+      <label for="mobile">Your mobile number (optional — only needed if asking about an order)</label>
+      <input type="tel" id="mobile" placeholder="10-digit mobile number" maxlength="10" inputmode="numeric" />
+    </div>
+    <div id="log"><div class="empty">Ask a question below to get started — e.g. "where is my order?" or "how do I take Ashwagandha churna?"</div></div>
+    <div class="row">
+      <input type="text" id="question" placeholder="Type your question…" />
+      <button id="sendBtn">Send</button>
+    </div>
+  </div>
+
+  <div class="footer">AIRX PLUS Healthcare Private Limited · <a href="/track.html">Track an order instead</a></div>
+</div>
+
+<script>
+  const log = document.getElementById('log');
+  const mobileInput = document.getElementById('mobile');
+  const questionInput = document.getElementById('question');
+  const sendBtn = document.getElementById('sendBtn');
+  let started = false;
+
+  mobileInput.addEventListener('input', () => {
+    mobileInput.value = mobileInput.value.replace(/\D/g, '').slice(0, 10);
+  });
+  questionInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
+  sendBtn.addEventListener('click', send);
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c]));
+  }
+
+  function addMsg(role, text) {
+    if (!started) { log.innerHTML = ''; started = true; }
+    const div = document.createElement('div');
+    div.className = 'msg ' + role;
+    div.textContent = text;
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+    return div;
+  }
+
+  async function send() {
+    const question = questionInput.value.trim();
+    if (!question) return;
+    questionInput.value = '';
+    addMsg('user', question);
+    const thinking = addMsg('bot', 'Thinking…');
+    sendBtn.disabled = true;
+    sendBtn.innerHTML = '<span class="spinner"></span>';
+
+    try {
+      const res = await fetch('/api/public/assistant', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question, mobile: mobileInput.value.trim() }),
+      });
+      const data = await res.json();
+      if (res.status === 429) {
+        thinking.textContent = data.error || 'Too many messages — please try again in a few minutes.';
+      } else if (!res.ok) {
+        thinking.textContent = data.error || 'Something went wrong — please try again.';
+      } else {
+        thinking.textContent = data.answer || "Sorry, I couldn't find an answer to that.";
+      }
+    } catch (err) {
+      thinking.textContent = 'Could not reach the server. Please check your connection and try again.';
+    } finally {
+      sendBtn.disabled = false;
+      sendBtn.textContent = 'Send';
+    }
+  }
+</script>
+</body>
+</html>

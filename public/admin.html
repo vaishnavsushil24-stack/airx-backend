@@ -220,6 +220,7 @@
     <div class="tab" id="tab-leads"></div>
     <div class="tab" id="tab-inventory"></div>
     <div class="tab" id="tab-staff"></div>
+    <div class="tab" id="tab-ai_assistant"></div>
     <div class="tab" id="tab-rewards"></div>
     <div class="tab" id="tab-cms"></div>
     <div class="tab" id="tab-user_management"></div>
@@ -228,6 +229,10 @@
 
 <div class="detail-overlay" id="memberDetailOverlay">
   <div class="detail-box" id="memberDetailBox"></div>
+</div>
+
+<div class="detail-overlay" id="aiDraftOverlay">
+  <div class="detail-box" id="aiDraftBox"></div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -253,6 +258,7 @@ const TABS = [
   { id: 'leads', label: 'Leads' },
   { id: 'inventory', label: 'D2C Inventory' },
   { id: 'staff', label: 'Staff Performance' },
+  { id: 'ai_assistant', label: 'AI Assistant' },
   { id: 'rewards', label: 'Rewards' },
   { id: 'cms', label: 'Content (CMS)' },
   { id: 'user_management', label: 'User Management' },
@@ -275,6 +281,7 @@ const MODULE_KEYS = [
   { key: 'leads', label: 'Leads' },
   { key: 'inventory', label: 'D2C Inventory' },
   { key: 'staff', label: 'Staff Performance' },
+  { key: 'ai_assistant', label: 'AI Assistant' },
   { key: 'rewards', label: 'Rewards' },
   { key: 'cms', label: 'Content (CMS)' },
   { key: 'user_management', label: 'User Management' },
@@ -427,7 +434,7 @@ function renderNav() {
 function switchTab(id) {
   document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === id));
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.id === 'tab-' + id));
-  const loaders = { dashboard: loadDashboard, members: loadMembers, masters: loadMasters, commission: loadCommission, payouts: loadPayouts, accounts: loadAccounts, reports: loadReports, products: loadProducts, franchises: loadFranchises, franchise_commission: loadFranchiseCommission, orders: loadOrders, leads: loadLeads, inventory: loadInventory, staff: loadStaff, rewards: loadRewards, cms: loadCms, user_management: loadUserManagement };
+  const loaders = { dashboard: loadDashboard, members: loadMembers, masters: loadMasters, commission: loadCommission, payouts: loadPayouts, accounts: loadAccounts, reports: loadReports, products: loadProducts, franchises: loadFranchises, franchise_commission: loadFranchiseCommission, orders: loadOrders, leads: loadLeads, inventory: loadInventory, staff: loadStaff, ai_assistant: loadAiAssistant, rewards: loadRewards, cms: loadCms, user_management: loadUserManagement };
   if (loaders[id]) loaders[id]();
 }
 
@@ -739,6 +746,9 @@ async function openMemberDetail(code) {
 }
 document.getElementById('memberDetailOverlay').addEventListener('click', (e) => {
   if (e.target.id === 'memberDetailOverlay') e.target.style.display = 'none';
+});
+document.getElementById('aiDraftOverlay').addEventListener('click', (e) => {
+  if (e.target.id === 'aiDraftOverlay') e.target.style.display = 'none';
 });
 
 // ---------- Commission settings ----------
@@ -1573,17 +1583,49 @@ async function loadLeads() {
   async function refresh() {
     const leads = await api('/api/leads');
     document.getElementById('leadsTable').innerHTML = leads.length
-      ? `<table><thead><tr><th>Date</th><th>Name</th><th>Phone</th><th>Email</th><th>Status</th></tr></thead><tbody>
+      ? `<table><thead><tr><th>Date</th><th>Name</th><th>Phone</th><th>Email</th><th>Status</th><th></th></tr></thead><tbody>
           ${leads.map(l => `<tr>
             <td>${esc((l.createdAt || '').slice(0, 10))}</td>
             <td>${esc(l.name) || '—'}</td><td>${esc(l.phone) || '—'}</td><td>${esc(l.email) || '—'}</td>
             <td><select data-lead="${esc(l.id)}">${STATUSES.map(s => `<option value="${s}" ${l.status === s ? 'selected' : ''}>${s}</option>`).join('')}</select></td>
+            <td><button class="secondary" data-draft="${esc(l.id)}" style="padding:3px 8px;font-size:11px" ${l.phone ? '' : 'disabled title="no phone on this lead"'}>AI: Draft follow-up</button></td>
           </tr>`).join('')}
         </tbody></table>`
       : '<div class="empty">No leads yet — they will appear here automatically once Meta Lead Ads is sending webhooks.</div>';
     document.querySelectorAll('[data-lead]').forEach(sel => sel.addEventListener('change', async () => {
       try { await api('/api/leads/' + encodeURIComponent(sel.dataset.lead), { method: 'PATCH', body: JSON.stringify({ status: sel.value }) }); toast('Lead updated', 'success'); }
       catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+    document.querySelectorAll('[data-draft]').forEach(btn => btn.addEventListener('click', async () => {
+      const lead = leads.find(l => l.id === btn.dataset.draft);
+      if (!lead) return;
+      const overlay = document.getElementById('aiDraftOverlay');
+      const box = document.getElementById('aiDraftBox');
+      overlay.style.display = 'flex';
+      box.innerHTML = `<h3>AI follow-up draft — ${esc(lead.name) || esc(lead.phone)}</h3><div class="empty">Thinking…</div>`;
+      try {
+        const result = await api('/api/ai/draft-followup', { method: 'POST', body: JSON.stringify({ name: lead.name, phone: lead.phone, status: lead.status }) });
+        box.innerHTML = `
+          <h3>AI follow-up draft — ${esc(lead.name) || esc(lead.phone)}</h3>
+          ${result.configured === false ? `<p class="muted">${esc(result.draft)}</p>` : `
+            <textarea id="aiDraftText" style="width:100%;min-height:100px;margin-top:8px" readonly>${esc(result.draft)}</textarea>
+            <p class="muted" style="margin-top:6px">Copy this and send it yourself on WhatsApp — auto-send isn't turned on yet.</p>
+          `}
+          <div class="row" style="margin-top:10px">
+            ${result.configured !== false ? `<button id="aiDraftCopyBtn">Copy</button>` : ''}
+            <button class="secondary" id="aiDraftCloseBtn">Close</button>
+          </div>`;
+        if (result.configured !== false) {
+          document.getElementById('aiDraftCopyBtn').addEventListener('click', async () => {
+            try { await navigator.clipboard.writeText(document.getElementById('aiDraftText').value); toast('Copied', 'success'); }
+            catch (e) { toast('Could not copy — select the text manually', 'error'); }
+          });
+        }
+        document.getElementById('aiDraftCloseBtn').addEventListener('click', () => { overlay.style.display = 'none'; });
+      } catch (e) {
+        box.innerHTML = `<h3>AI follow-up draft</h3><div class="empty">Failed: ${esc(e.message)}</div><div class="row" style="margin-top:10px"><button class="secondary" id="aiDraftCloseBtn2">Close</button></div>`;
+        document.getElementById('aiDraftCloseBtn2').addEventListener('click', () => { overlay.style.display = 'none'; });
+      }
     }));
   }
   refresh().catch(e => { document.getElementById('leadsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
@@ -1671,6 +1713,99 @@ async function loadStaff() {
         </tbody></table>`
       : '<div class="empty">No orders recorded yet.</div>';
   } catch (e) { document.getElementById('staffTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; }
+}
+
+// ---------- AI Assistant (system copilot + Knowledge Base for the customer-facing assistant) ----------
+let aiChatHistory = []; // [{ role: 'user'|'assistant', text }] — this tab's session only, not persisted
+async function loadAiAssistant() {
+  const el = document.getElementById('tab-ai_assistant');
+  el.innerHTML = `
+    <div class="panel">
+      <h2>Ask AIRX Ops <span class="muted" style="font-weight:normal">(natural-language questions about live data — low stock, near-expiry, leads, orders, staff)</span></h2>
+      <div id="aiChatLog" style="max-height:340px;overflow-y:auto;margin-bottom:10px"></div>
+      <div class="row">
+        <input id="aiChatInput" placeholder="e.g. 'which items are low on stock?' or 'how many leads came in this week?'" style="flex:1" />
+        <button id="aiChatSendBtn">Ask</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Knowledge Base <span class="muted" style="font-weight:normal">(product education + FAQs the public customer assistant on /assistant.html answers from — the AI never invents claims beyond what's added here)</span></h2>
+      <div class="row">
+        <select id="kb_category" style="max-width:180px">
+          <option value="product_education">Product education</option>
+          <option value="faq">FAQ</option>
+          <option value="policy">Policy (returns, shipping, etc.)</option>
+        </select>
+        <input id="kb_title" placeholder="Title" style="flex:1;min-width:160px" />
+      </div>
+      <textarea id="kb_content" placeholder="Content (what the assistant should say — be precise, this is what customers will be told)" style="width:100%;min-height:70px;margin-top:8px"></textarea>
+      <div class="row" style="margin-top:8px"><button id="addKbBtn">+ Add article</button></div>
+      <div id="kbTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
+    </div>
+  `;
+
+  function renderChatLog() {
+    const log = document.getElementById('aiChatLog');
+    if (!aiChatHistory.length) { log.innerHTML = '<div class="empty">Ask a question below to get started.</div>'; return; }
+    log.innerHTML = aiChatHistory.map(m => `
+      <div style="margin-bottom:10px;padding:8px 10px;border-radius:8px;background:${m.role === 'user' ? 'rgba(255,255,255,0.06)' : 'rgba(80,160,255,0.10)'}">
+        <div class="muted" style="font-size:11px;margin-bottom:3px">${m.role === 'user' ? 'You' : 'AI'}</div>
+        <div style="white-space:pre-wrap">${esc(m.text)}</div>
+      </div>`).join('');
+    log.scrollTop = log.scrollHeight;
+  }
+  renderChatLog();
+
+  async function sendChat() {
+    const input = document.getElementById('aiChatInput');
+    const question = input.value.trim();
+    if (!question) return;
+    input.value = '';
+    aiChatHistory.push({ role: 'user', text: question });
+    renderChatLog();
+    const thinkingIdx = aiChatHistory.push({ role: 'assistant', text: 'Thinking…' }) - 1;
+    renderChatLog();
+    try {
+      const result = await api('/api/ai/ask', { method: 'POST', body: JSON.stringify({ question }) });
+      aiChatHistory[thinkingIdx] = { role: 'assistant', text: result.answer || '(no answer)' };
+    } catch (e) {
+      aiChatHistory[thinkingIdx] = { role: 'assistant', text: 'Failed: ' + e.message };
+    }
+    renderChatLog();
+  }
+  document.getElementById('aiChatSendBtn').addEventListener('click', sendChat);
+  document.getElementById('aiChatInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') sendChat(); });
+
+  async function refreshKb() {
+    const items = await api('/api/kb');
+    document.getElementById('kbTable').innerHTML = items.length
+      ? `<table><thead><tr><th>Category</th><th>Title</th><th>Content</th><th></th></tr></thead><tbody>
+          ${items.map(i => `<tr>
+            <td>${esc(i.category)}</td><td>${esc(i.title)}</td>
+            <td style="max-width:360px;white-space:pre-wrap">${esc(i.content)}</td>
+            <td><button class="danger" data-del-kb="${esc(i.id)}" style="padding:3px 8px;font-size:11px">Delete</button></td>
+          </tr>`).join('')}
+        </tbody></table>`
+      : '<div class="empty">No articles yet — the customer assistant has nothing to answer from until you add some.</div>';
+    document.querySelectorAll('[data-del-kb]').forEach(b => b.addEventListener('click', async () => {
+      try { await api('/api/kb/' + encodeURIComponent(b.dataset.delKb), { method: 'DELETE' }); toast('Deleted', 'success'); refreshKb(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+  }
+  document.getElementById('addKbBtn').addEventListener('click', async () => {
+    const body = {
+      category: document.getElementById('kb_category').value,
+      title: document.getElementById('kb_title').value.trim(),
+      content: document.getElementById('kb_content').value.trim(),
+    };
+    if (!body.title || !body.content) return toast('Title and content are required', 'error');
+    try {
+      await api('/api/kb', { method: 'POST', body: JSON.stringify(body) });
+      document.getElementById('kb_title').value = ''; document.getElementById('kb_content').value = '';
+      toast('Article added', 'success'); refreshKb();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+  refreshKb().catch(e => { document.getElementById('kbTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
 }
 
 // ---------- Rewards ----------
