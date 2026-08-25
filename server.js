@@ -126,6 +126,7 @@ const MODULE_KEYS = [
   "leads",
   "inventory",
   "staff",
+  "ai_assistant",
 ];
 
 function hashPassword(password) {
@@ -3233,6 +3234,297 @@ app.delete("/api/admin/users/:id", requireAccess("user_management"), (req, res) 
   db.prepare("DELETE FROM admin_sessions WHERE user_id = ?").run(req.params.id);
   const result = db.prepare("DELETE FROM admin_users WHERE id = ?").run(req.params.id);
   res.json({ deleted: result.changes > 0 });
+});
+
+// =====================================================================
+// AI AGENT — sales support, customer education, and a system copilot
+// =====================================================================
+//
+// Powered by the Anthropic Claude API via a plain fetch() call (Node 22
+// has global fetch — no SDK/npm install needed, consistent with this
+// project's "npm install is blocked in this environment" constraint).
+//
+// Needs one env var to activate:
+//   ANTHROPIC_API_KEY   - from console.anthropic.com
+// Optional:
+//   ANTHROPIC_MODEL     - defaults to "claude-sonnet-4-5-20250929"
+//
+// Until ANTHROPIC_API_KEY is set, every route below returns a clean
+// "not configured yet" response instead of crashing — the same
+// inert-until-configured pattern used for WhatsApp above.
+//
+// Three surfaces:
+//  1. Public customer assistant (/api/public/assistant) — support +
+//     product education. Answers ONLY from a staff-curated Knowledge
+//     Base plus the customer's own order status (same safe mobile
+//     lookup /api/public/track uses). Deliberately has NO access to
+//     any internal tool/data beyond that — a customer can't ask it
+//     about other people's orders, leads, inventory, etc.
+//  2. Staff system copilot (/api/ai/ask) — can call read-only "tools"
+//     to answer natural-language questions about live system data
+//     (low stock, near-expiry, leads, orders, staff performance).
+//     Gated behind requireAccess("ai_assistant").
+//  3. Sales follow-up drafter (/api/ai/draft-followup) — drafts (never
+//     sends) a WhatsApp-style follow-up message for one lead, for staff
+//     to review and send manually. Actual WhatsApp auto-send stays
+//     gated on WHATSAPP_TOKEN/WHATSAPP_PHONE_ID above, unrelated to this.
+
+const KB_FILE = path.join(JSON_DATA_DIR, "kb.json");
+if (!fs.existsSync(KB_FILE)) fs.writeFileSync(KB_FILE, "[]");
+// Each entry: { id, category: "product_education"|"faq"|"policy", title, content }
+
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5-20250929";
+
+async function callClaude({ system, messages, tools, max_tokens = 1024 }) {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) {
+    return {
+      configured: false,
+      text: "The AI assistant isn't set up yet — ask the AIRX team to add an Anthropic API key.",
+    };
+  }
+  const resp = await fetchFn("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": key,
+      "anthropic-version": "2023-06-01",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: ANTHROPIC_MODEL,
+      max_tokens,
+      system,
+      messages,
+      ...(tools ? { tools } : {}),
+    }),
+  });
+  const data = await resp.json();
+  if (data.error) throw new Error(data.error.message || "Anthropic API error");
+  return { configured: true, ...data };
+}
+
+// ---- Knowledge Base CRUD (staff-managed content the agent grounds itself in) ----
+app.get("/api/kb", requireAccess("ai_assistant"), (req, res) => {
+  res.json(readJson(KB_FILE));
+});
+app.post("/api/kb", requireAccess("ai_assistant"), (req, res) => {
+  const items = readJson(KB_FILE);
+  const item = {
+    id: "kb" + Date.now(),
+    category: req.body.category || "faq",
+    title: req.body.title || "",
+    content: req.body.content || "",
+  };
+  items.push(item);
+  writeJson(KB_FILE, items);
+  res.json(item);
+});
+app.patch("/api/kb/:id", requireAccess("ai_assistant"), (req, res) => {
+  const items = readJson(KB_FILE);
+  const idx = items.findIndex((i) => i.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: "not found" });
+  items[idx] = { ...items[idx], ...req.body };
+  writeJson(KB_FILE, items);
+  res.json(items[idx]);
+});
+app.delete("/api/kb/:id", requireAccess("ai_assistant"), (req, res) => {
+  const items = readJson(KB_FILE);
+  const filtered = items.filter((i) => i.id !== req.params.id);
+  writeJson(KB_FILE, filtered);
+  res.json({ deleted: items.length !== filtered.length });
+});
+
+// ---- Public customer assistant (support + product education) ----
+// Separate rate-limit bucket from /api/public/track but the same shape
+// (15 messages / 10 min per IP), same first-IP-in-chain fix already
+// applied to the tracking route.
+const assistantAttempts = new Map();
+function isAssistantRateLimited(ip) {
+  const now = Date.now();
+  const attempts = (assistantAttempts.get(ip) || []).filter((t) => now - t < TRACKING_RATE_WINDOW_MS);
+  attempts.push(now);
+  assistantAttempts.set(ip, attempts);
+  return attempts.length > TRACKING_RATE_LIMIT;
+}
+
+app.post("/api/public/assistant", async (req, res) => {
+  const forwardedFor = req.header("x-forwarded-for");
+  const ip = (forwardedFor ? forwardedFor.split(",")[0].trim() : "") || req.socket.remoteAddress || "unknown";
+  if (isAssistantRateLimited(ip)) {
+    return res.status(429).json({ error: "Too many messages — please try again in a few minutes." });
+  }
+  const question = String(req.body.question || "").trim().slice(0, 1000);
+  if (!question) return res.status(400).json({ error: "question is required" });
+  const mobile = String(req.body.mobile || "").replace(/\D/g, "").slice(-10);
+
+  try {
+    const kb = readJson(KB_FILE);
+    let orderContext = "";
+    if (mobile.length === 10) {
+      const orders = readJson(ORDERS_FILE)
+        .filter((o) => String(o.mobile || "").replace(/\D/g, "").slice(-10) === mobile)
+        .slice(0, 5)
+        .map((o) => ({ product: o.product, status: o.status, createdAt: o.createdAt, trackingBarcode: o.indiaPostBarcode || null }));
+      if (orders.length) orderContext = `\n\nThis customer's recent orders (only mention what's relevant to their question):\n${JSON.stringify(orders)}`;
+    }
+    const kbText = kb.length
+      ? kb.map((k) => `[${k.category}] ${k.title}\n${k.content}`).join("\n\n")
+      : "(no knowledge base articles added yet — tell the customer the team will get back to them)";
+
+    const system = `You are the AIRX PLUS customer support and product education assistant for an Ayurvedic D2C healthcare brand.
+Answer ONLY using the knowledge base content below and, if given, the customer's own order data — never invent product
+claims, dosages, or health/medical advice beyond what's written here. For any health condition, medication interaction,
+pregnancy, or dosage question not directly answered by the knowledge base, tell the customer to consult a qualified
+doctor/Ayurvedic practitioner before use — do not guess. Keep answers short and warm, and reply in whichever language/
+style the customer wrote in (Hindi, Hinglish, or English). If you don't know, say so plainly and offer to connect them
+to the team.
+
+Knowledge base:
+${kbText}${orderContext}`;
+
+    const result = await callClaude({ system, messages: [{ role: "user", content: question }], max_tokens: 600 });
+    if (!result.configured) return res.json({ answer: result.text, configured: false });
+    const textBlock = (result.content || []).find((b) => b.type === "text");
+    res.json({ answer: textBlock ? textBlock.text : "Sorry, I couldn't find an answer to that.", configured: true });
+  } catch (err) {
+    console.error("AI assistant error:", err);
+    res.status(500).json({ error: "assistant temporarily unavailable" });
+  }
+});
+
+// ---- Staff system copilot (tool-calling over read-only summaries) ----
+function aiTool_getLowStock() {
+  const items = readJson(INVENTORY_FILE);
+  return items.filter((i) => Number(i.stock) <= Number(i.lowStockThreshold));
+}
+function aiTool_getNearExpiry() {
+  const items = readJson(INVENTORY_FILE);
+  const now = Date.now();
+  return items
+    .map((i) => ({
+      ...i,
+      daysLeft: i.expiryDate ? Math.ceil((new Date(i.expiryDate + "T00:00:00").getTime() - now) / 86400000) : null,
+    }))
+    .filter((i) => i.daysLeft !== null && i.daysLeft <= 60);
+}
+function aiTool_getLeadsSummary() {
+  const leads = readJson(LEADS_FILE);
+  const byStatus = {};
+  leads.forEach((l) => {
+    byStatus[l.status || "new"] = (byStatus[l.status || "new"] || 0) + 1;
+  });
+  return {
+    total: leads.length,
+    byStatus,
+    recent: leads.slice(0, 10).map((l) => ({ name: l.name, phone: l.phone, status: l.status, createdAt: l.createdAt })),
+  };
+}
+function aiTool_getOrdersSummary() {
+  const orders = readJson(ORDERS_FILE);
+  const byStatus = {};
+  orders.forEach((o) => {
+    byStatus[o.status || "pending"] = (byStatus[o.status || "pending"] || 0) + 1;
+  });
+  const totalSales = orders.reduce((s, o) => s + Number(o.codAmount || o.cod || 0), 0);
+  return { total: orders.length, byStatus, totalSales };
+}
+function aiTool_getStaffSummary() {
+  const orders = readJson(ORDERS_FILE);
+  const byStaff = {};
+  orders.forEach((o) => {
+    const name = o.staff && o.staff.trim() ? o.staff.trim() : "Unassigned";
+    if (!byStaff[name]) byStaff[name] = { staff: name, orders: 0, totalSales: 0, delivered: 0, pending: 0, booked: 0 };
+    const bucket = byStaff[name];
+    bucket.orders += 1;
+    bucket.totalSales += Number(o.codAmount || o.cod || 0);
+    if (o.status === "delivered") bucket.delivered += 1;
+    else if (o.status === "booked") bucket.booked += 1;
+    else bucket.pending += 1;
+  });
+  return Object.values(byStaff).sort((a, b) => b.totalSales - a.totalSales);
+}
+
+const AI_TOOLS = [
+  { name: "get_low_stock", description: "Get D2C inventory items at or below their low-stock threshold.", input_schema: { type: "object", properties: {} } },
+  { name: "get_near_expiry", description: "Get inventory batches expiring within 60 days or already expired.", input_schema: { type: "object", properties: {} } },
+  { name: "get_leads_summary", description: "Get a summary of Meta lead ads leads by status, plus the 10 most recent.", input_schema: { type: "object", properties: {} } },
+  { name: "get_orders_summary", description: "Get order counts by status and total sales value.", input_schema: { type: "object", properties: {} } },
+  { name: "get_staff_summary", description: "Get per-staff order counts, sales, delivered/pending breakdown.", input_schema: { type: "object", properties: {} } },
+];
+const AI_TOOL_IMPL = {
+  get_low_stock: aiTool_getLowStock,
+  get_near_expiry: aiTool_getNearExpiry,
+  get_leads_summary: aiTool_getLeadsSummary,
+  get_orders_summary: aiTool_getOrdersSummary,
+  get_staff_summary: aiTool_getStaffSummary,
+};
+
+app.post("/api/ai/ask", requireAccess("ai_assistant"), async (req, res) => {
+  const question = String(req.body.question || "").trim().slice(0, 1000);
+  if (!question) return res.status(400).json({ error: "question is required" });
+  try {
+    const system = `You are the AIRX Ops internal system copilot for staff. You can call tools to look up live data
+about inventory, leads, orders, and staff performance. Always call a tool rather than guessing when the question is
+about current data. Answer concisely, in plain language, with numbers where relevant.`;
+    let messages = [{ role: "user", content: question }];
+    let finalText = "";
+    let configured = true;
+
+    for (let round = 0; round < 5; round++) {
+      const result = await callClaude({ system, messages, tools: AI_TOOLS, max_tokens: 800 });
+      if (!result.configured) {
+        finalText = result.text;
+        configured = false;
+        break;
+      }
+      const toolUses = (result.content || []).filter((b) => b.type === "tool_use");
+      const textBlocks = (result.content || []).filter((b) => b.type === "text");
+      if (!toolUses.length) {
+        finalText = textBlocks.map((b) => b.text).join("\n");
+        break;
+      }
+      messages.push({ role: "assistant", content: result.content });
+      const toolResults = toolUses.map((tu) => {
+        const impl = AI_TOOL_IMPL[tu.name];
+        let output;
+        try {
+          output = impl ? impl() : { error: "unknown tool" };
+        } catch (e) {
+          output = { error: e.message };
+        }
+        return { type: "tool_result", tool_use_id: tu.id, content: JSON.stringify(output) };
+      });
+      messages.push({ role: "user", content: toolResults });
+      if (round === 4) {
+        finalText = textBlocks.map((b) => b.text).join("\n") || "I looked into it but couldn't finish — try rephrasing your question.";
+      }
+    }
+    res.json({ answer: finalText, configured });
+  } catch (err) {
+    console.error("AI copilot error:", err);
+    res.status(500).json({ error: "assistant temporarily unavailable" });
+  }
+});
+
+// ---- Sales follow-up drafter (drafts only — staff reviews and sends manually) ----
+app.post("/api/ai/draft-followup", requireAccess("leads"), async (req, res) => {
+  const { name, phone, status, product } = req.body;
+  if (!phone) return res.status(400).json({ error: "phone required" });
+  try {
+    const system = `You write short, warm WhatsApp follow-up messages in Hindi/Hinglish (matching how an Indian D2C
+Ayurvedic brand's staff would actually message a customer) for AIRX PLUS Healthcare. Never invent product claims or
+prices you aren't given. Keep it under 40 words. Output ONLY the message text, nothing else.`;
+    const userMsg = `Draft a follow-up WhatsApp message for this lead:\nName: ${name || "unknown"}\nStatus: ${status || "new"}\n${
+      product ? `Interested in: ${product}\n` : ""
+    }Goal: move them toward placing an order, politely, no pressure.`;
+    const result = await callClaude({ system, messages: [{ role: "user", content: userMsg }], max_tokens: 300 });
+    if (!result.configured) return res.json({ draft: result.text, configured: false });
+    const textBlock = (result.content || []).find((b) => b.type === "text");
+    res.json({ draft: textBlock ? textBlock.text : "", configured: true });
+  } catch (err) {
+    console.error("AI draft-followup error:", err);
+    res.status(500).json({ error: "assistant temporarily unavailable" });
+  }
 });
 
 app.get("/health", (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
