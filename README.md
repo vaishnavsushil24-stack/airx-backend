@@ -22,7 +22,7 @@ few thousand records.
 ## Pending items — only you can do these (updated 2026-08-25)
 
 Everything buildable without new external permissions or business decisions
-has been built, tested, and deployed (through Phase 14 below). These four
+has been built, tested, and deployed (through Phase 15 below). These five
 are genuinely stuck on someone/something outside this server, so they're
 listed here together instead of scattered across sections:
 
@@ -49,6 +49,18 @@ listed here together instead of scattered across sections:
    this can be built correctly. Same situation as the Phase 3 commission
    engine — built as an admin-configurable placeholder until the real rule
    is known.
+5. **Retiring store.airxplus.com / admin.airxplus.com (the "Cutover" step,
+   `MLM_INTEGRATION_PLAN.md` Phase 5)** — everything those two legacy
+   systems do has now been rebuilt here (Phases 1–9 below), but switching
+   real distributor data-entry and payouts over to this server, and
+   shutting the old ones down, is a one-way business decision, not a code
+   change. It also directly affects distributor income, so before that
+   switch it's worth reconciling this system's commission math against a
+   real payout cycle from admin.airxplus.com (e.g. the ₹22,275.60 / PV
+   67,450 figures reviewed while planning this — see
+   `MLM_INTEGRATION_PLAN.md`) to confirm the numbers match exactly. This
+   wasn't flagged as a pending item before this round — noting it now
+   rather than ever cutting distributors over silently.
 
 Also worth a periodic manual check (no diagnostic endpoint for this one):
 Meta Lead Ads' "Standard Access" review on the `leads_retrieval` /
