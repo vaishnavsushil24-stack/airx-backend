@@ -224,6 +224,7 @@
     <div class="tab" id="tab-rewards"></div>
     <div class="tab" id="tab-cms"></div>
     <div class="tab" id="tab-user_management"></div>
+    <div class="tab" id="tab-social_media"></div>
   </main>
 </div>
 
@@ -262,6 +263,7 @@ const TABS = [
   { id: 'rewards', label: 'Rewards' },
   { id: 'cms', label: 'Content (CMS)' },
   { id: 'user_management', label: 'User Management' },
+  { id: 'social_media', label: 'Social Media' },
 ];
 
 // Mirrors server.js MODULE_KEYS — the set of modules a role's permissions
@@ -285,6 +287,7 @@ const MODULE_KEYS = [
   { key: 'rewards', label: 'Rewards' },
   { key: 'cms', label: 'Content (CMS)' },
   { key: 'user_management', label: 'User Management' },
+  { key: 'social_media', label: 'Social Media' },
 ];
 
 function toast(msg, type) {
@@ -434,7 +437,7 @@ function renderNav() {
 function switchTab(id) {
   document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === id));
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.id === 'tab-' + id));
-  const loaders = { dashboard: loadDashboard, members: loadMembers, masters: loadMasters, commission: loadCommission, payouts: loadPayouts, accounts: loadAccounts, reports: loadReports, products: loadProducts, franchises: loadFranchises, franchise_commission: loadFranchiseCommission, orders: loadOrders, leads: loadLeads, inventory: loadInventory, staff: loadStaff, ai_assistant: loadAiAssistant, rewards: loadRewards, cms: loadCms, user_management: loadUserManagement };
+  const loaders = { dashboard: loadDashboard, members: loadMembers, masters: loadMasters, commission: loadCommission, payouts: loadPayouts, accounts: loadAccounts, reports: loadReports, products: loadProducts, franchises: loadFranchises, franchise_commission: loadFranchiseCommission, orders: loadOrders, leads: loadLeads, inventory: loadInventory, staff: loadStaff, ai_assistant: loadAiAssistant, rewards: loadRewards, cms: loadCms, user_management: loadUserManagement, social_media: loadSocialMedia };
   if (loaders[id]) loaders[id]();
 }
 
@@ -2163,6 +2166,227 @@ async function loadUserManagement() {
 
   refreshRoles().catch(e => { document.getElementById('rolesTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
   refreshUsers().catch(e => { document.getElementById('usersTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+}
+
+// ---------- Social Media Hub (Phase 16) ----------
+async function loadSocialMedia() {
+  const el = document.getElementById('tab-social_media');
+  el.innerHTML = `
+    <div class="panel"><h2>Post Composer &amp; Calendar</h2>
+      <p class="muted">Plan and schedule Facebook/Instagram posts. Publishing goes live the moment Meta posting is connected (see README Phase 16) — until then posts save fine and just wait as "scheduled".</p>
+      <div class="row" style="flex-wrap:wrap">
+        <select id="sm_platform"><option value="facebook">Facebook</option><option value="instagram">Instagram</option></select>
+        <input id="sm_media" placeholder="Image URL (required for Instagram)" style="min-width:220px" />
+        <input id="sm_schedule" type="datetime-local" />
+      </div>
+      <textarea id="sm_caption" placeholder="Caption…" style="width:100%;min-height:70px;margin-top:8px"></textarea>
+      <div class="row" style="margin-top:8px">
+        <input id="sm_topic" placeholder="Topic/occasion for AI suggestion (optional)" style="min-width:200px" />
+        <input id="sm_product" placeholder="Featured product (optional)" style="min-width:160px" />
+        <button class="secondary" id="sm_suggestBtn">AI: Suggest caption</button>
+        <button id="sm_saveBtn">Save post</button>
+      </div>
+      <div id="smPostsTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
+    </div>
+    <div class="panel"><h2>Engagement Inbox — AI-answered comments &amp; DMs</h2>
+      <p class="muted">Every new comment/DM gets an AI-drafted reply automatically (using the Knowledge Base). Replies are <b>staff-approved before sending</b> by default — edit if needed, then Approve &amp; Send. Set <code>AI_AUTO_REPLY_SOCIAL=true</code> on Render to let the AI send replies on its own once you trust the tone/coverage.</p>
+      <div id="smEngagementTable"><div class="empty">Loading…</div></div>
+    </div>
+    <div class="panel"><h2>Meta Ads Manager</h2>
+      <p class="muted"><b>Real ad spend.</b> "Launch" only creates the campaign in Meta, paused (₹0 spent) — review it in Meta's own Ads Manager, then use "Activate" here (or in Meta) when you're ready to actually spend. Not yet tested against a live ad account — start with a small daily budget.</p>
+      <div class="row" style="flex-wrap:wrap">
+        <input id="ad_name" placeholder="Campaign name" style="min-width:160px" />
+        <select id="ad_objective">
+          <option value="OUTCOME_ENGAGEMENT">Engagement</option>
+          <option value="OUTCOME_TRAFFIC">Traffic</option>
+          <option value="OUTCOME_SALES">Sales</option>
+          <option value="OUTCOME_AWARENESS">Awareness</option>
+        </select>
+        <input id="ad_budget" type="number" placeholder="Daily budget (₹)" style="max-width:150px" />
+        <select id="ad_gender"><option value="all">All genders</option><option value="male">Male</option><option value="female">Female</option></select>
+        <input id="ad_ageMin" type="number" placeholder="Age min" style="max-width:90px" value="18" />
+        <input id="ad_ageMax" type="number" placeholder="Age max" style="max-width:90px" value="65" />
+      </div>
+      <div class="row" style="margin-top:8px">
+        <input id="ad_media" placeholder="Ad image URL" style="min-width:220px" />
+      </div>
+      <textarea id="ad_caption" placeholder="Ad copy…" style="width:100%;min-height:60px;margin-top:8px"></textarea>
+      <div class="row" style="margin-top:8px"><button id="ad_saveBtn">Save draft campaign</button></div>
+      <div id="adCampaignsTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
+    </div>
+  `;
+
+  document.getElementById('sm_suggestBtn').addEventListener('click', async () => {
+    const btn = document.getElementById('sm_suggestBtn');
+    btn.disabled = true; btn.textContent = 'Thinking…';
+    try {
+      const result = await api('/api/social/posts/suggest-caption', { method: 'POST', body: JSON.stringify({
+        platform: document.getElementById('sm_platform').value,
+        topic: document.getElementById('sm_topic').value,
+        productName: document.getElementById('sm_product').value,
+      }) });
+      if (result.configured === false) toast(result.caption || 'AI assistant not configured', 'error');
+      else { document.getElementById('sm_caption').value = result.caption; toast('Draft caption ready — review before saving', 'success'); }
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+    finally { btn.disabled = false; btn.textContent = 'AI: Suggest caption'; }
+  });
+
+  document.getElementById('sm_saveBtn').addEventListener('click', async () => {
+    const caption = document.getElementById('sm_caption').value.trim();
+    if (!caption) return toast('Caption required', 'error');
+    try {
+      await api('/api/social/posts', { method: 'POST', body: JSON.stringify({
+        platform: document.getElementById('sm_platform').value,
+        caption,
+        mediaUrl: document.getElementById('sm_media').value.trim(),
+        scheduledAt: document.getElementById('sm_schedule').value ? new Date(document.getElementById('sm_schedule').value).toISOString() : null,
+      }) });
+      document.getElementById('sm_caption').value = '';
+      document.getElementById('sm_media').value = '';
+      document.getElementById('sm_schedule').value = '';
+      toast('Post saved', 'success');
+      refreshPosts();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+
+  async function refreshPosts() {
+    const posts = await api('/api/social/posts');
+    const badge = s => `<span class="badge ${s === 'published' ? 'active' : s === 'failed' ? 'inactive' : ''}">${esc(s)}</span>`;
+    document.getElementById('smPostsTable').innerHTML = posts.length
+      ? `<table><thead><tr><th>Platform</th><th>Caption</th><th>Scheduled</th><th>Status</th><th></th></tr></thead><tbody>
+          ${posts.map(p => `<tr>
+            <td>${esc(p.platform)}</td>
+            <td style="max-width:280px">${esc((p.caption || '').slice(0, 90))}${p.caption && p.caption.length > 90 ? '…' : ''}</td>
+            <td>${esc((p.scheduledAt || '').slice(0, 16).replace('T', ' ')) || '—'}</td>
+            <td>${badge(p.status)}${p.error ? `<div class="muted" style="font-size:11px">${esc(p.error)}</div>` : ''}</td>
+            <td>
+              ${p.status !== 'published' ? `<button class="secondary" data-pub="${p.id}" style="padding:3px 8px;font-size:11px">Publish now</button>
+              <button class="danger" data-delpost="${p.id}" style="padding:3px 8px;font-size:11px">Delete</button>` : ''}
+            </td>
+          </tr>`).join('')}
+        </tbody></table>` : '<div class="empty">No posts yet.</div>';
+    document.querySelectorAll('[data-pub]').forEach(b => b.addEventListener('click', async () => {
+      try {
+        const r = await api('/api/social/posts/' + b.dataset.pub + '/publish', { method: 'POST' });
+        toast(r.configured === false ? r.message : 'Published', r.configured === false ? 'error' : 'success');
+        refreshPosts();
+      } catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+    document.querySelectorAll('[data-delpost]').forEach(b => b.addEventListener('click', async () => {
+      try { await api('/api/social/posts/' + b.dataset.delpost, { method: 'DELETE' }); refreshPosts(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+  }
+
+  async function refreshEngagement() {
+    const rows = await api('/api/social/engagement');
+    document.getElementById('smEngagementTable').innerHTML = rows.length
+      ? rows.map(r => `
+        <div style="border:1px solid var(--border,#333);border-radius:8px;padding:10px;margin-bottom:8px">
+          <div class="row" style="justify-content:space-between">
+            <span><b>${esc(r.platform)} ${esc(r.type)}</b> — ${esc(r.fromName) || 'unknown'}</span>
+            <span class="badge ${r.status === 'pending' ? '' : r.status === 'dismissed' ? 'inactive' : 'active'}">${esc(r.status)}</span>
+          </div>
+          <p style="margin:6px 0">"${esc(r.message)}"</p>
+          ${r.status === 'pending' ? `
+            <textarea data-reply="${r.id}" style="width:100%;min-height:50px">${esc(r.aiDraftReply)}</textarea>
+            <div class="row" style="margin-top:6px">
+              <button class="secondary" data-redraft="${r.id}" style="padding:3px 8px;font-size:11px">Regenerate draft</button>
+              <button data-send="${r.id}" style="padding:3px 8px;font-size:11px">Approve &amp; Send</button>
+              <button class="danger" data-dismiss="${r.id}" style="padding:3px 8px;font-size:11px">Dismiss</button>
+            </div>` : `<p class="muted" style="font-size:12px">Reply: "${esc(r.aiDraftReply)}"</p>`}
+        </div>`).join('')
+      : '<div class="empty">No comments/DMs yet — they will appear here once Meta engagement webhooks are connected.</div>';
+    document.querySelectorAll('[data-redraft]').forEach(b => b.addEventListener('click', async () => {
+      try { await api('/api/social/engagement/' + b.dataset.redraft + '/draft', { method: 'POST' }); refreshEngagement(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+    document.querySelectorAll('[data-send]').forEach(b => b.addEventListener('click', async () => {
+      const textarea = document.querySelector(`[data-reply="${b.dataset.send}"]`);
+      try {
+        const r = await api('/api/social/engagement/' + b.dataset.send + '/send', { method: 'POST', body: JSON.stringify({ message: textarea ? textarea.value : undefined }) });
+        toast(r.configured === false ? r.message : 'Reply sent', r.configured === false ? 'error' : 'success');
+        refreshEngagement();
+      } catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+    document.querySelectorAll('[data-dismiss]').forEach(b => b.addEventListener('click', async () => {
+      try { await api('/api/social/engagement/' + b.dataset.dismiss + '/dismiss', { method: 'POST' }); refreshEngagement(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+  }
+
+  document.getElementById('ad_saveBtn').addEventListener('click', async () => {
+    const name = document.getElementById('ad_name').value.trim();
+    const dailyBudget = document.getElementById('ad_budget').value;
+    if (!name || !dailyBudget) return toast('Campaign name and daily budget required', 'error');
+    try {
+      await api('/api/ads/campaigns', { method: 'POST', body: JSON.stringify({
+        name, objective: document.getElementById('ad_objective').value, dailyBudget,
+        caption: document.getElementById('ad_caption').value.trim(),
+        mediaUrl: document.getElementById('ad_media').value.trim(),
+        ageMin: document.getElementById('ad_ageMin').value, ageMax: document.getElementById('ad_ageMax').value,
+        genders: document.getElementById('ad_gender').value,
+      }) });
+      document.getElementById('ad_name').value = '';
+      document.getElementById('ad_budget').value = '';
+      document.getElementById('ad_caption').value = '';
+      document.getElementById('ad_media').value = '';
+      toast('Draft campaign saved', 'success');
+      refreshCampaigns();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+
+  async function refreshCampaigns() {
+    const campaigns = await api('/api/ads/campaigns');
+    document.getElementById('adCampaignsTable').innerHTML = campaigns.length
+      ? `<table><thead><tr><th>Name</th><th>Objective</th><th>Daily budget</th><th>Status</th><th></th></tr></thead><tbody>
+          ${campaigns.map(c => `<tr>
+            <td>${esc(c.name)}</td><td>${esc(c.objective)}</td><td>₹${esc(String(c.dailyBudget))}</td>
+            <td><span class="badge ${c.status === 'active' ? 'active' : c.status === 'failed' ? 'inactive' : ''}">${esc(c.status)}</span>${c.error ? `<div class="muted" style="font-size:11px">${esc(c.error)}</div>` : ''}</td>
+            <td>
+              ${c.status === 'draft' ? `<button class="secondary" data-launch="${c.id}" style="padding:3px 8px;font-size:11px">Launch (paused)</button>
+              <button class="danger" data-delcamp="${c.id}" style="padding:3px 8px;font-size:11px">Delete</button>` : ''}
+              ${c.status === 'created_paused' || c.status === 'paused' ? `<button data-activate="${c.id}" style="padding:3px 8px;font-size:11px">Activate (spends money)</button>` : ''}
+              ${c.status === 'active' ? `<button class="secondary" data-pause="${c.id}" style="padding:3px 8px;font-size:11px">Pause</button>` : ''}
+              ${c.metaCampaignId ? `<button class="secondary" data-insights="${c.id}" style="padding:3px 8px;font-size:11px">Insights</button>` : ''}
+            </td>
+          </tr>`).join('')}
+        </tbody></table>` : '<div class="empty">No campaigns yet.</div>';
+    document.querySelectorAll('[data-launch]').forEach(b => b.addEventListener('click', async () => {
+      try {
+        const r = await api('/api/ads/campaigns/' + b.dataset.launch + '/launch', { method: 'POST' });
+        toast(r.configured === false ? r.message : 'Created in Meta, paused — review before activating', r.configured === false ? 'error' : 'success');
+        refreshCampaigns();
+      } catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+    document.querySelectorAll('[data-activate]').forEach(b => b.addEventListener('click', async () => {
+      const ok = window.prompt('This starts real ad spend. Type LAUNCH to confirm:');
+      if (ok !== 'LAUNCH') return;
+      try {
+        const r = await api('/api/ads/campaigns/' + b.dataset.activate + '/activate', { method: 'POST', body: JSON.stringify({ confirm: true }) });
+        toast(r.configured === false ? 'Not connected yet' : 'Campaign is now live', r.configured === false ? 'error' : 'success');
+        refreshCampaigns();
+      } catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+    document.querySelectorAll('[data-pause]').forEach(b => b.addEventListener('click', async () => {
+      try { await api('/api/ads/campaigns/' + b.dataset.pause + '/pause', { method: 'POST' }); refreshCampaigns(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+    document.querySelectorAll('[data-delcamp]').forEach(b => b.addEventListener('click', async () => {
+      try { await api('/api/ads/campaigns/' + b.dataset.delcamp, { method: 'DELETE' }); refreshCampaigns(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+    document.querySelectorAll('[data-insights]').forEach(b => b.addEventListener('click', async () => {
+      try {
+        const r = await api('/api/ads/campaigns/' + b.dataset.insights + '/insights');
+        toast(r.configured === false ? 'Not connected yet' : JSON.stringify(r), r.configured === false ? 'error' : 'success');
+      } catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+  }
+
+  refreshPosts().catch(e => { document.getElementById('smPostsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+  refreshEngagement().catch(e => { document.getElementById('smEngagementTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+  refreshCampaigns().catch(e => { document.getElementById('adCampaignsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
 }
 
 // ---------- Boot ----------
