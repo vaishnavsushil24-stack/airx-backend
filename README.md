@@ -703,3 +703,83 @@ change in this phase — zero regressions. Every new/changed endpoint was
 also re-verified live against the deployed Render API after push,
 including confirming the master `x-api-key` still reaches every
 newly-rewired `franchise-stock` route exactly as before.
+
+## Phase 10 — surface Shopify, Orders, Leads, Inventory, Staff in admin.html (2026-08-25)
+
+This phase didn't add new backend capability so much as switch on and
+finish exposing capability that was already fully coded from an earlier
+AIRX Ops build (Shopify OAuth sync/fulfillment, Meta Lead Ads capture,
+India Post booking/tracking, D2C inventory with auto-decrement, staff
+performance summary, WhatsApp Cloud API automation) but had zero
+representation in this admin.html dashboard — the one actually in use.
+An audit of server.js turned up ~18 routes that were fully built and
+tested in an earlier session but simply never wired into any UI.
+
+**Shopify — went from "coded, never connected" to live.** `SHOPIFY_API_KEY`
+/ `SHOPIFY_API_SECRET` / `SHOPIFY_SHOP` were already set in Render's
+environment, but the OAuth install handshake (`/shopify/install` →
+Shopify → `/shopify/callback`) had never actually been completed, so
+`shopifyFetch()` always failed with "Shopify not connected yet." Since
+the browser already had an authorized Shopify admin session, visiting
+`/shopify/install` completed the handshake with no password entry
+involved — verified live by syncing all 14 existing Shopify orders into
+AIRX Ops on the first pull.
+
+**Bug found and fixed: JSON-file storage wasn't on the persistent disk.**
+A post-deploy smoke test showed the 14 just-synced orders — and the
+Shopify connection itself — had vanished after the very next push. Root
+cause: `LEADS_FILE` / `ORDERS_FILE` / `SHOP_FILE` / `INDIAPOST_FILE` /
+`INVENTORY_FILE` / `PROXY_STATUS_FILE` all resolved to `__dirname/data`
+(the container's own throwaway filesystem) instead of `DATA_DIR` (the
+Render Persistent Disk mount), unlike `db.js`'s SQLite database which
+was already correctly wired to `DATA_DIR`. Every deploy — including
+routine future ones — was silently wiping D2C orders, leads, inventory,
+and forcing a Shopify reconnect. Fixed by pointing all six at the same
+`DATA_DIR` `db.js` already uses; reconnected Shopify once more afterward
+and confirmed the data survived a further live regression pass.
+
+**Auth:** the 18 routes above moved from the old blanket `requireApiKey`
+to `requireAccess(moduleKey)`, adding four new module keys — `orders`,
+`leads`, `inventory`, `staff` — to the same permission system built in
+Phase 8. The master `x-api-key` still works everywhere unchanged; staff
+logins can now be scoped to just Orders, or just Inventory, etc.
+
+**Automatic Shopify sync:** a `setInterval` loop (every 5 minutes, no
+new dependency) calls the same `syncShopifyOrders()` function the manual
+button uses, so new Shopify orders land in AIRX Ops without anyone
+clicking anything. It no-ops quietly if Shopify isn't connected yet,
+so a fresh deploy before reconnecting doesn't spam error logs.
+
+**admin.html — four new tabs:**
+- **Orders** — one list for both Shopify and WhatsApp-sourced orders,
+  a manual "Sync from Shopify" button, search/status/source filters, a
+  manual-order-entry form, per-order "Book (India Post)" (assigns a real
+  Speed Post barcode and auto-decrements inventory), "Mark delivered,"
+  and three WhatsApp trigger buttons (COD confirm, tracking update,
+  delivery follow-up/reorder nudge) that call the existing
+  `sendWhatsApp()` scaffolding.
+- **Leads** — Meta/Facebook Lead Ads captured automatically via
+  `/webhook/meta`, with a status dropdown (new → contacted → converted
+  → lost) per row.
+- **D2C Inventory** — separate from the MLM franchise-warehouse stock
+  table; this is the storefront's own SKU stock, with low-stock rows
+  highlighted and auto-decrement on order booking.
+- **Staff Performance** — per-staff orders/sales/delivered/pending,
+  read straight from the Orders data so no one has to compile it by hand.
+
+**The one still-open gap:** WhatsApp automation (COD confirmation,
+tracking updates, delivery follow-up/reorder nudges — the single
+highest-leverage lever for an Ayurvedic D2C repeat-purchase business)
+is fully coded but inert — `WHATSAPP_TOKEN` / `WHATSAPP_PHONE_ID` aren't
+set, so `sendWhatsApp()` currently just logs and returns `{skipped:true}`
+(verified live — it does this cleanly, no crash). Turning it on needs a
+WhatsApp Business Account created in Meta Business Manager and three
+message templates (`cod_confirmation`, `tracking_update`,
+`delivery_followup`) approved by Meta — an account-ownership step tied
+to the business's identity, not something that can be done by password
+or API key alone.
+
+Live-verified after push: 20/20 checks on the first pass (all master-key
+regression + new-route + auth-boundary checks), then a further 10/10
+after the `DATA_DIR` fix and Shopify reconnect, including confirming the
+synced Shopify orders survived the fix being deployed.
