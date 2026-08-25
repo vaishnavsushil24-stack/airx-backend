@@ -19,6 +19,47 @@ Leads and orders are stored in `data/leads.json` / `data/orders.json` — good
 enough to start today; swap for a real database later if volume grows past a
 few thousand records.
 
+## Pending items — only you can do these (updated 2026-08-25)
+
+Everything buildable without new external permissions or business decisions
+has been built, tested, and deployed (through Phase 14 below). These four
+are genuinely stuck on someone/something outside this server, so they're
+listed here together instead of scattered across sections:
+
+1. **India Post IP whitelisting** — still not approved on India Post's side.
+   Submit `64.227.141.75` on `/customer-selfservice/whitelist-ip-address`
+   (UAT Environment field). Re-tested today (2026-08-25) and it's still
+   blocked with the same signature as before — full detail in section 4a.
+   Once approved, real parcel booking + tracking works immediately, no code
+   changes needed.
+2. **WhatsApp automation activation** — needs a WhatsApp Business Account in
+   Meta Business Manager: a Phone Number ID + permanent access token (added
+   to Render as `WHATSAPP_PHONE_ID` / `WHATSAPP_TOKEN`), plus four message
+   templates approved by Meta: `cod_confirmation`, `tracking_update`,
+   `delivery_followup`, and `replenishment_reminder` (new in Phase 14). See
+   section 7.
+3. **Abandoned-cart recovery** — needs you to re-approve the Shopify app
+   with one extra permission (`read_checkouts`) by revisiting
+   `/shopify/install` and clicking through Shopify's consent screen again.
+   Deliberately not something this server does on its own — an OAuth
+   consent screen always needs a human click.
+4. **Referral bridge (retail customers → distributor signups)** — needs you
+   to define the actual referral/commission rule (e.g. "give a customer a
+   ₹X credit or Y% off when someone they refer places a first order") before
+   this can be built correctly. Same situation as the Phase 3 commission
+   engine — built as an admin-configurable placeholder until the real rule
+   is known.
+
+Also worth a periodic manual check (no diagnostic endpoint for this one):
+Meta Lead Ads' "Standard Access" review on the `leads_retrieval` /
+`pages_manage_metadata` permissions (section 2) — status wasn't
+re-confirmed this round.
+
+Everything else — AI Agent (Phase 13), replenishment reminders (Phase 14),
+inventory/batch/expiry tracking, staff performance, multi-user admin auth,
+and the rest of the MLM feature set — is live and already working
+autonomously.
+
 ## 1. Deploy it (10 minutes, free tier is enough to start)
 
 Easiest option: **Render.com** (Railway or Fly.io work the same way).
@@ -155,7 +196,10 @@ expect from a server that resets connections from any IP that isn't on its
 allowlist yet. **64.227.141.75 needs to be submitted on
 `/customer-selfservice/whitelist-ip-address`** (UAT Environment field) -
 once India Post approves it, bookings should start working immediately with
-no further code changes.
+no further code changes. Re-checked 2026-08-25 via both diagnostic
+endpoints below - same signature as before (proxy TCP/CONNECT works fine,
+TLS handshake to `test.cept.gov.in` still resets), so this is **still
+pending on India Post's side**, not a regression.
 
 Two small diagnostic endpoints exist on this server for verifying the proxy
 chain without ever touching the real `AIRX_API_KEY` - both guarded by a
