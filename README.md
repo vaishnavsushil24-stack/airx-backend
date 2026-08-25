@@ -1054,6 +1054,49 @@ matched item. All existing test suites
 (`test_phase3/6/7/8/9.js`) were re-run after this change — zero
 regressions.
 
+## Phase 15 — full data backup / export (2026-08-25)
+
+**Why:** while re-checking the India Post proxy this round, re-reading the
+`DATA_DIR` comment in `server.js` surfaced a real incident from an earlier
+phase — the flat JSON files (leads/orders/inventory) were originally
+pointed at the container's own ephemeral folder instead of the Render
+Persistent Disk, so a deploy silently wiped 14 synced Shopify orders and
+the Shopify connection itself before that was caught and fixed. That's
+already resolved (both `server.js` and `db.js` now consistently use
+`DATA_DIR`, which is set to the mounted disk at `/var/data`, confirmed via
+Render's Disks page — 1 GB, daily snapshots kept 7 days). Disk snapshots
+cover disaster recovery, but there was still no way for the founder to
+grab a copy of the actual data on demand without going through Render's
+dashboard — this phase adds that, and needed no new external permission,
+so it was built the same way as Phase 14.
+
+- **`GET /api/backup/export`** (`requireAccess("user_management")` — the
+  most privileged module key in the app, since a full export includes
+  customer names, phone numbers and order history) returns one downloadable
+  JSON file containing leads, orders, inventory, the AI Agent's Knowledge
+  Base, dismissed-replenishment records, and every MLM/SQLite table
+  (products, franchises, members, commissions, payouts, etc.).
+- **Live secrets are deliberately left out.** The Shopify and India Post
+  connection files hold real OAuth tokens (`accessToken` /
+  `refreshToken`), not just config — the export includes only
+  `{ shop, connected, connectedAt }` / `{ connected, expiresAt,
+  barcodeSeq }` for each, never the token values themselves, so the backup
+  file is safe to hand to an accountant or store off-Render without
+  handing over live API access too.
+- **Admin UI**: a "Data Backup" panel in the User Management tab with a
+  single **Download full backup (.json)** button — fetches with the
+  logged-in session's own credentials (API key or Bearer token, whichever
+  is active) and triggers a normal browser file download, named
+  `airx-backup-<date>.json`.
+
+A functional test (`test_phase15.js`, 7 assertions) isolates the
+redaction logic specifically — asserting a live Shopify access token and
+India Post access/refresh tokens never appear anywhere in the JSON output
+for both connected and not-yet-connected states, plus that the
+non-secret fields (shop domain, barcode sequence) still come through
+correctly. All existing test suites (`test_phase3/6/7/8/9/14.js`) were
+re-run after this change — zero regressions.
+
 **Next candidates (not yet started), largely growth-focused per the
 founder's Ayurvedic D2C directive:** WhatsApp automation activation
 (blocked on Meta Business Manager setup, not code), abandoned-cart

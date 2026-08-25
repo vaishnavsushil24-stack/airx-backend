@@ -3762,6 +3762,77 @@ prices you aren't given. Keep it under 40 words. Output ONLY the message text, n
   }
 });
 
+// ---------------------------------------------------------------------
+// Phase 15 — full data backup / export (2026-08-25)
+// ---------------------------------------------------------------------
+// The flat JSON files (leads/orders/inventory/etc.) and the SQLite database
+// already live on the Render Persistent Disk (/var/data), which Render
+// snapshots once a day and keeps for 7 days - that protects against disk
+// loss. This is a *different* kind of backup: a human-downloadable single
+// JSON file, available on demand from the admin UI, useful for keeping an
+// off-Render copy, handing data to an accountant, or opening in Excel.
+// Gated behind requireAccess("user_management") - the most privileged
+// module key in the app - since a full export includes customer names,
+// phone numbers and order history and shouldn't be available to every
+// role. Live secrets (Shopify/India Post OAuth tokens) are deliberately
+// left out; only their connection status is included.
+function readJsonSafe(file, fallback) {
+  try {
+    if (!fs.existsSync(file)) return fallback;
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (err) {
+    console.error(`Backup export: failed to read ${file}:`, err.message);
+    return fallback;
+  }
+}
+
+function dumpAllSqliteTables() {
+  try {
+    const tables = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+      .all()
+      .map((t) => t.name);
+    const out = {};
+    for (const table of tables) {
+      try {
+        out[table] = db.prepare(`SELECT * FROM "${table}"`).all();
+      } catch (err) {
+        out[table] = { error: err.message };
+      }
+    }
+    return out;
+  } catch (err) {
+    console.error("Backup export: SQLite dump failed:", err.message);
+    return { error: err.message };
+  }
+}
+
+app.get("/api/backup/export", requireAccess("user_management"), (req, res) => {
+  try {
+    const shop = readJsonSafe(SHOP_FILE, {});
+    const indiapost = readJsonSafe(INDIAPOST_FILE, {});
+    const backup = {
+      exportedAt: new Date().toISOString(),
+      source: "AIRX Ops backend",
+      leads: readJsonSafe(LEADS_FILE, []),
+      orders: readJsonSafe(ORDERS_FILE, []),
+      inventory: readJsonSafe(INVENTORY_FILE, []),
+      knowledgeBase: readJsonSafe(KB_FILE, []),
+      replenishmentDismissed: readJsonSafe(REPLENISH_DISMISSED_FILE, []),
+      shopifyConnection: { shop: shop.shop || null, connected: !!shop.accessToken, connectedAt: shop.connectedAt || null },
+      indiaPostConnection: { connected: !!indiapost.accessToken, expiresAt: indiapost.expiresAt || null, barcodeSeq: indiapost.barcodeSeq || null },
+      mlm: dumpAllSqliteTables(),
+    };
+    const filename = `airx-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader("Content-Type", "application/json");
+    res.send(JSON.stringify(backup, null, 2));
+  } catch (err) {
+    console.error("Backup export error:", err);
+    res.status(500).json({ error: "backup export failed" });
+  }
+});
+
 app.get("/health", (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
 app.listen(PORT, () => {
