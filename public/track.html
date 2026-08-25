@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Track Your Order — AIRX PLUS</title>
+<style>
+  :root {
+    --green: #14532d;
+    --green-light: #16a34a;
+    --bg: #f6f8f4;
+    --card: #ffffff;
+    --border: #e2e8dd;
+    --text: #1f2a1f;
+    --muted: #6b7a6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 24px 16px 60px;
+  }
+  .wrap { max-width: 520px; margin: 0 auto; }
+  .brand {
+    text-align: center;
+    margin-bottom: 24px;
+  }
+  .brand h1 {
+    font-size: 22px;
+    margin: 0 0 4px;
+    color: var(--green);
+    letter-spacing: 0.5px;
+  }
+  .brand p { margin: 0; color: var(--muted); font-size: 14px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    margin-bottom: 16px;
+  }
+  label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: var(--text); }
+  .row { display: flex; gap: 8px; }
+  input[type="tel"] {
+    flex: 1;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    font-size: 16px;
+    outline: none;
+  }
+  input[type="tel"]:focus { border-color: var(--green-light); }
+  button {
+    background: var(--green);
+    color: #fff;
+    border: none;
+    padding: 12px 20px;
+    border-radius: 10px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.6; cursor: not-allowed; }
+  button:hover:not(:disabled) { background: var(--green-light); }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .msg { font-size: 14px; padding: 12px 14px; border-radius: 10px; margin-bottom: 16px; }
+  .msg.error { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
+  .msg.empty { background: #fffbeb; color: #92400e; border: 1px solid #fde68a; }
+  .order {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin-bottom: 12px;
+    background: var(--card);
+  }
+  .order-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .product { font-weight: 700; font-size: 15px; }
+  .date { font-size: 12px; color: var(--muted); }
+  .status {
+    display: inline-block;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 3px 10px;
+    border-radius: 999px;
+    text-transform: capitalize;
+  }
+  .status.delivered { background: #dcfce7; color: #166534; }
+  .status.pending, .status.processing, .status.confirmed { background: #fef9c3; color: #854d0e; }
+  .status.cancelled, .status.returned { background: #fee2e2; color: #991b1b; }
+  .status.shipped, .status.in_transit, .status.dispatched { background: #dbeafe; color: #1e40af; }
+  .detail-row { font-size: 13px; color: var(--text); margin-top: 4px; }
+  .detail-row span.label { color: var(--muted); }
+  .barcode { font-family: monospace; font-size: 13px; background: #f1f5f1; padding: 2px 8px; border-radius: 6px; }
+  .footer { text-align: center; font-size: 12px; color: var(--muted); margin-top: 24px; }
+  .spinner {
+    display: inline-block;
+    width: 14px; height: 14px;
+    border: 2px solid rgba(255,255,255,0.5);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    vertical-align: middle;
+    margin-right: 6px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">
+    <h1>AIRX PLUS</h1>
+    <p>Track your Ayurvedic order</p>
+  </div>
+
+  <div class="card">
+    <label for="mobile">Registered mobile number</label>
+    <div class="row">
+      <input type="tel" id="mobile" placeholder="10-digit mobile number" maxlength="10" inputmode="numeric" autocomplete="tel" />
+      <button id="trackBtn">Track</button>
+    </div>
+    <div class="hint">Enter the mobile number used while placing your order.</div>
+  </div>
+
+  <div id="results"></div>
+
+  <div class="footer">AIRX PLUS Healthcare Private Limited</div>
+</div>
+
+<script>
+  const mobileInput = document.getElementById("mobile");
+  const trackBtn = document.getElementById("trackBtn");
+  const results = document.getElementById("results");
+
+  mobileInput.addEventListener("input", () => {
+    mobileInput.value = mobileInput.value.replace(/\D/g, "").slice(0, 10);
+  });
+  mobileInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") trackOrder();
+  });
+  trackBtn.addEventListener("click", trackOrder);
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    }[c]));
+  }
+
+  function statusClass(status) {
+    return String(status || "").toLowerCase().replace(/\s+/g, "_");
+  }
+
+  function fmtDate(iso) {
+    if (!iso) return "";
+    const d = new Date(iso);
+    if (isNaN(d)) return iso;
+    return d.toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
+  }
+
+  async function trackOrder() {
+    const mobile = mobileInput.value.trim();
+    results.innerHTML = "";
+
+    if (mobile.length !== 10) {
+      results.innerHTML = '<div class="msg error">Please enter a valid 10-digit mobile number.</div>';
+      return;
+    }
+
+    trackBtn.disabled = true;
+    trackBtn.innerHTML = '<span class="spinner"></span>Searching...';
+
+    try {
+      const res = await fetch("/api/public/track?mobile=" + encodeURIComponent(mobile));
+      const data = await res.json();
+
+      if (res.status === 429) {
+        results.innerHTML = '<div class="msg error">' + esc(data.error || "Too many attempts. Please try again later.") + "</div>";
+        return;
+      }
+      if (!res.ok) {
+        results.innerHTML = '<div class="msg error">' + esc(data.error || "Something went wrong. Please try again.") + "</div>";
+        return;
+      }
+
+      const orders = data.orders || [];
+      if (!orders.length) {
+        results.innerHTML = '<div class="msg empty">No orders found for this mobile number. If you just placed an order, please check back in a few minutes.</div>';
+        return;
+      }
+
+      results.innerHTML = orders.map((o) => `
+        <div class="order">
+          <div class="order-top">
+            <div>
+              <div class="product">${esc(o.product || "Order")}</div>
+              <div class="date">${esc(fmtDate(o.createdAt))}</div>
+            </div>
+            <span class="status ${esc(statusClass(o.status))}">${esc(o.status || "pending")}</span>
+          </div>
+          ${o.codAmount != null ? `<div class="detail-row"><span class="label">COD Amount:</span> ₹${esc(o.codAmount)}</div>` : ""}
+          ${o.trackingBarcode ? `<div class="detail-row"><span class="label">Tracking ID:</span> <span class="barcode">${esc(o.trackingBarcode)}</span></div>` : ""}
+          ${o.latestEvent ? `<div class="detail-row"><span class="label">Latest update:</span> ${esc(o.latestEvent)}</div>` : ""}
+        </div>
+      `).join("");
+    } catch (err) {
+      results.innerHTML = '<div class="msg error">Could not reach the server. Please check your connection and try again.</div>';
+    } finally {
+      trackBtn.disabled = false;
+      trackBtn.textContent = "Track";
+    }
+  }
+</script>
+</body>
+</html>
