@@ -783,3 +783,59 @@ Live-verified after push: 20/20 checks on the first pass (all master-key
 regression + new-route + auth-boundary checks), then a further 10/10
 after the `DATA_DIR` fix and Shopify reconnect, including confirming the
 synced Shopify orders survived the fix being deployed.
+
+## Phase 11 — public order-tracking page, no login (2026-08-25)
+
+**Why:** the single biggest source of avoidable staff load in a COD-first
+D2C business is "where is my order" messages. This closes that loop
+without adding any headcount.
+
+- **`GET /api/public/track?mobile=`** — a new route deliberately placed
+  *outside* `requireAccess`/`requireApiKey`, since customers have no
+  login and shouldn't need one. Normalizes the `mobile` query param to
+  its last 10 digits, 400s on anything else, and looks up orders by
+  exact mobile match from the same `ORDERS_FILE` the admin Orders tab
+  uses. Returns up to 5 matches with a deliberately minimal field set
+  (`createdAt`, `product`, `status`, `codAmount`, `trackingBarcode`,
+  `latestEvent`) — no name, address, or the mobile number itself, so a
+  guessed number can't harvest anything beyond order status.
+- **Threat model, stated plainly:** looking someone's order up by their
+  own mobile number (the same number the courier already has) is a
+  proportionate trade for a small COD-grocery-sized D2C business — not
+  the right trade for anything carrying financial or medical data. A
+  full login system was rejected on purpose: it would push customers
+  back to messaging staff on WhatsApp, defeating the entire point of a
+  self-serve tracking page.
+- **Rate limiting:** a hand-rolled in-memory per-IP limiter (15 lookups
+  per 10-minute window, no new npm dependency — `express-rate-limit`
+  isn't installable in this environment) caps enumeration attempts.
+  **Bug found and fixed during live verification:** the limiter was
+  first keyed on the raw `x-forwarded-for` header string, but Render's
+  edge can vary the proxy hop chain in that header per request even for
+  the same client, so the limiter's Map key never matched twice and it
+  silently never tripped (confirmed live: 17 rapid requests, zero
+  429s). Fixed by keying on just the first (client) IP in the chain;
+  re-verified live — now trips reliably (confirmed at request #16, i.e.
+  immediately after the 15th allowed lookup).
+- **`public/track.html`** — new customer-facing page (mobile-number
+  input, one button, no login) styled to match the AIRX PLUS brand,
+  automatically served at `/track.html` via the existing
+  `express.static("public")` mount (no new static-serving code needed).
+  Renders each order's product, status (color-coded badge), COD amount,
+  India Post tracking barcode, and latest tracking event.
+
+Live-verified after push: real order lookup by mobile returns the
+correct order with no PII beyond what's listed above, invalid/missing
+mobile returns 400, a valid-but-unmatched mobile returns an empty list
+(not a 404 — avoids confirming/denying whether a number has ever
+ordered), and the rate limiter trips at the correct threshold.
+
+**Next candidates (not yet started), largely growth-focused per the
+founder's Ayurvedic D2C directive:** WhatsApp automation activation
+(blocked on Meta Business Manager setup, not code), a low-stock banner
+on the admin Dashboard surfacing the D2C Inventory data already being
+tracked, repeat-purchase/replenishment WhatsApp nudges timed to typical
+Ayurvedic-formulation consumption cycles, abandoned-cart recovery for
+Shopify checkouts, batch/expiry tracking for formulations, and a
+retail-customer-to-distributor referral bridge tying the D2C storefront
+into the existing MLM structure.
