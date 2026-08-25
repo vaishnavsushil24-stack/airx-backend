@@ -830,12 +830,26 @@ mobile returns 400, a valid-but-unmatched mobile returns an empty list
 (not a 404 — avoids confirming/denying whether a number has ever
 ordered), and the rate limiter trips at the correct threshold.
 
+## Phase 11b — low-stock banner on the Dashboard (2026-08-25)
+
+`loadDashboard()` now also fetches `/api/inventory` and, if any item's
+`stock` is at or below its `lowStockThreshold`, shows a red-highlighted
+banner listing SKU/name/stock/alert-at right above the member/BV summary
+cards — so a low-stock condition is visible the moment anyone opens the
+Dashboard, no separate check required. Fails silently (banner just
+doesn't show) for a staff user without the `inventory` permission, or on
+any fetch error, so it can never break the rest of the dashboard.
+
+Live-verified: temporarily added a test SKU below its threshold, reloaded
+the Dashboard, confirmed the banner rendered with the correct item and
+values, then deleted the test SKU and confirmed the banner disappeared
+and inventory was back to empty.
+
 **Next candidates (not yet started), largely growth-focused per the
 founder's Ayurvedic D2C directive:** WhatsApp automation activation
-(blocked on Meta Business Manager setup, not code), a low-stock banner
-on the admin Dashboard surfacing the D2C Inventory data already being
-tracked, repeat-purchase/replenishment WhatsApp nudges timed to typical
-Ayurvedic-formulation consumption cycles, abandoned-cart recovery for
-Shopify checkouts, batch/expiry tracking for formulations, and a
-retail-customer-to-distributor referral bridge tying the D2C storefront
-into the existing MLM structure.
+(blocked on Meta Business Manager setup, not code), repeat-purchase/
+replenishment WhatsApp nudges timed to typical Ayurvedic-formulation
+consumption cycles, abandoned-cart recovery for Shopify checkouts,
+batch/expiry tracking for formulations, and a retail-customer-to-
+distributor referral bridge tying the D2C storefront into the existing
+MLM structure.
