@@ -845,11 +845,36 @@ the Dashboard, confirmed the banner rendered with the correct item and
 values, then deleted the test SKU and confirmed the banner disappeared
 and inventory was back to empty.
 
+## Phase 12 — batch/expiry tracking for D2C Inventory (2026-08-25)
+
+**Why:** Ayurvedic formulations are batch-manufactured with a shelf
+life; unsold near-expiry stock is a direct write-off risk for a
+formulation-based D2C business, and it was previously invisible — the
+Inventory tab only tracked stock count, not age.
+
+- `/api/inventory` items now accept optional `batchNumber` and
+  `expiryDate` (`YYYY-MM-DD`) fields on create (PATCH already spread
+  the request body, so updating them needed no route change).
+- Inventory tab: new Batch number + Expiry date inputs on the add-item
+  form; the table gained Batch and Expiry columns with color-coded row
+  highlighting — purple for expired, amber for expiring within 60 days
+  (`NEAR_EXPIRY_DAYS`), red for low stock (unchanged).
+- Dashboard: new amber "Batches nearing/past expiry" banner alongside
+  the existing low-stock banner, sharing the same single `/api/inventory`
+  fetch (no extra request) and the same silent-fail-if-no-access pattern.
+
+Live-verified: created a near-expiry item and an already-expired item
+via the API (batch number, expiry date), confirmed both persisted with
+the right fields, confirmed PATCH updates `batchNumber` in place,
+confirmed the Dashboard's near-expiry banner rendered both correctly
+(purple "expired" row for the past-dated item, amber "days left" row
+for the near-dated one), then deleted both test items and confirmed
+inventory returned to empty — 6/6 checks passed.
+
 **Next candidates (not yet started), largely growth-focused per the
 founder's Ayurvedic D2C directive:** WhatsApp automation activation
 (blocked on Meta Business Manager setup, not code), repeat-purchase/
 replenishment WhatsApp nudges timed to typical Ayurvedic-formulation
-consumption cycles, abandoned-cart recovery for Shopify checkouts,
-batch/expiry tracking for formulations, and a retail-customer-to-
-distributor referral bridge tying the D2C storefront into the existing
-MLM structure.
+consumption cycles, abandoned-cart recovery for Shopify checkouts, and
+a retail-customer-to-distributor referral bridge tying the D2C
+storefront into the existing MLM structure.
