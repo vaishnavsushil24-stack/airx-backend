@@ -1287,8 +1287,38 @@ function extractOrderProductSegments(productText) {
     .filter((s) => s.nameOnly);
 }
 
+// Phase 21: per-customer replenishment timing. Phase 14's cycle length was
+// one fixed number per product (admin-configured, or the 30-day default)
+// applied identically to every customer. Real customers don't all consume a
+// pack at the same rate - a family sharing one order finishes it faster than
+// someone taking it once a day solo. Once a customer has reordered the same
+// product before, we use THEIR OWN observed gap between orders instead of
+// the one-size-fits-all number - the reminder gets more accurate for a
+// customer the more order history they build up, with no manual tuning.
+// Pure function - no I/O beyond the orders array already in memory.
+function computePersonalizedCycleDays(mobile, itemName, orders) {
+  const nameLower = itemName.toLowerCase();
+  const deliveries = orders
+    .filter((o) => o.mobile === mobile && o.status === "delivered")
+    .filter((o) => extractOrderProductSegments(o.product).some((s) => s.nameOnly.includes(nameLower)))
+    .map((o) => new Date(o.deliveredAt || o.createdAt).getTime())
+    .filter((ms) => !isNaN(ms))
+    .sort((a, b) => a - b);
+  if (deliveries.length < 2) return null; // not enough history yet - fall back to the item/default cycle
+  const intervalsDays = [];
+  for (let i = 1; i < deliveries.length; i++) {
+    intervalsDays.push((deliveries[i] - deliveries[i - 1]) / (24 * 60 * 60 * 1000));
+  }
+  const avg = intervalsDays.reduce((s, d) => s + d, 0) / intervalsDays.length;
+  // Clamp to a sane range - a data-entry glitch (two orders logged a day
+  // apart) shouldn't produce a cycle so short it spams the customer, and a
+  // multi-year gap between two one-off orders shouldn't produce a cycle so
+  // long it never reminds them again.
+  return Math.round(Math.min(180, Math.max(7, avg)));
+}
+
 // Pure function (no I/O beyond the three JSON reads) so it's easy to unit
-// test - see test_phase14.js.
+// test - see test_phase14.js and test_phase21.js.
 function computeReplenishmentDue(orders, items, dismissed, now) {
   now = now || Date.now();
   const isDismissed = (orderId, sku) => dismissed.some((d) => d.orderId === orderId && d.sku === sku);
@@ -1306,7 +1336,9 @@ function computeReplenishmentDue(orders, items, dismissed, now) {
       if (!item) return;
       if (isDismissed(order.id, item.sku)) return;
 
-      const cycleDays = Number(item.reorderCycleDays) > 0 ? Number(item.reorderCycleDays) : DEFAULT_REORDER_CYCLE_DAYS;
+      const personalizedCycleDays = computePersonalizedCycleDays(order.mobile, item.name, orders);
+      const cycleDays = personalizedCycleDays || (Number(item.reorderCycleDays) > 0 ? Number(item.reorderCycleDays) : DEFAULT_REORDER_CYCLE_DAYS);
+      const cycleSource = personalizedCycleDays ? "personalized" : (Number(item.reorderCycleDays) > 0 ? "item-configured" : "default");
       const dueMs = deliveredMs + cycleDays * 24 * 60 * 60 * 1000;
       if (now < dueMs) return; // not due yet
 
@@ -1329,6 +1361,7 @@ function computeReplenishmentDue(orders, items, dismissed, now) {
         deliveredAt,
         daysSinceDelivered: Math.floor((now - deliveredMs) / (24 * 60 * 60 * 1000)),
         reorderCycleDays: cycleDays,
+        cycleSource,
         daysOverdue: Math.floor((now - dueMs) / (24 * 60 * 60 * 1000)),
       });
     });
@@ -1357,6 +1390,69 @@ app.post("/api/replenishment/dismiss", requireAccess("orders"), (req, res) => {
   res.json({ dismissed: true });
 });
 
+// Phase 24: AI demand forecasting for inventory. The existing low-stock
+// alert (aiTool_getLowStock / the dashboard banner) is a static threshold -
+// it only fires once stock is already at or below a fixed number, with no
+// sense of HOW FAST that stock is moving. A slow-selling item sitting just
+// under its threshold isn't urgent; a fast-selling item still comfortably
+// above its threshold can still sell out before the founder notices. This
+// looks at each item's actual sales velocity over a trailing window and
+// projects days-of-stock-remaining, so a genuinely soon-to-stock-out item
+// surfaces even while it's still "above threshold" by the old static rule.
+// Deliberately NOT a per-item AI/LLM call - this is a straightforward
+// rate-projection over real order data, cheap and deterministic, always on
+// regardless of whether an AI provider is configured. Pure function - no
+// I/O beyond the two arrays already read elsewhere.
+const DEMAND_FORECAST_LOOKBACK_DAYS = 90;
+const DEMAND_FORECAST_LEAD_TIME_DAYS = 14; // flag "stock out soon" inside a typical restock lead time
+
+function computeDemandForecast(orders, items, now) {
+  now = now || Date.now();
+  const windowStartMs = now - DEMAND_FORECAST_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+  return items
+    .map((item) => {
+      const nameLower = (item.name || "").toLowerCase();
+      let unitsSold = 0;
+      if (nameLower) {
+        orders.forEach((order) => {
+          if (order.status === "cancelled") return;
+          const createdMs = new Date(order.createdAt).getTime();
+          if (isNaN(createdMs) || createdMs < windowStartMs || createdMs > now) return;
+          extractOrderProductSegments(order.product).forEach((seg) => {
+            if (seg.nameOnly.includes(nameLower)) unitsSold += seg.qty;
+          });
+        });
+      }
+      const dailyRate = unitsSold / DEMAND_FORECAST_LOOKBACK_DAYS;
+      const stock = Number(item.stock) || 0;
+      // No sales at all in the lookback window -> no meaningful rate to
+      // project from; daysOfStockLeft stays null (excluded below) rather
+      // than reporting a misleading "infinite" runway.
+      const daysOfStockLeft = dailyRate > 0 ? Math.floor(stock / dailyRate) : null;
+      return {
+        sku: item.sku,
+        name: item.name,
+        stock,
+        unitsSoldLast90Days: unitsSold,
+        dailyRate: Math.round(dailyRate * 100) / 100,
+        daysOfStockLeft,
+        willStockOutSoon: daysOfStockLeft !== null && daysOfStockLeft <= DEMAND_FORECAST_LEAD_TIME_DAYS,
+      };
+    })
+    .filter((f) => f.daysOfStockLeft !== null)
+    .sort((a, b) => a.daysOfStockLeft - b.daysOfStockLeft);
+}
+
+app.get("/api/inventory/forecast", requireAccess("inventory"), (req, res) => {
+  try {
+    const forecast = computeDemandForecast(readJson(ORDERS_FILE), readJson(INVENTORY_FILE));
+    res.json(forecast);
+  } catch (err) {
+    console.error("Demand forecast error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Reuses sendWhatsApp() - template name is a placeholder, same as the other
 // three WhatsApp routes above; create+approve "replenishment_reminder" in
 // Meta Business Manager alongside cod_confirmation/tracking_update/
@@ -1369,6 +1465,56 @@ app.post("/api/whatsapp/replenishment-reminder", requireAccess("orders"), async 
       template: "replenishment_reminder",
       templateParams: [name || "", product || ""],
     });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Phase 23: personalized reminder/follow-up copy. The "Send reminder" route
+// above sends a fixed WhatsApp TEMPLATE (name/product as the only two blanks)
+// - that's not a limitation to fix, it's a WhatsApp platform rule: any
+// message sent outside a 24h customer-initiated conversation window MUST use
+// a pre-approved template, free text is rejected. So instead of trying to
+// personalize the template itself, this generates a warm, specific draft
+// message (using the customer's name, product, and their own reorder cadence
+// from Phase 21) that staff can copy today and send manually via WhatsApp/
+// SMS/call - and that becomes usable as real free-text once WhatsApp is
+// actually connected and a customer messages in first (sendWhatsApp's `text`
+// path, already built, just unused until then). This is genuinely draft-only
+// by design, not a placeholder waiting on a permission - see the pending
+// items list in the README for what's actually blocked (WhatsApp itself).
+async function generateReplenishmentReminderDraft({ name, product, mobile, daysOverdue, cycleSource, reorderCycleDays }) {
+  const fallback = `Hi ${name || "there"}! Just checking in — based on your last ${product || "AIRX PLUS"} order, you might be running low. Reply here anytime to reorder, we're happy to help. 🙏 Team AIRX PLUS`;
+  const system = `You write short, warm WhatsApp follow-up messages for AIRX PLUS Healthcare, an Ayurvedic D2C brand, reminding
+a specific customer that their product may be running low and it's a good time to reorder. Use the customer's name if given.
+Mention the product by name. Keep it under 350 characters, friendly and not pushy, no medical claims, no dosage advice,
+no discount/offer unless told to include one. End with an invitation to reply to reorder. Output ONLY the message text,
+nothing else (no quotes, no preamble).`;
+  const context = `Customer name: ${name || "(unknown, use a friendly generic greeting)"}
+Product: ${product || "their AIRX PLUS product"}
+Days since their reminder became due: ${daysOverdue ?? "unknown"}
+Their reorder cadence: ${cycleSource === "personalized" ? `personalized, based on their own past reorder gap of about ${reorderCycleDays} days` : `estimated at about ${reorderCycleDays || 30} days (not enough order history yet to personalize)`}`;
+  try {
+    const result = await callAI({
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: context },
+      ],
+      max_tokens: 200,
+    });
+    if (!result.configured || !result.text) return { draft: fallback, configured: false };
+    return { draft: result.text.trim(), configured: true };
+  } catch (err) {
+    console.error("Replenishment draft generation failed:", err.message);
+    return { draft: fallback, configured: false };
+  }
+}
+
+app.post("/api/replenishment/draft-message", requireAccess("orders"), async (req, res) => {
+  try {
+    const { name, product, mobile, daysOverdue, cycleSource, reorderCycleDays } = req.body;
+    const result = await generateReplenishmentReminderDraft({ name, product, mobile, daysOverdue, cycleSource, reorderCycleDays });
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -3571,27 +3717,108 @@ async function callAI({ messages, tools, max_tokens = 1024 }) {
   };
 }
 
+// ---------------------------------------------------------------------
+// Phase 19 — semantic search over the Knowledge Base (2026-08-27)
+// ---------------------------------------------------------------------
+// Both AI surfaces that ground themselves in the Knowledge Base (the
+// public assistant below, and generateSocialReplyDraft() in Phase 16)
+// used to paste the ENTIRE kb.json into every prompt. Fine at a handful of
+// articles; it gets slower, pricier, and less accurate as the KB grows,
+// since the model has to wade through irrelevant articles to find the
+// right one. This embeds each article once (OpenAI's embeddings API - a
+// separate, much cheaper endpoint from chat, and the only embeddings
+// option here since Anthropic doesn't offer one) and at answer-time
+// retrieves only the handful of articles actually relevant to the
+// question. No new credential - reuses OPENAI_API_KEY if it's set.
+//
+// Graceful degradation, same spirit as everywhere else in this app: if
+// OPENAI_API_KEY isn't set (e.g. running on Anthropic only), or an
+// article has no embedding yet, retrieveRelevantKB() falls back to
+// returning the FULL knowledge base - the exact old behavior - rather
+// than silently returning nothing.
+const EMBEDDING_MODEL = "text-embedding-3-small";
+
+async function embedText(text) {
+  if (!process.env.OPENAI_API_KEY || !text) return null;
+  try {
+    const resp = await fetchFn("https://api.openai.com/v1/embeddings", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model: EMBEDDING_MODEL, input: text.slice(0, 8000) }),
+    });
+    const data = await resp.json();
+    if (data.error) {
+      console.error("embedText error:", data.error.message);
+      return null;
+    }
+    return (data.data && data.data[0] && data.data[0].embedding) || null;
+  } catch (err) {
+    console.error("embedText failed:", err.message);
+    return null;
+  }
+}
+
+function cosineSimilarity(a, b) {
+  if (!a || !b || a.length !== b.length) return -1;
+  let dot = 0, magA = 0, magB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    magA += a[i] * a[i];
+    magB += b[i] * b[i];
+  }
+  if (magA === 0 || magB === 0) return -1;
+  return dot / (Math.sqrt(magA) * Math.sqrt(magB));
+}
+
+// Pure-ish ranking function (network call for the query embedding happens
+// in the caller so this stays independently testable) - given the query's
+// own embedding and the KB (each item optionally carrying .embedding),
+// returns the topN most relevant articles. Falls back to the full KB,
+// most-recent-first-preserved, whenever semantic ranking isn't possible.
+function rankKBBySimilarity(queryEmbedding, kb, topN) {
+  const embedded = kb.filter((k) => Array.isArray(k.embedding) && k.embedding.length);
+  if (!queryEmbedding || !embedded.length) return kb; // fall back to everything - old behavior
+  return embedded
+    .map((k) => ({ ...k, _score: cosineSimilarity(queryEmbedding, k.embedding) }))
+    .sort((a, b) => b._score - a._score)
+    .slice(0, topN)
+    .map(({ _score, ...k }) => k);
+}
+
+async function retrieveRelevantKB(query, kb, topN = 5) {
+  if (!kb.length) return kb;
+  if (kb.length <= topN) return kb; // small KB - no point ranking, just use it all like before
+  const queryEmbedding = await embedText(query);
+  return rankKBBySimilarity(queryEmbedding, kb, topN);
+}
+
 // ---- Knowledge Base CRUD (staff-managed content the agent grounds itself in) ----
 app.get("/api/kb", requireAccess("ai_assistant"), (req, res) => {
   res.json(readJson(KB_FILE));
 });
-app.post("/api/kb", requireAccess("ai_assistant"), (req, res) => {
+app.post("/api/kb", requireAccess("ai_assistant"), async (req, res) => {
   const items = readJson(KB_FILE);
   const item = {
     id: "kb" + Date.now(),
     category: req.body.category || "faq",
     title: req.body.title || "",
     content: req.body.content || "",
+    embedding: null,
   };
+  item.embedding = await embedText(`${item.title}\n${item.content}`);
   items.push(item);
   writeJson(KB_FILE, items);
   res.json(item);
 });
-app.patch("/api/kb/:id", requireAccess("ai_assistant"), (req, res) => {
+app.patch("/api/kb/:id", requireAccess("ai_assistant"), async (req, res) => {
   const items = readJson(KB_FILE);
   const idx = items.findIndex((i) => i.id === req.params.id);
   if (idx === -1) return res.status(404).json({ error: "not found" });
+  const titleOrContentChanged = req.body.title !== undefined || req.body.content !== undefined;
   items[idx] = { ...items[idx], ...req.body };
+  if (titleOrContentChanged) {
+    items[idx].embedding = await embedText(`${items[idx].title}\n${items[idx].content}`);
+  }
   writeJson(KB_FILE, items);
   res.json(items[idx]);
 });
@@ -3635,8 +3862,13 @@ app.post("/api/public/assistant", async (req, res) => {
         .map((o) => ({ product: o.product, status: o.status, createdAt: o.createdAt, trackingBarcode: o.indiaPostBarcode || null }));
       if (orders.length) orderContext = `\n\nThis customer's recent orders (only mention what's relevant to their question):\n${JSON.stringify(orders)}`;
     }
-    const kbText = kb.length
-      ? kb.map((k) => `[${k.category}] ${k.title}\n${k.content}`).join("\n\n")
+    // Phase 19: rank the KB by semantic similarity to this question instead of
+    // always stuffing every article in — keeps the prompt small and focused as
+    // the KB grows, with a built-in fallback to the full KB when embeddings
+    // aren't available (no OpenAI key) or the KB is small enough not to bother.
+    const relevantKB = await retrieveRelevantKB(question, kb);
+    const kbText = relevantKB.length
+      ? relevantKB.map((k) => `[${k.category}] ${k.title}\n${k.content}`).join("\n\n")
       : "(no knowledge base articles added yet — tell the customer the team will get back to them)";
 
     const system = `You are the AIRX PLUS customer support and product education assistant for an Ayurvedic D2C healthcare brand.
@@ -3663,6 +3895,129 @@ ${kbText}${orderContext}`;
     console.error("AI assistant error:", err);
     res.status(500).json({ error: "assistant temporarily unavailable" });
   }
+});
+
+// ---- Phase 20: AI eval harness ----
+// Both AI surfaces (public assistant, social replies) rewrite their own system
+// prompt/model as the app evolves. Without a fixed set of known-good question
+// -> expected-keyword cases to check against, a prompt tweak or a provider
+// switch (OpenAI <-> Anthropic) can silently make answers worse with no way
+// to notice besides a customer complaint. This harness lets the founder/admin
+// build up that fixed case set through the admin UI and re-run it on demand.
+// Unlike test_phase*.js, this DOES make a real AI call (it's testing prompt
+// quality, not pure logic), so it's intentionally NOT part of the CI suite -
+// it's an admin-triggered "Run Evals" action, same trust level as any other
+// admin-only route behind requireAccess("ai_assistant").
+const AI_EVALS_FILE = path.join(JSON_DATA_DIR, "ai_evals.json");
+if (!fs.existsSync(AI_EVALS_FILE)) fs.writeFileSync(AI_EVALS_FILE, "[]");
+const AI_EVAL_RESULTS_FILE = path.join(JSON_DATA_DIR, "ai_eval_results.json");
+if (!fs.existsSync(AI_EVAL_RESULTS_FILE)) fs.writeFileSync(AI_EVAL_RESULTS_FILE, JSON.stringify({ results: [], summary: null }));
+
+// Pure function - no I/O, no AI call. Given an answer string and an eval
+// case, decides pass/fail. All configured expectedKeywords must appear
+// (case-insensitive substring match); any configured mustNotContain term
+// appearing fails the case (e.g. to catch the assistant inventing a dosage
+// number or promising something it shouldn't).
+function scoreEvalResult(answerText, evalCase) {
+  const answer = String(answerText || "").toLowerCase();
+  const expected = Array.isArray(evalCase.expectedKeywords) ? evalCase.expectedKeywords : [];
+  const forbidden = Array.isArray(evalCase.mustNotContain) ? evalCase.mustNotContain : [];
+  const missingKeywords = expected.filter((k) => k && !answer.includes(String(k).toLowerCase()));
+  const foundForbidden = forbidden.filter((k) => k && answer.includes(String(k).toLowerCase()));
+  return {
+    passed: missingKeywords.length === 0 && foundForbidden.length === 0,
+    missingKeywords,
+    foundForbidden,
+  };
+}
+
+// Runs one eval case through the exact same retrieval + prompt shape as
+// /api/public/assistant, so this genuinely tests what a real customer would
+// get - not a simplified stand-in.
+async function runSingleEval(evalCase) {
+  const kb = readJson(KB_FILE);
+  const relevantKB = await retrieveRelevantKB(evalCase.question, kb);
+  const kbText = relevantKB.length
+    ? relevantKB.map((k) => `[${k.category}] ${k.title}\n${k.content}`).join("\n\n")
+    : "(no knowledge base articles added yet — tell the customer the team will get back to them)";
+  const system = `You are the AIRX PLUS customer support and product education assistant for an Ayurvedic D2C healthcare brand.
+Answer ONLY using the knowledge base content below and, if given, the customer's own order data — never invent product
+claims, dosages, or health/medical advice beyond what's written here. For any health condition, medication interaction,
+pregnancy, or dosage question not directly answered by the knowledge base, tell the customer to consult a qualified
+doctor/Ayurvedic practitioner before use — do not guess. Keep answers short and warm, and reply in whichever language/
+style the customer wrote in (Hindi, Hinglish, or English). If you don't know, say so plainly and offer to connect them
+to the team.
+
+Knowledge base:
+${kbText}`;
+  const result = await callAI({
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: evalCase.question },
+    ],
+    max_tokens: 600,
+  });
+  if (!result.configured) return { id: evalCase.id, question: evalCase.question, answer: null, configured: false, passed: null, missingKeywords: [], foundForbidden: [] };
+  const answer = result.text || "";
+  const score = scoreEvalResult(answer, evalCase);
+  return { id: evalCase.id, question: evalCase.question, answer, configured: true, ...score };
+}
+
+app.get("/api/ai/evals", requireAccess("ai_assistant"), (req, res) => {
+  res.json(readJson(AI_EVALS_FILE));
+});
+app.post("/api/ai/evals", requireAccess("ai_assistant"), (req, res) => {
+  const items = readJson(AI_EVALS_FILE);
+  const item = {
+    id: "eval" + Date.now(),
+    question: req.body.question || "",
+    expectedKeywords: Array.isArray(req.body.expectedKeywords) ? req.body.expectedKeywords : String(req.body.expectedKeywords || "").split(",").map((s) => s.trim()).filter(Boolean),
+    mustNotContain: Array.isArray(req.body.mustNotContain) ? req.body.mustNotContain : String(req.body.mustNotContain || "").split(",").map((s) => s.trim()).filter(Boolean),
+    notes: req.body.notes || "",
+    createdAt: new Date().toISOString(),
+  };
+  items.push(item);
+  writeJson(AI_EVALS_FILE, items);
+  res.json(item);
+});
+app.patch("/api/ai/evals/:id", requireAccess("ai_assistant"), (req, res) => {
+  const items = readJson(AI_EVALS_FILE);
+  const idx = items.findIndex((i) => i.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: "not found" });
+  items[idx] = { ...items[idx], ...req.body };
+  writeJson(AI_EVALS_FILE, items);
+  res.json(items[idx]);
+});
+app.delete("/api/ai/evals/:id", requireAccess("ai_assistant"), (req, res) => {
+  const items = readJson(AI_EVALS_FILE).filter((i) => i.id !== req.params.id);
+  writeJson(AI_EVALS_FILE, items);
+  res.json({ ok: true });
+});
+app.post("/api/ai/evals/run", requireAccess("ai_assistant"), async (req, res) => {
+  try {
+    const cases = readJson(AI_EVALS_FILE);
+    if (!cases.length) return res.json({ results: [], summary: { total: 0, passed: 0, failed: 0 } });
+    const results = [];
+    for (const c of cases) {
+      results.push(await runSingleEval(c));
+    }
+    const configuredResults = results.filter((r) => r.configured);
+    const summary = {
+      total: results.length,
+      passed: configuredResults.filter((r) => r.passed).length,
+      failed: configuredResults.filter((r) => !r.passed).length,
+      notConfigured: results.length - configuredResults.length,
+      ranAt: new Date().toISOString(),
+    };
+    writeJson(AI_EVAL_RESULTS_FILE, { results, summary });
+    res.json({ results, summary });
+  } catch (err) {
+    console.error("AI eval run failed:", err);
+    res.status(500).json({ error: "eval run failed" });
+  }
+});
+app.get("/api/ai/evals/results", requireAccess("ai_assistant"), (req, res) => {
+  res.json(readJsonSafe(AI_EVAL_RESULTS_FILE, { results: [], summary: null }));
 });
 
 // ---- Staff system copilot (tool-calling over read-only summaries) ----
@@ -4091,8 +4446,11 @@ setInterval(async () => {
 async function generateSocialReplyDraft(item) {
   try {
     const kb = readJson(KB_FILE);
-    const kbText = kb.length
-      ? kb.map((k) => `[${k.category}] ${k.title}\n${k.content}`).join("\n\n")
+    // Phase 19: same semantic-retrieval narrowing as the public assistant,
+    // keyed off the customer's actual comment/DM text.
+    const relevantKB = await retrieveRelevantKB(item.message || "", kb);
+    const kbText = relevantKB.length
+      ? relevantKB.map((k) => `[${k.category}] ${k.title}\n${k.content}`).join("\n\n")
       : "(no knowledge base articles added yet)";
     const system = `You reply to public ${item.type === "dm" ? "Instagram/Facebook DMs" : "Facebook/Instagram comments"} for AIRX PLUS
 Healthcare, an Ayurvedic D2C brand. Use ONLY the knowledge base below - never invent product claims, dosages, or medical
@@ -4128,10 +4486,65 @@ async function sendSocialReply(item, message) {
   return callMetaGraphAPI(`${item.externalId}/comments`, { method: "POST", body: { message } });
 }
 
+// Phase 22: sentiment-aware engagement triage. Every inbound comment/DM used
+// to land in the inbox with equal weight - a "love this, ordered again!"
+// and a "this gave my mother an allergic reaction, I want a refund" sat side
+// by side in arrival order. A public brand account needs the second one
+// found and handled fast, not scrolled past. This is a deliberately
+// rule-based (keyword) classifier, not an extra AI API call per comment -
+// same reasoning as the rest of this app's "cheap, deterministic, always-on"
+// pieces: it needs no OpenAI/Anthropic key to work at all, costs nothing,
+// runs instantly, and never depends on a third-party AI being configured or
+// available. It's intentionally biased toward over-flagging (a false
+// positive just means a normal comment gets a priority tag it didn't need;
+// a false negative means a real complaint gets missed) - pure function, unit
+// tested in test_phase22.js.
+const URGENT_KEYWORDS = [
+  "refund", "fraud", "scam", "cheated", "lawyer", "legal action", "consumer court",
+  "side effect", "allergic", "allergy", "reaction", "hospital", "hospitalized",
+  "fake product", "duplicate product", "expired product", "damaged", "poison",
+  "sick", "worse", "harmful", "unsafe", "police", "complaint filed",
+];
+const NEGATIVE_KEYWORDS = [
+  "worst", "terrible", "horrible", "disappointed", "disappointing", "waste of money",
+  "not working", "doesn't work", "didn't work", "no result", "no effect", "useless",
+  "cancel my order", "cancel order", "never again", "regret", "bad experience",
+  "poor quality", "late delivery", "not delivered", "missing item", "wrong product",
+  "bekaar", "faltu", "ghatiya", "dhoka", "paisa barbad",
+];
+const POSITIVE_KEYWORDS = [
+  "thank you", "thanks", "great product", "love this", "loved it", "amazing",
+  "excellent", "works great", "worked well", "highly recommend", "best product",
+  "very happy", "satisfied", "good quality", "ordering again", "repeat order",
+  "shukriya", "badhiya", "zabardast",
+];
+
+// Pure function - no I/O, no AI call.
+function classifyEngagementSentiment(message) {
+  const text = String(message || "").toLowerCase();
+  const urgentHits = URGENT_KEYWORDS.filter((k) => text.includes(k));
+  const negativeHits = NEGATIVE_KEYWORDS.filter((k) => text.includes(k));
+  const positiveHits = POSITIVE_KEYWORDS.filter((k) => text.includes(k));
+
+  let sentiment = "neutral";
+  if (urgentHits.length || negativeHits.length) sentiment = "negative";
+  else if (positiveHits.length) sentiment = "positive";
+
+  // Urgent always wins the priority call regardless of what else is in the
+  // message - "thanks for the great product but I had an allergic reaction"
+  // still needs to be triaged as urgent, not averaged into "mixed/neutral".
+  let priority = "normal";
+  if (urgentHits.length) priority = "high";
+  else if (negativeHits.length) priority = "medium";
+
+  return { sentiment, priority, flaggedKeywords: [...urgentHits, ...negativeHits] };
+}
+
 async function handleIncomingSocialComment({ platform, type = "comment", externalId, postId, fromName, message }) {
   if (!message) return;
   const engagement = readJson(SOCIAL_ENGAGEMENT_FILE);
   if (engagement.some((e) => e.externalId === externalId)) return; // Meta can redeliver webhooks - de-dupe.
+  const { sentiment, priority, flaggedKeywords } = classifyEngagementSentiment(message);
   const item = {
     id: "eng_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8),
     platform,
@@ -4140,6 +4553,9 @@ async function handleIncomingSocialComment({ platform, type = "comment", externa
     postId,
     fromName: fromName || "",
     message,
+    sentiment,
+    priority,
+    flaggedKeywords,
     aiDraftReply: "",
     status: "pending", // pending -> approved_sent | auto_sent | dismissed
     receivedAt: new Date().toISOString(),
@@ -4147,13 +4563,15 @@ async function handleIncomingSocialComment({ platform, type = "comment", externa
   };
   item.aiDraftReply = await generateSocialReplyDraft(item);
 
-  // Auto-send stays OFF unless the founder explicitly opts in via env var -
-  // an unreviewed AI reply going out publicly under the brand's name is a
-  // real reputational risk, so the safe default is "draft only, staff
-  // clicks Approve & Send" (same reasoning as the WhatsApp follow-up
-  // drafter). Flip AI_AUTO_REPLY_SOCIAL=true only once you trust the KB
-  // coverage and tone.
-  if (process.env.AI_AUTO_REPLY_SOCIAL === "true" && item.aiDraftReply) {
+  // A high-priority (urgent) item never auto-sends, even if the founder has
+  // opted into AI_AUTO_REPLY_SOCIAL for routine comments - a possible
+  // allergic-reaction/refund/legal-threat message getting an auto-reply
+  // instead of a human's eyes is exactly the reputational risk that setting
+  // was never meant to cover. Auto-send stays OFF for everything else unless
+  // the founder explicitly opts in via env var (same reasoning as the
+  // WhatsApp follow-up drafter) - flip AI_AUTO_REPLY_SOCIAL=true only once
+  // you trust the KB coverage and tone.
+  if (priority !== "high" && process.env.AI_AUTO_REPLY_SOCIAL === "true" && item.aiDraftReply) {
     const sendResult = await sendSocialReply(item, item.aiDraftReply);
     if (sendResult.configured && sendResult.ok) {
       item.status = "auto_sent";
@@ -4165,10 +4583,19 @@ async function handleIncomingSocialComment({ platform, type = "comment", externa
   writeJson(SOCIAL_ENGAGEMENT_FILE, engagement);
 }
 
+const ENGAGEMENT_PRIORITY_RANK = { high: 0, medium: 1, normal: 2 };
 app.get("/api/social/engagement", requireAccess("social_media"), (req, res) => {
-  const { status } = req.query;
+  const { status, priority } = req.query;
   let rows = readJson(SOCIAL_ENGAGEMENT_FILE);
   if (status) rows = rows.filter((r) => r.status === status);
+  if (priority) rows = rows.filter((r) => r.priority === priority);
+  // Urgent items surface first regardless of arrival order, then negative,
+  // then everything else newest-first within each bucket.
+  rows = rows.slice().sort((a, b) => {
+    const rankDiff = (ENGAGEMENT_PRIORITY_RANK[a.priority] ?? 2) - (ENGAGEMENT_PRIORITY_RANK[b.priority] ?? 2);
+    if (rankDiff !== 0) return rankDiff;
+    return new Date(b.receivedAt).getTime() - new Date(a.receivedAt).getTime();
+  });
   res.json(rows);
 });
 
@@ -4231,7 +4658,7 @@ app.get("/api/ads/campaigns", requireAccess("social_media"), (req, res) => {
 });
 
 app.post("/api/ads/campaigns", requireAccess("social_media"), (req, res) => {
-  const { name, objective, dailyBudget, caption, mediaUrl, ageMin, ageMax, genders, locations } = req.body;
+  const { name, objective, dailyBudget, caption, mediaUrl, ageMin, ageMax, genders, locations, variantGroupId, variantLabel } = req.body;
   if (!name || !objective || !dailyBudget) return res.status(400).json({ error: "name, objective and dailyBudget required" });
   const campaigns = readJson(AD_CAMPAIGNS_FILE);
   const campaign = {
@@ -4246,6 +4673,11 @@ app.post("/api/ads/campaigns", requireAccess("social_media"), (req, res) => {
       genders: genders || "all",
       locations: locations || "India",
     },
+    // Phase 25: two or more campaigns sharing the same variantGroupId (e.g.
+    // different captions/images testing the same offer) can be compared
+    // side by side via /api/ads/campaigns/compare - see rankAdVariants below.
+    variantGroupId: variantGroupId || null,
+    variantLabel: variantLabel || null,
     status: "draft", // draft -> created_paused -> active -> paused (or failed)
     metaCampaignId: null,
     metaAdSetId: null,
@@ -4275,6 +4707,8 @@ app.patch("/api/ads/campaigns/:id", requireAccess("social_media"), (req, res) =>
   if (ageMax !== undefined) campaigns[idx].targeting.ageMax = Number(ageMax);
   if (genders !== undefined) campaigns[idx].targeting.genders = genders;
   if (locations !== undefined) campaigns[idx].targeting.locations = locations;
+  if (req.body.variantGroupId !== undefined) campaigns[idx].variantGroupId = req.body.variantGroupId || null;
+  if (req.body.variantLabel !== undefined) campaigns[idx].variantLabel = req.body.variantLabel || null;
   writeJson(AD_CAMPAIGNS_FILE, campaigns);
   res.json(campaigns[idx]);
 });
@@ -4416,6 +4850,72 @@ app.get("/api/ads/campaigns/:id/insights", requireAccess("social_media"), async 
   const result = await callMetaGraphAPI(`${campaign.metaCampaignId}/insights?fields=spend,impressions,clicks,reach`);
   if (result.configured === false) return res.json({ configured: false });
   res.json(result.ok ? result.data : { error: result.data.error });
+});
+
+// Phase 25: ad-creative variant testing. Two or more campaigns sharing a
+// variantGroupId (e.g. the same offer with two different captions/images)
+// can be compared here by click-through rate, with a minimum-impressions
+// gate so a "winner" isn't declared off a handful of early impressions that
+// could easily flip. This is local comparison LOGIC only - it works purely
+// off whatever insights are passed in, so it's fully testable without a
+// live ad account. The actual live spend/launch path this reads insights
+// from is unchanged and stays behind the Phase 16 Meta Ads permission flow
+// (create paused, explicit confirm:true to activate) - nothing about that
+// safety gate changes here.
+const AD_VARIANT_MIN_IMPRESSIONS = 500;
+
+// Pure function - no I/O. variants: [{id, name, variantLabel, insights: {impressions, clicks, spend}|null}]
+function rankAdVariants(variants) {
+  const ranked = variants.map((v) => {
+    const impressions = Number((v.insights && v.insights.impressions) || 0);
+    const clicks = Number((v.insights && v.insights.clicks) || 0);
+    const spend = Number((v.insights && v.insights.spend) || 0);
+    const ctr = impressions > 0 ? clicks / impressions : null;
+    const cpc = clicks > 0 ? spend / clicks : null;
+    return { id: v.id, name: v.name, variantLabel: v.variantLabel, impressions, clicks, spend, ctr, cpc };
+  });
+
+  // Rank by CTR descending (nulls/no-data last), tie-break by lower CPC.
+  ranked.sort((a, b) => {
+    if (a.ctr === null && b.ctr === null) return 0;
+    if (a.ctr === null) return 1;
+    if (b.ctr === null) return -1;
+    if (b.ctr !== a.ctr) return b.ctr - a.ctr;
+    if (a.cpc === null) return 1;
+    if (b.cpc === null) return -1;
+    return a.cpc - b.cpc;
+  });
+
+  if (ranked.length < 2) {
+    return { ranked, winner: null, reason: "need at least 2 variants in the group to compare" };
+  }
+  const top = ranked[0];
+  if (top.ctr === null || top.impressions < AD_VARIANT_MIN_IMPRESSIONS) {
+    return { ranked, winner: null, reason: `not enough data yet — each variant needs at least ${AD_VARIANT_MIN_IMPRESSIONS} impressions before a winner is called` };
+  }
+  return { ranked, winner: top.id, reason: `${top.variantLabel || top.name} leads by click-through rate with sufficient impressions` };
+}
+
+app.get("/api/ads/campaigns/compare", requireAccess("social_media"), async (req, res) => {
+  const { groupId } = req.query;
+  if (!groupId) return res.status(400).json({ error: "groupId is required" });
+  const campaigns = readJson(AD_CAMPAIGNS_FILE).filter((c) => c.variantGroupId === groupId);
+  if (!campaigns.length) return res.status(404).json({ error: "no campaigns found for that variant group" });
+  try {
+    const variants = [];
+    for (const c of campaigns) {
+      let insights = null;
+      if (c.metaCampaignId) {
+        const result = await callMetaGraphAPI(`${c.metaCampaignId}/insights?fields=spend,impressions,clicks,reach`);
+        if (result.configured && result.ok && result.data.data && result.data.data[0]) insights = result.data.data[0];
+      }
+      variants.push({ id: c.id, name: c.name, variantLabel: c.variantLabel, insights });
+    }
+    res.json(rankAdVariants(variants));
+  } catch (err) {
+    console.error("Ad variant comparison error:", err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ---------------------------------------------------------------------

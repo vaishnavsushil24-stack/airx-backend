@@ -1284,3 +1284,295 @@ checkouts (blocked on a `read_checkouts` OAuth scope this app's current
 Shopify connection doesn't have — re-authorizing needs an explicit
 OAuth-consent click, so this is flagged for the founder rather than done
 silently).
+
+## Phase 19 — semantic search for the Knowledge Base (RAG) (2026-08-27)
+
+**Why:** both AI surfaces that ground themselves in the Knowledge Base —
+the public customer assistant (`/api/public/assistant`) and the Social
+Media Hub's auto-drafted replies (`generateSocialReplyDraft`) — used to
+paste every single KB article into the prompt on every single question.
+That's fine with a handful of articles, but it doesn't scale: a growing
+KB means a growing prompt (slower, costlier, and eventually past the
+model's useful context for the actual question), and stuffing in
+irrelevant articles makes it easier for the model to answer from the
+wrong one. This is the first item from the AI Upgrade Roadmap's Tier 1.
+
+- **`embedText(text)`** — calls OpenAI's `text-embedding-3-small` model to
+  turn a string into a vector. Same "inert until configured" pattern as
+  every other integration in this app: with no `OPENAI_API_KEY` set, it
+  returns `null` immediately rather than throwing, and every caller
+  already has a documented fallback for that case.
+- **`cosineSimilarity(a, b)`** and **`rankKBBySimilarity(queryEmbedding, kb, topN)`**
+  — pure functions, no I/O. Rank KB articles by how closely their stored
+  embedding matches the query's embedding, returning the top N. Both
+  degrade safely: no query embedding, an empty/all-unembedded KB, or a
+  mismatched vector all fall back to returning the KB untouched rather
+  than erroring or silently dropping everything.
+- **`retrieveRelevantKB(query, kb, topN=5)`** — the actual entry point
+  both AI surfaces now call. Skips embedding entirely (no network call,
+  no cost) when the KB is already small enough (`kb.length <= topN`) that
+  ranking wouldn't change anything — this keeps small-KB behavior
+  byte-for-byte identical to before Phase 19.
+- **`POST /api/kb`** and **`PATCH /api/kb/:id`** now compute and store an
+  `embedding` field on each article whenever it's created or its
+  title/content changes, via `embedText()`. Existing articles created
+  before this phase simply have no `embedding` yet — `rankKBBySimilarity`
+  already treats those as un-rankable and falls back to including
+  everything, so nothing needs a one-time backfill migration for this to
+  work correctly; articles pick up an embedding the next time they're
+  edited.
+- Both `/api/public/assistant` and `generateSocialReplyDraft` now call
+  `retrieveRelevantKB(question or item.message, kb)` before building the
+  `kbText` block that goes into the AI prompt, instead of using the raw
+  KB array directly.
+- **Without `OPENAI_API_KEY` configured** (or as long as the KB stays at
+  5 articles or fewer), behavior is identical to before this phase — the
+  full KB is always included. This only starts narrowing the context once
+  both an OpenAI key is present and the KB has grown past a handful of
+  articles, so nothing about existing behavior changes until the founder
+  is actually running enough KB content for it to matter.
+- **`test_phase19.js`** (17 assertions) — `cosineSimilarity` on identical/
+  orthogonal/opposite/mismatched/zero-magnitude vectors; `rankKBBySimilarity`
+  top-N selection and score-stripping; graceful fallback with no query
+  embedding, an all-unembedded KB, and a KB with mixed embedded/
+  unembedded articles; `retrieveRelevantKB` skips the network call
+  entirely for a small KB and an empty KB, and calls it exactly once for
+  a KB larger than `topN`.
+- Full regression suite (`test_phase3/6/7/8/9/14/15/16/17/19.js` +
+  `test_migration.js`, 11 files) passes, plus `node -c server.js`.
+
+No admin UI changes — this is a backend quality/scaling improvement to AI
+surfaces that already exist. `embedText()` itself (the only part that
+makes a real network call) isn't unit-tested here, the same way `callAI()`'s
+HTTP call isn't unit-tested elsewhere in this repo — it's exercised for
+real once `OPENAI_API_KEY` is configured and the assistant is used.
+
+## Phase 20 — AI eval harness (2026-08-27)
+
+**Why:** the assistant's system prompt, the AI provider (OpenAI/Anthropic),
+and now the KB retrieval logic (Phase 19) all change over time — with no
+fixed set of known-good question/answer checks to run afterward, the only
+way to notice a regression was a customer getting a wrong or missing
+answer. This is Tier 1 item 2 from the AI Upgrade Roadmap.
+
+- **`scoreEvalResult(answerText, evalCase)`** — pure function. An eval case
+  has `expectedKeywords` (all must appear, case-insensitive) and an
+  optional `mustNotContain` (none may appear — e.g. to catch the assistant
+  inventing a specific dosage number it shouldn't state). Returns
+  `{passed, missingKeywords, foundForbidden}`.
+- **`runSingleEval(evalCase)`** — runs one case through the *exact* same
+  KB-retrieval + system prompt as `/api/public/assistant` (not a
+  simplified stand-in), then scores the real answer.
+- **`GET/POST/PATCH/DELETE /api/ai/evals`** — admin CRUD for eval cases,
+  behind `requireAccess("ai_assistant")`. Starts empty; the founder/admin
+  builds up cases through the new "AI Evals" panel on the AI Assistant
+  admin tab (question + comma-separated expected/forbidden keywords).
+- **`POST /api/ai/evals/run`** — runs every case, stores the results
+  (`ai_eval_results.json`) and returns a summary
+  (`{total, passed, failed, notConfigured}`). Deliberately **not** wired
+  into CI — this makes a real AI API call (costs money, needs a live
+  key), so it's an on-demand admin action, same trust level as any other
+  `ai_assistant`-gated route, rather than something that runs
+  automatically on every push.
+- Admin UI: new "AI Evals" panel — add a case, "Run all evals now", see
+  pass/fail per case with the actual AI answer and exactly which keyword
+  was missing or which forbidden term appeared, for any case that failed.
+- **`test_phase20.js`** (10 assertions) — keyword presence/absence,
+  case-insensitivity, combined pass/fail logic, empty/null-safe handling,
+  reporting every missing keyword rather than just the first.
+- Full regression suite (`test_phase3/6/7/8/9/14/15/16/17/19/20.js` +
+  `test_migration.js`, 12 files) passes, plus `node -c server.js` and a
+  JS-syntax check of the extracted `admin.html` script block.
+
+No new external permission needed — this only runs against the AI
+provider the founder has already configured.
+
+## Phase 21 — per-customer replenishment timing (2026-08-27)
+
+**Why:** Phase 14's reorder-reminder logic used one fixed cycle length per
+product (admin-configured, or a 30-day default) applied identically to
+every customer. Real customers don't consume a pack at the same rate — a
+family sharing one order finishes it faster than someone taking it once a
+day solo. This is Tier 1 item 3 from the AI Upgrade Roadmap.
+
+- **`computePersonalizedCycleDays(mobile, itemName, orders)`** — pure
+  function. Once a customer has 2+ delivered orders of the same product,
+  computes the average gap (in days) between their own past deliveries
+  and uses that as their personal reorder cycle, clamped to a 7–180 day
+  range so a data-entry glitch (two orders logged a day apart) or a
+  multi-year gap between unrelated one-off orders can't produce a
+  nonsensical cycle.
+- **`computeReplenishmentDue`** now calls this per due candidate: a
+  customer with reorder history gets their own observed cadence
+  (`cycleSource: "personalized"`); a first-time customer still falls back
+  to the item's configured cycle or the 30-day default exactly as
+  before Phase 21 — nothing changes for customers with no history yet.
+- Admin UI: the dashboard's "Replenishment due" table now shows a "Cycle
+  used" column with a 👤 personalized badge (tooltip explains why) when a
+  reminder is based on that specific customer's own reorder gap rather
+  than the product default.
+- **`test_phase21.js`** (8 assertions) — no-history fallback, 2-delivery
+  and 3-delivery averaging, minimum/maximum clamping, cross-customer
+  isolation (one customer's history never leaks into another's cycle),
+  and both `cycleSource` paths end-to-end through `computeReplenishmentDue`.
+- Full regression suite (`test_phase3/6/7/8/9/14/15/16/17/19/20/21.js` +
+  `test_migration.js`, 13 files) passes — including the original
+  `test_phase14.js` unchanged, since its fixtures are all single-delivery
+  customers where personalization correctly doesn't kick in.
+
+No new external permission needed — this only reshapes numbers already in
+`orders.json`.
+
+## Phase 22 — sentiment-aware engagement triage (2026-08-27)
+
+**Why:** Phase 16's Engagement Inbox treated every comment/DM with equal
+weight — a "love this, ordered again!" and a "this gave my mother an
+allergic reaction, I want a refund" sat side by side in plain arrival
+order. A public brand account needs the second one found and handled
+fast. This is Tier 1 item 4 from the AI Upgrade Roadmap.
+
+- **`classifyEngagementSentiment(message)`** — pure function, deliberately
+  rule-based (keyword matching in English + common Hinglish terms), not
+  an extra AI API call per comment: it costs nothing, runs instantly, and
+  needs no OpenAI/Anthropic key to work at all — same "cheap,
+  deterministic, always-on" reasoning as this app's other non-AI logic.
+  Returns `{sentiment, priority, flaggedKeywords}` — `priority` is
+  `"high"` for anything touching refunds/fraud/allergic reactions/legal
+  threats/etc., `"medium"` for negative-but-not-urgent language, `"normal"`
+  otherwise. Deliberately biased toward over-flagging: a false positive
+  just tags a normal comment, a false negative could mean a real
+  complaint gets missed.
+- `handleIncomingSocialComment` now stores `sentiment`/`priority`/
+  `flaggedKeywords` on every inbound item, and **a `"high"`-priority item
+  now never auto-sends**, even when the founder has opted into
+  `AI_AUTO_REPLY_SOCIAL=true` — an AI reply to a possible
+  allergic-reaction/refund/legal-threat message going out unreviewed is
+  exactly the reputational risk that setting was never meant to cover.
+- **`GET /api/social/engagement`** now accepts `?priority=high|medium|normal`
+  and always sorts urgent items first, then negative, then the rest
+  newest-first within each bucket — no more scrolling past a real
+  complaint to find it.
+- Admin UI: Engagement Inbox cards now show a 🚨 urgent / ⚠️ negative badge
+  with the specific keywords that triggered it, plus a priority filter
+  dropdown.
+- **`test_phase22.js`** (14 assertions) — sentiment/priority classification
+  across positive/neutral/negative/urgent/mixed/Hinglish/empty inputs,
+  case-insensitivity, and the updated auto-send gate (urgent always
+  blocked; medium/normal unaffected, same flag/draft logic as before).
+- Full regression suite (`test_phase3/6/7/8/9/14/15/16/17/19/20/21/22.js`
+  + `test_migration.js`, 14 files) passes.
+
+No new external permission needed — this only changes how existing
+inbound messages already stored are classified and ordered.
+
+## Phase 23 — personalized reminder/follow-up copy (2026-08-27)
+
+**Why:** the existing "Send reminder" button sends a fixed WhatsApp
+*template* with only name/product as blanks — that's a WhatsApp platform
+rule, not a limitation to code around: any message sent outside a 24h
+customer-initiated conversation window must use a pre-approved template,
+free text is rejected there. So instead of trying to personalize the
+template itself, this generates a genuinely personalized draft message
+(using the customer's name, product, and their own reorder cadence from
+Phase 21) that staff can copy today and send manually — and that becomes
+usable as real free-text once WhatsApp is connected and a customer
+messages in first. This is Tier 1's last item, and completes Tier 1.
+
+- **`generateReplenishmentReminderDraft({name, product, mobile, daysOverdue, cycleSource, reorderCycleDays})`**
+  — calls the configured AI provider for a short, warm, specific
+  WhatsApp-style message. Always has a plain templated fallback (uses the
+  same "inert until configured" pattern as the rest of the app) so a
+  missing AI key or a network failure never returns a blank draft.
+- **`POST /api/replenishment/draft-message`** — behind
+  `requireAccess("orders")`, same access level as the existing reminder
+  route.
+- Admin UI: a new "AI: Draft message" button per row in the dashboard's
+  Replenishment Due table, opening an editable textarea with a "Copy"
+  button (`navigator.clipboard`) — explicitly labeled as draft-only, for
+  manual send until WhatsApp sending is connected.
+- **`test_phase23.js`** (5 assertions) — AI-not-configured fallback stays
+  personalized (never blank), a configured provider's response is used
+  and trimmed, an empty AI response still falls back safely, a thrown
+  network error is caught rather than crashing the route, and missing
+  name/product still produce a natural generic fallback.
+- Full regression suite (`test_phase3/6/7/8/9/14/15/16/17/19/20/21/22/23.js`
+  + `test_migration.js`, 15 files) passes.
+
+No new external permission needed — this only drafts text for a human to
+copy; nothing is sent automatically. **This completes Tier 1 of the AI
+Upgrade Roadmap.**
+
+## Phase 24 — AI demand forecasting for inventory (2026-08-27)
+
+**Why:** the existing low-stock alert is a static threshold — it only
+fires once stock is already at or below a fixed number, with no sense of
+how fast that stock is actually moving. A fast-selling item still
+comfortably above its threshold can sell out before anyone notices; a
+slow-selling item just under threshold isn't actually urgent. This is
+Tier 2 item 1 from the AI Upgrade Roadmap.
+
+- **`computeDemandForecast(orders, items, now)`** — pure function.
+  Projects each item's sales velocity over a trailing 90-day window
+  (excluding cancelled orders) and computes days-of-stock-remaining at
+  that rate. Deliberately not a per-item AI/LLM call — a rate projection
+  over real order data is cheap, deterministic, and always on regardless
+  of whether an AI provider is configured. Items with zero recent
+  matching sales are excluded rather than reporting a misleading
+  "infinite" runway. Flags `willStockOutSoon` for anything projected to
+  run out within 14 days (a typical restock lead time), and sorts
+  soonest-to-stock-out first.
+- **`GET /api/inventory/forecast`** — behind `requireAccess("inventory")`.
+- Admin UI: new "Demand Forecast" panel on the Inventory tab — name,
+  current stock, units sold (90d), daily rate, and days left, with a
+  ⚠️ restock-soon highlight.
+- **`test_phase24.js`** (7 assertions) — no-sales-data exclusion, rate/
+  days-left math, the stock-out-soon threshold in both directions,
+  cancelled orders excluded from velocity, sales outside the lookback
+  window excluded, and sort order.
+- Full regression suite (`test_phase3/6/7/8/9/14/15/16/17/19/20/21/22/23/24.js`
+  + `test_migration.js`, 16 files) passes.
+
+No new external permission needed — this only re-derives numbers already
+in `orders.json`/`inventory.json`.
+
+## Phase 25 — ad-creative variant testing (2026-08-27)
+
+**Why:** Phase 16's Ads Manager could create one campaign at a time, with
+no structured way to test which caption/image actually performs better.
+This is Tier 2 item 2 from the AI Upgrade Roadmap. The live-spend safety
+model from Phase 16 is completely unchanged — this is comparison logic
+over campaigns that already went through the existing create-paused,
+explicit-`confirm:true`-to-activate flow.
+
+- Campaigns can now optionally carry a `variantGroupId` + `variantLabel`
+  (e.g. two campaigns both tagged `"diwali-push"`, labeled "A" and "B")
+  when created or edited in draft.
+- **`rankAdVariants(variants)`** — pure function. Ranks variants by
+  click-through rate (clicks/impressions), tie-broken by lower
+  cost-per-click. Deliberately refuses to call a winner until every
+  compared variant has at least 500 impressions — an early CTR lead from
+  a handful of impressions can easily flip, so declaring a winner too
+  soon would actively mislead. A variant not yet launched (no insights)
+  sorts last rather than breaking the comparison.
+- **`GET /api/ads/campaigns/compare?groupId=...`** — behind
+  `requireAccess("social_media")`, fetches live insights for each
+  variant in the group (gracefully skips any not yet launched) and
+  returns the ranked comparison.
+- Admin UI: variant group/label fields on the campaign form, plus a new
+  "Ad Variant Comparison" panel showing impressions/clicks/CTR/CPC per
+  variant with a 🏆 leading badge once there's enough data.
+- **`test_phase25.js`** (6 assertions) — single-variant/no-comparison
+  case, the impressions-threshold gate blocking a premature winner call,
+  CTR-based ranking, CPC tie-break, a not-yet-launched variant sorting
+  last without crashing, and zero-impressions producing a null CTR
+  rather than NaN/Infinity.
+- Full regression suite (`test_phase3/6/7/8/9/14/15/16/17/19/20/21/22/23/24/25.js`
+  + `test_migration.js`, 17 files) passes.
+
+No new external permission needed — real ad spend still requires the
+same explicit Launch → review in Meta → Activate (`confirm:true`) flow
+from Phase 16, untouched by this phase.
+
+**Next up (Tier 2, continuing in sequence):** distributor payout anomaly
+detection (Phase 26) — flagging payout amounts that deviate sharply from
+a member's own history before they're paid out.
