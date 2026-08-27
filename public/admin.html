@@ -499,18 +499,27 @@ async function loadDashboard() {
         replenishBanner = `
           <div class="panel" style="background:rgba(30,140,110,0.10);border:1px solid rgba(30,140,110,0.35)">
             <h2 style="margin-top:0">🔁 Replenishment due — ${due.length} customer${due.length > 1 ? 's' : ''} likely ready to reorder</h2>
-            <table><thead><tr><th>Name</th><th>Mobile</th><th>Product</th><th>Delivered</th><th>Overdue by</th><th></th></tr></thead><tbody>
+            <table><thead><tr><th>Name</th><th>Mobile</th><th>Product</th><th>Delivered</th><th>Cycle used</th><th>Overdue by</th><th></th></tr></thead><tbody>
               ${due.map(d => `<tr data-replenish-row="${esc(d.orderId)}|${esc(d.sku)}">
                 <td>${esc(d.name) || '—'}</td>
                 <td>${esc(d.mobile)}</td>
                 <td>${esc(d.product)}</td>
                 <td>${esc((d.deliveredAt || '').slice(0, 10))}</td>
+                <td>${d.reorderCycleDays}d${d.cycleSource === 'personalized' ? ' <span class="muted" title="Based on this customer\'s own past reorder gap">👤 personalized</span>' : ''}</td>
                 <td>${d.daysOverdue}d</td>
                 <td>
                   <button class="secondary" data-remind="${esc(d.orderId)}|${esc(d.sku)}|${esc(d.mobile)}|${esc(d.name)}|${esc(d.product)}" style="padding:3px 8px;font-size:11px">Send reminder</button>
+                  <button class="secondary" data-draft="${esc(d.orderId)}|${esc(d.sku)}|${esc(d.mobile)}|${esc(d.name)}|${esc(d.product)}|${d.daysOverdue}|${esc(d.cycleSource)}|${d.reorderCycleDays}" style="padding:3px 8px;font-size:11px">AI: Draft message</button>
                   <button class="secondary" data-dismiss-replenish="${esc(d.orderId)}|${esc(d.sku)}" style="padding:3px 8px;font-size:11px">Dismiss</button>
                 </td>
-              </tr>`).join('')}
+              </tr>
+              <tr data-draft-row="${esc(d.orderId)}|${esc(d.sku)}" style="display:none"><td colspan="7">
+                <div class="row" style="align-items:flex-start">
+                  <textarea data-draft-text style="flex:1;min-height:54px;font-size:12px"></textarea>
+                  <button class="secondary" data-copy-draft style="padding:3px 8px;font-size:11px">Copy</button>
+                </div>
+                <div class="muted" style="font-size:11px;margin-top:2px">Draft only — copy and send manually via WhatsApp/SMS until WhatsApp sending is connected (see README pending items).</div>
+              </td></tr>`).join('')}
             </tbody></table>
           </div>`;
       }
@@ -556,6 +565,28 @@ async function loadDashboard() {
         toast('Dismissed', 'success');
         loadDashboard();
       } catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+    document.querySelectorAll('[data-draft]').forEach(b => b.addEventListener('click', async () => {
+      const [orderId, sku, mobile, name, product, daysOverdue, cycleSource, reorderCycleDays] = b.dataset.draft.split('|');
+      const row = document.querySelector(`[data-draft-row="${CSS.escape(orderId)}|${CSS.escape(sku)}"]`);
+      if (!row) return;
+      b.disabled = true; b.textContent = 'Drafting…';
+      try {
+        const result = await api('/api/replenishment/draft-message', { method: 'POST', body: JSON.stringify({
+          mobile, name, product, daysOverdue: Number(daysOverdue), cycleSource, reorderCycleDays: Number(reorderCycleDays),
+        }) });
+        row.style.display = '';
+        row.querySelector('[data-draft-text]').value = result.draft;
+        if (result.configured === false) toast('AI not configured — showing a plain fallback message', 'error');
+      } catch (e) { toast('Failed: ' + e.message, 'error'); }
+      b.disabled = false; b.textContent = 'AI: Draft message';
+    }));
+    document.querySelectorAll('[data-copy-draft]').forEach(b => b.addEventListener('click', async () => {
+      const textarea = b.closest('tr').querySelector('[data-draft-text]');
+      try {
+        await navigator.clipboard.writeText(textarea.value);
+        toast('Copied to clipboard', 'success');
+      } catch (e) { toast('Could not copy — select the text manually', 'error'); }
     }));
   } catch (e) {
     el.innerHTML = `<div class="empty">Failed to load: ${esc(e.message)}</div>`;
@@ -1770,6 +1801,9 @@ async function loadInventory() {
       <button id="addInventoryBtn">+ Add</button>
     </div>
     <div id="inventoryTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
+  </div>
+  <div class="panel"><h2>Demand Forecast <span class="muted" style="font-weight:normal">(projects days-of-stock-remaining from each item's actual sales velocity over the last 90 days — catches a fast seller before it hits the low-stock threshold)</span></h2>
+    <div id="forecastTable"><div class="empty">Loading…</div></div>
   </div>`;
   async function refresh() {
     const items = await api('/api/inventory');
@@ -1816,6 +1850,19 @@ async function loadInventory() {
     } catch (e) { toast('Failed: ' + e.message, 'error'); }
   });
   refresh().catch(e => { document.getElementById('inventoryTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+
+  async function refreshForecast() {
+    const forecast = await api('/api/inventory/forecast');
+    document.getElementById('forecastTable').innerHTML = forecast.length
+      ? `<table><thead><tr><th>Name</th><th>Stock</th><th>Sold (90d)</th><th>Daily rate</th><th>Days left</th></tr></thead><tbody>
+          ${forecast.map(f => `<tr ${f.willStockOutSoon ? 'style="background:rgba(220,80,80,0.12)"' : ''}>
+            <td>${esc(f.name)}</td><td>${f.stock}</td><td>${f.unitsSoldLast90Days}</td><td>${f.dailyRate}/day</td>
+            <td>${f.daysOfStockLeft}d${f.willStockOutSoon ? ' ⚠️ restock soon' : ''}</td>
+          </tr>`).join('')}
+        </tbody></table>`
+      : '<div class="empty">No forecast yet — needs at least one item with matching sales in the last 90 days.</div>';
+  }
+  refreshForecast().catch(e => { document.getElementById('forecastTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
 }
 
 // ---------- Staff Performance ----------
@@ -1860,6 +1907,22 @@ async function loadAiAssistant() {
       <textarea id="kb_content" placeholder="Content (what the assistant should say — be precise, this is what customers will be told)" style="width:100%;min-height:70px;margin-top:8px"></textarea>
       <div class="row" style="margin-top:8px"><button id="addKbBtn">+ Add article</button></div>
       <div id="kbTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
+    </div>
+    <div class="panel">
+      <h2>AI Evals <span class="muted" style="font-weight:normal">(a fixed set of question → expected-answer checks — re-run any time you change the Knowledge Base, the AI provider, or a prompt, to catch a regression before a customer does)</span></h2>
+      <div class="row">
+        <input id="eval_question" placeholder="Question a customer might ask" style="flex:1;min-width:200px" />
+      </div>
+      <div class="row" style="margin-top:8px">
+        <input id="eval_expected" placeholder="Must mention (comma-separated keywords)" style="flex:1" />
+        <input id="eval_forbidden" placeholder="Must NOT mention (comma-separated, optional)" style="flex:1" />
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button id="addEvalBtn">+ Add eval case</button>
+        <button id="runEvalsBtn" class="secondary">Run all evals now</button>
+      </div>
+      <div id="evalRunSummary" style="margin-top:10px"></div>
+      <div id="evalTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
     </div>
   `;
 
@@ -1925,6 +1988,59 @@ async function loadAiAssistant() {
     } catch (e) { toast('Failed: ' + e.message, 'error'); }
   });
   refreshKb().catch(e => { document.getElementById('kbTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+
+  function renderEvalResultBadge(r) {
+    if (!r) return '';
+    if (r.configured === false) return '<span class="muted">not run yet</span>';
+    return r.passed ? '<span style="color:#3fb95f">✓ pass</span>' : '<span style="color:#e06a5a">✗ fail</span>';
+  }
+  let lastEvalResults = {};
+  async function refreshEvals() {
+    const items = await api('/api/ai/evals');
+    document.getElementById('evalTable').innerHTML = items.length
+      ? `<table><thead><tr><th>Question</th><th>Must mention</th><th>Must NOT mention</th><th>Last result</th><th></th></tr></thead><tbody>
+          ${items.map(i => `<tr>
+            <td style="max-width:280px;white-space:pre-wrap">${esc(i.question)}</td>
+            <td>${esc((i.expectedKeywords || []).join(', '))}</td>
+            <td>${esc((i.mustNotContain || []).join(', '))}</td>
+            <td>${renderEvalResultBadge(lastEvalResults[i.id])}</td>
+            <td><button class="danger" data-del-eval="${esc(i.id)}" style="padding:3px 8px;font-size:11px">Delete</button></td>
+          </tr>${lastEvalResults[i.id] && lastEvalResults[i.id].configured && !lastEvalResults[i.id].passed ? `<tr><td colspan="5" class="muted" style="font-size:12px;padding-top:0">
+            AI answered: "${esc(lastEvalResults[i.id].answer || '')}"${(lastEvalResults[i.id].missingKeywords || []).length ? ` — missing: ${esc(lastEvalResults[i.id].missingKeywords.join(', '))}` : ''}${(lastEvalResults[i.id].foundForbidden || []).length ? ` — contains forbidden: ${esc(lastEvalResults[i.id].foundForbidden.join(', '))}` : ''}
+          </td></tr>` : ''}`).join('')}
+        </tbody></table>`
+      : '<div class="empty">No eval cases yet — add a question and the keywords a correct answer must mention.</div>';
+    document.querySelectorAll('[data-del-eval]').forEach(b => b.addEventListener('click', async () => {
+      try { await api('/api/ai/evals/' + encodeURIComponent(b.dataset.delEval), { method: 'DELETE' }); toast('Deleted', 'success'); refreshEvals(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); }
+    }));
+  }
+  document.getElementById('addEvalBtn').addEventListener('click', async () => {
+    const question = document.getElementById('eval_question').value.trim();
+    const expectedKeywords = document.getElementById('eval_expected').value.split(',').map(s => s.trim()).filter(Boolean);
+    const mustNotContain = document.getElementById('eval_forbidden').value.split(',').map(s => s.trim()).filter(Boolean);
+    if (!question || !expectedKeywords.length) return toast('Question and at least one expected keyword are required', 'error');
+    try {
+      await api('/api/ai/evals', { method: 'POST', body: JSON.stringify({ question, expectedKeywords, mustNotContain }) });
+      document.getElementById('eval_question').value = ''; document.getElementById('eval_expected').value = ''; document.getElementById('eval_forbidden').value = '';
+      toast('Eval case added', 'success'); refreshEvals();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+  document.getElementById('runEvalsBtn').addEventListener('click', async () => {
+    const btn = document.getElementById('runEvalsBtn');
+    btn.disabled = true; btn.textContent = 'Running…';
+    try {
+      const { results, summary } = await api('/api/ai/evals/run', { method: 'POST' });
+      lastEvalResults = {}; results.forEach(r => { lastEvalResults[r.id] = r; });
+      document.getElementById('evalRunSummary').innerHTML = summary.total
+        ? `<span class="muted">Last run: ${summary.passed}/${summary.total - summary.notConfigured} passed${summary.notConfigured ? ` (${summary.notConfigured} skipped — AI not configured)` : ''} — ${new Date(summary.ranAt).toLocaleString()}</span>`
+        : '';
+      toast('Evals run complete', 'success');
+      refreshEvals();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+    btn.disabled = false; btn.textContent = 'Run all evals now';
+  });
+  refreshEvals().catch(e => { document.getElementById('evalTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
 }
 
 // ---------- Rewards ----------
@@ -2255,8 +2371,9 @@ async function loadSocialMedia() {
       <div id="smPostsTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
     </div>
     <div class="panel"><h2>Engagement Inbox — AI-answered comments &amp; DMs</h2>
-      <p class="muted">Every new comment/DM gets an AI-drafted reply automatically (using the Knowledge Base). Replies are <b>staff-approved before sending</b> by default — edit if needed, then Approve &amp; Send. Set <code>AI_AUTO_REPLY_SOCIAL=true</code> on Render to let the AI send replies on its own once you trust the tone/coverage.</p>
-      <div id="smEngagementTable"><div class="empty">Loading…</div></div>
+      <p class="muted">Every new comment/DM gets an AI-drafted reply automatically (using the Knowledge Base). Replies are <b>staff-approved before sending</b> by default — edit if needed, then Approve &amp; Send. Set <code>AI_AUTO_REPLY_SOCIAL=true</code> on Render to let the AI send replies on its own once you trust the tone/coverage. 🚨 urgent items (possible complaint/refund/health issue) always float to the top and never auto-send, even if that setting is on.</p>
+      <div class="row"><select id="sm_priorityFilter"><option value="">All priorities</option><option value="high">🚨 Urgent only</option><option value="medium">⚠️ Negative only</option><option value="normal">Normal only</option></select></div>
+      <div id="smEngagementTable" style="margin-top:8px"><div class="empty">Loading…</div></div>
     </div>
     <div class="panel"><h2>Meta Ads Manager</h2>
       <p class="muted"><b>Real ad spend.</b> "Launch" only creates the campaign in Meta, paused (₹0 spent) — review it in Meta's own Ads Manager, then use "Activate" here (or in Meta) when you're ready to actually spend. Not yet tested against a live ad account — start with a small daily budget.</p>
@@ -2277,8 +2394,19 @@ async function loadSocialMedia() {
         <input id="ad_media" placeholder="Ad image URL" style="min-width:220px" />
       </div>
       <textarea id="ad_caption" placeholder="Ad copy…" style="width:100%;min-height:60px;margin-top:8px"></textarea>
+      <div class="row" style="margin-top:8px">
+        <input id="ad_variantGroup" placeholder="Variant group (optional — same value on 2+ campaigns to A/B test them)" style="flex:1;min-width:220px" />
+        <input id="ad_variantLabel" placeholder="Variant label (e.g. A)" style="max-width:130px" />
+      </div>
       <div class="row" style="margin-top:8px"><button id="ad_saveBtn">Save draft campaign</button></div>
       <div id="adCampaignsTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
+    </div>
+    <div class="panel"><h2>Ad Variant Comparison <span class="muted" style="font-weight:normal">(compare 2+ campaigns sharing a variant group by click-through rate)</span></h2>
+      <div class="row">
+        <input id="avc_groupId" placeholder="Variant group name to compare" style="flex:1" />
+        <button id="avc_compareBtn">Compare</button>
+      </div>
+      <div id="avcResult" style="margin-top:10px"></div>
     </div>
   `;
 
@@ -2344,15 +2472,20 @@ async function loadSocialMedia() {
     }));
   }
 
+  document.getElementById('sm_priorityFilter').addEventListener('change', () => refreshEngagement());
   async function refreshEngagement() {
-    const rows = await api('/api/social/engagement');
+    const priority = document.getElementById('sm_priorityFilter').value;
+    const rows = await api('/api/social/engagement' + (priority ? '?priority=' + encodeURIComponent(priority) : ''));
     document.getElementById('smEngagementTable').innerHTML = rows.length
       ? rows.map(r => `
         <div style="border:1px solid var(--border,#333);border-radius:8px;padding:10px;margin-bottom:8px">
           <div class="row" style="justify-content:space-between">
-            <span><b>${esc(r.platform)} ${esc(r.type)}</b> — ${esc(r.fromName) || 'unknown'}</span>
+            <span><b>${esc(r.platform)} ${esc(r.type)}</b> — ${esc(r.fromName) || 'unknown'}
+              ${r.priority === 'high' ? '<span class="badge" style="background:rgba(220,70,60,0.18);color:#e06a5a">🚨 urgent</span>' : r.priority === 'medium' ? '<span class="badge" style="background:rgba(220,160,40,0.18);color:#c99a2e">⚠️ negative</span>' : ''}
+            </span>
             <span class="badge ${r.status === 'pending' ? '' : r.status === 'dismissed' ? 'inactive' : 'active'}">${esc(r.status)}</span>
           </div>
+          ${(r.flaggedKeywords || []).length ? `<div class="muted" style="font-size:11px;margin-top:2px">Flagged for: ${esc(r.flaggedKeywords.join(', '))}</div>` : ''}
           <p style="margin:6px 0">"${esc(r.message)}"</p>
           ${r.status === 'pending' ? `
             <textarea data-reply="${r.id}" style="width:100%;min-height:50px">${esc(r.aiDraftReply)}</textarea>
@@ -2392,14 +2525,38 @@ async function loadSocialMedia() {
         mediaUrl: document.getElementById('ad_media').value.trim(),
         ageMin: document.getElementById('ad_ageMin').value, ageMax: document.getElementById('ad_ageMax').value,
         genders: document.getElementById('ad_gender').value,
+        variantGroupId: document.getElementById('ad_variantGroup').value.trim() || null,
+        variantLabel: document.getElementById('ad_variantLabel').value.trim() || null,
       }) });
       document.getElementById('ad_name').value = '';
       document.getElementById('ad_budget').value = '';
       document.getElementById('ad_caption').value = '';
       document.getElementById('ad_media').value = '';
+      document.getElementById('ad_variantGroup').value = '';
+      document.getElementById('ad_variantLabel').value = '';
       toast('Draft campaign saved', 'success');
       refreshCampaigns();
     } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+
+  document.getElementById('avc_compareBtn').addEventListener('click', async () => {
+    const groupId = document.getElementById('avc_groupId').value.trim();
+    if (!groupId) return toast('Enter a variant group name', 'error');
+    const resultEl = document.getElementById('avcResult');
+    resultEl.innerHTML = '<div class="empty">Comparing…</div>';
+    try {
+      const { ranked, winner, reason } = await api('/api/ads/campaigns/compare?groupId=' + encodeURIComponent(groupId));
+      resultEl.innerHTML = `
+        <table><thead><tr><th>Variant</th><th>Impressions</th><th>Clicks</th><th>CTR</th><th>CPC</th><th></th></tr></thead><tbody>
+          ${ranked.map(r => `<tr ${r.id === winner ? 'style="background:rgba(30,140,110,0.12)"' : ''}>
+            <td>${esc(r.variantLabel || r.name)}</td><td>${r.impressions}</td><td>${r.clicks}</td>
+            <td>${r.ctr !== null ? (r.ctr * 100).toFixed(2) + '%' : '—'}</td>
+            <td>${r.cpc !== null ? '₹' + r.cpc.toFixed(2) : '—'}</td>
+            <td>${r.id === winner ? '🏆 leading' : ''}</td>
+          </tr>`).join('')}
+        </tbody></table>
+        <p class="muted" style="margin-top:6px">${esc(reason)}</p>`;
+    } catch (e) { resultEl.innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; }
   });
 
   async function refreshCampaigns() {
@@ -2407,7 +2564,7 @@ async function loadSocialMedia() {
     document.getElementById('adCampaignsTable').innerHTML = campaigns.length
       ? `<table><thead><tr><th>Name</th><th>Objective</th><th>Daily budget</th><th>Status</th><th></th></tr></thead><tbody>
           ${campaigns.map(c => `<tr>
-            <td>${esc(c.name)}</td><td>${esc(c.objective)}</td><td>₹${esc(String(c.dailyBudget))}</td>
+            <td>${esc(c.name)}${c.variantGroupId ? `<div class="muted" style="font-size:11px">Variant group: ${esc(c.variantGroupId)}${c.variantLabel ? ' (' + esc(c.variantLabel) + ')' : ''}</div>` : ''}</td><td>${esc(c.objective)}</td><td>₹${esc(String(c.dailyBudget))}</td>
             <td><span class="badge ${c.status === 'active' ? 'active' : c.status === 'failed' ? 'inactive' : ''}">${esc(c.status)}</span>${c.error ? `<div class="muted" style="font-size:11px">${esc(c.error)}</div>` : ''}</td>
             <td>
               ${c.status === 'draft' ? `<button class="secondary" data-launch="${c.id}" style="padding:3px 8px;font-size:11px">Launch (paused)</button>
