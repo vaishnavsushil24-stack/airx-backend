@@ -2575,11 +2575,79 @@ app.put("/api/settings/commission", requireAccess("commission"), (req, res) => {
   res.json(db.prepare("SELECT * FROM commission_settings ORDER BY setting_key").all());
 });
 
+// Phase 26: distributor payout anomaly detection. A weekly matching payout
+// run can involve dozens of members and is computed automatically from PV
+// ledger data - a data-entry mistake upstream (a duplicate order counted
+// twice, a wrongly-placed member) can silently produce one member's payout
+// being far larger than usual, with nothing forcing a human to notice before
+// it's committed and paid out. This flags anything that looks unusual for
+// REVIEW ONLY - it never blocks or changes a payout, exactly the same
+// "surface it, founder/admin decides" principle as the low-stock and
+// near-expiry banners. Pure function - no I/O, no DB access itself.
+const PAYOUT_ANOMALY_OWN_HISTORY_MULTIPLIER = 3; // vs. this member's own average
+const PAYOUT_ANOMALY_NO_HISTORY_MULTIPLIER = 5; // vs. this run's median, for a first-time payout
+
+function computeMedian(numbers) {
+  if (!numbers.length) return 0;
+  const sorted = [...numbers].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
+
+// currentMembers: [{member_code, net_amount}] - this run's computed payouts.
+// historicalPayoutsByMember: { member_code: [net_amount, ...] } - that
+// member's own net_amount from PAST committed runs (never including the
+// current one).
+function detectPayoutAnomalies(currentMembers, historicalPayoutsByMember) {
+  const positiveAmounts = currentMembers.map((m) => Number(m.net_amount) || 0).filter((a) => a > 0);
+  const runMedian = computeMedian(positiveAmounts);
+  const anomalies = [];
+  currentMembers.forEach((m) => {
+    const amount = Number(m.net_amount) || 0;
+    if (amount <= 0) return; // no payout this run - nothing to flag
+    const history = (historicalPayoutsByMember[m.member_code] || []).map(Number).filter((a) => a > 0);
+    if (history.length) {
+      const avg = round2(history.reduce((s, a) => s + a, 0) / history.length);
+      if (avg > 0 && amount > avg * PAYOUT_ANOMALY_OWN_HISTORY_MULTIPLIER) {
+        anomalies.push({
+          member_code: m.member_code,
+          net_amount: amount,
+          reason: `₹${amount} is ${round2(amount / avg)}x this member's own average payout (₹${avg}) — worth a quick check before paying out`,
+        });
+      }
+    } else if (runMedian > 0 && amount > runMedian * PAYOUT_ANOMALY_NO_HISTORY_MULTIPLIER) {
+      anomalies.push({
+        member_code: m.member_code,
+        net_amount: amount,
+        reason: `first payout of ₹${amount} is ${round2(amount / runMedian)}x this run's median payout (₹${runMedian}) — worth a quick check before paying out`,
+      });
+    }
+  });
+  return anomalies;
+}
+
+// Looks up each given member's own past committed net_amount history (most
+// recent runs first, capped) - the only DB-touching part, kept separate from
+// the pure detectPayoutAnomalies above so that function stays unit-testable.
+function getHistoricalPayoutsByMember(memberCodes, excludePeriodLabel) {
+  const byMember = {};
+  const stmt = db.prepare(
+    `SELECT net_amount FROM payouts WHERE member_code = ? AND period_label != ? ORDER BY id DESC LIMIT 10`
+  );
+  memberCodes.forEach((code) => {
+    byMember[code] = stmt.all(code, excludePeriodLabel || "").map((r) => r.net_amount);
+  });
+  return byMember;
+}
+
 // ---------- Weekly matching payout run (preview, read-only, then commit) ----------
 
 app.get("/api/payouts/preview", requireAccess("payouts"), (req, res) => {
   const periodLabel = req.query.period || `PREVIEW-${new Date().toISOString().slice(0, 10)}`;
-  res.json(computeMatching(periodLabel));
+  const result = computeMatching(periodLabel);
+  const historical = getHistoricalPayoutsByMember(result.members.map((m) => m.member_code), periodLabel);
+  const anomalies = detectPayoutAnomalies(result.members, historical);
+  res.json({ ...result, anomalies });
 });
 
 app.post("/api/payouts/commit", requireAccess("payouts"), (req, res) => {
@@ -2589,6 +2657,9 @@ app.post("/api/payouts/commit", requireAccess("payouts"), (req, res) => {
   if (already) return res.status(409).json({ error: `period_label "${period_label}" was already committed` });
 
   const result = computeMatching(period_label);
+  const historical = getHistoricalPayoutsByMember(result.members.map((m) => m.member_code), period_label);
+  const anomalies = detectPayoutAnomalies(result.members, historical);
+  if (anomalies.length) console.warn(`Payout anomalies flagged for ${period_label}:`, JSON.stringify(anomalies));
 
   const insertPayout = db.prepare(
     `INSERT INTO payouts (member_code, period_label, gross_amount, tds_amount, admin_charge, net_amount, status)
@@ -2619,7 +2690,7 @@ app.post("/api/payouts/commit", requireAccess("payouts"), (req, res) => {
   db.prepare("UPDATE pv_ledger SET consumed_in_period = ? WHERE consumed_in_period IS NULL").run(period_label);
   insertRun.run(period_label, result.total_incoming_bv, result.total_outgoing_net, result.payout_ratio_percent);
 
-  res.json({ committed: true, ...result });
+  res.json({ committed: true, ...result, anomalies });
 });
 
 app.get("/api/payouts/runs", requireAccess("payouts"), (req, res) => {
@@ -3580,9 +3651,11 @@ app.delete("/api/admin/users/:id", requireAccess("user_management"), (req, res) 
 // Needs ONE of these env vars to activate:
 //   OPENAI_API_KEY      - from platform.openai.com (checked first)
 //   ANTHROPIC_API_KEY   - from console.anthropic.com (used if no OpenAI key)
-// Optional model overrides:
-//   OPENAI_MODEL         - defaults to "gpt-4o-mini"
-//   ANTHROPIC_MODEL       - defaults to "claude-sonnet-4-5-20250929"
+// Optional model overrides (Phase 29 - tiered routing, see below):
+//   OPENAI_MODEL / OPENAI_MODEL_FAST     - "fast" tier, defaults to "gpt-4o-mini"
+//   OPENAI_MODEL_SMART                   - "smart" tier, defaults to "gpt-4o"
+//   ANTHROPIC_MODEL_FAST                 - "fast" tier, defaults to "claude-3-5-haiku-20241022"
+//   ANTHROPIC_MODEL / ANTHROPIC_MODEL_SMART - "smart" tier, defaults to "claude-sonnet-4-5-20250929"
 //
 // Until one of the API keys is set, every route below returns a clean
 // "not configured yet" response instead of crashing — the same
@@ -3609,8 +3682,32 @@ if (!fs.existsSync(KB_FILE)) fs.writeFileSync(KB_FILE, "[]");
 // Each entry: { id, category: "product_education"|"faq"|"policy", title, content }
 
 const AI_PROVIDER = process.env.OPENAI_API_KEY ? "openai" : process.env.ANTHROPIC_API_KEY ? "anthropic" : null;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
-const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5-20250929";
+
+// Phase 29: tiered model routing. Every AI call in this app used to go
+// through one fixed model per provider - fine for OpenAI (gpt-4o-mini was
+// already the cheap default), but on Anthropic every single call, including
+// short customer-facing replies and caption suggestions, was hitting the
+// full Sonnet model. Most of what this app asks an AI to do (answer from a
+// fixed Knowledge Base, draft a short reply, suggest a caption, summarize
+// today's numbers) doesn't need the strongest available model - only the
+// staff copilot's multi-step tool-calling (/api/ai/ask) genuinely benefits
+// from the smarter tier. Splitting into "fast" (default) and "smart" tiers
+// keeps quality where it matters and cuts cost everywhere else, with zero
+// behavior change for OpenAI users (fast tier = the same gpt-4o-mini this
+// app always defaulted to) and a real cost reduction for Anthropic users.
+const OPENAI_MODEL_FAST = process.env.OPENAI_MODEL_FAST || process.env.OPENAI_MODEL || "gpt-4o-mini";
+const OPENAI_MODEL_SMART = process.env.OPENAI_MODEL_SMART || "gpt-4o";
+const ANTHROPIC_MODEL_FAST = process.env.ANTHROPIC_MODEL_FAST || "claude-3-5-haiku-20241022";
+const ANTHROPIC_MODEL_SMART = process.env.ANTHROPIC_MODEL_SMART || process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5-20250929";
+
+// Pure function - no I/O. Picks the model string for a given provider+tier;
+// factored out so the routing decision itself is unit-testable without
+// mocking fetch.
+function selectAIModel(provider, tier) {
+  if (provider === "openai") return tier === "smart" ? OPENAI_MODEL_SMART : OPENAI_MODEL_FAST;
+  if (provider === "anthropic") return tier === "smart" ? ANTHROPIC_MODEL_SMART : ANTHROPIC_MODEL_FAST;
+  return null;
+}
 
 // Normalized message shape every caller below uses, regardless of provider:
 //   { role: "system"|"user"|"assistant"|"tool", content: string,
@@ -3619,7 +3716,7 @@ const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5-202509
 // Normalized tool shape: { name, description, parameters: <JSON schema> }
 // Always returns { configured, text, toolCalls: [{ id, name, input }] } —
 // callers never need to know which provider actually answered.
-async function callAI({ messages, tools, max_tokens = 1024 }) {
+async function callAI({ messages, tools, max_tokens = 1024, tier = "fast" }) {
   if (!AI_PROVIDER) {
     return {
       configured: false,
@@ -3630,7 +3727,7 @@ async function callAI({ messages, tools, max_tokens = 1024 }) {
 
   if (AI_PROVIDER === "openai") {
     const body = {
-      model: OPENAI_MODEL,
+      model: selectAIModel("openai", tier),
       max_tokens,
       messages: messages.map((m) => {
         if (m.role === "assistant" && m.tool_calls) {
@@ -3699,7 +3796,7 @@ async function callAI({ messages, tools, max_tokens = 1024 }) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: ANTHROPIC_MODEL,
+      model: selectAIModel("anthropic", tier),
       max_tokens,
       system,
       messages: anthMessages,
@@ -4102,7 +4199,10 @@ about current data. Answer concisely, in plain language, with numbers where rele
     let configured = true;
 
     for (let round = 0; round < 5; round++) {
-      const result = await callAI({ messages, tools: AI_TOOLS, max_tokens: 800 });
+      // "smart" tier: multi-step tool-calling over live system data genuinely
+      // benefits from the stronger model, unlike the short, KB-grounded
+      // customer-facing replies elsewhere in this app (see Phase 29 above).
+      const result = await callAI({ messages, tools: AI_TOOLS, max_tokens: 800, tier: "smart" });
       if (!result.configured) {
         finalText = result.text;
         configured = false;
@@ -5030,6 +5130,185 @@ app.post("/api/referrals/:id/void", requireAccess("orders"), (req, res) => {
   referrals[idx].note = req.body.note || referrals[idx].note;
   writeJson(REFERRALS_FILE, referrals);
   res.json(referrals[idx]);
+});
+
+// ---------------------------------------------------------------------
+// Phase 27 — referral-propensity scoring (2026-08-27)
+// ---------------------------------------------------------------------
+// The Phase 17 referral bridge is entirely reactive - it only records a
+// referral after someone already used a referral code. There was no way to
+// tell staff WHICH delivered customers are worth proactively asking "hey,
+// know anyone else who'd like this?" This is a deliberately simple,
+// explainable points-based heuristic (not a trained model - there isn't
+// remotely enough referral history yet to train one, and a black-box score
+// nobody can explain to a customer-facing staff member isn't useful anyway).
+// Every point has a stated reason in the output, and the score is a ranking
+// aid for staff, never an automatic action - nothing gets contacted or
+// changed based on it.
+const REFERRAL_PROPENSITY_RECENT_DAYS = 30;
+
+// Pure function - no I/O. orders: full ORDERS_FILE array. mobile: the
+// customer being scored (already known to have at least one delivered order).
+function computeReferralPropensity(mobile, orders, now) {
+  now = now || Date.now();
+  const customerOrders = orders.filter((o) => o.mobile === mobile);
+  const deliveredOrders = customerOrders.filter((o) => o.status === "delivered");
+  if (!deliveredOrders.length) return null; // never delivered - nothing to score yet
+
+  let score = 20; // baseline: any delivered customer is a plausible referrer
+  const reasons = ["baseline: has at least one delivered order (+20)"];
+
+  // Proven referrer - someone else's order already names this mobile as
+  // referredByMobile. Strongest signal available: they've already done it.
+  const referredOthers = orders.filter((o) => o.referredByMobile === mobile).length;
+  if (referredOthers > 0) {
+    score += 30;
+    reasons.push(`already referred ${referredOthers} other order${referredOthers > 1 ? "s" : ""} (+30)`);
+  }
+
+  // Repeat-purchase loyalty - more delivered orders = more invested in the
+  // brand, capped so one very high-frequency outlier doesn't dominate.
+  const loyaltyPoints = Math.min(30, (deliveredOrders.length - 1) * 10);
+  if (loyaltyPoints > 0) {
+    score += loyaltyPoints;
+    reasons.push(`${deliveredOrders.length} delivered orders total (+${loyaltyPoints})`);
+  }
+
+  // Recency - a customer who just received a delivery is warmer to ask than
+  // one who ordered a year ago and hasn't been heard from since.
+  const mostRecentDeliveredMs = Math.max(...deliveredOrders.map((o) => new Date(o.deliveredAt || o.createdAt).getTime()).filter((ms) => !isNaN(ms)));
+  if (isFinite(mostRecentDeliveredMs)) {
+    const daysSince = Math.floor((now - mostRecentDeliveredMs) / (24 * 60 * 60 * 1000));
+    if (daysSince >= 0 && daysSince <= REFERRAL_PROPENSITY_RECENT_DAYS) {
+      score += 15;
+      reasons.push(`most recent delivery was ${daysSince} day${daysSince === 1 ? "" : "s"} ago (+15)`);
+    }
+  }
+
+  return { mobile, score: Math.min(100, score), reasons, deliveredOrderCount: deliveredOrders.length, alreadyReferredCount: referredOthers };
+}
+
+app.get("/api/referrals/propensity", requireAccess("orders"), (req, res) => {
+  try {
+    const orders = readJson(ORDERS_FILE);
+    const mobiles = [...new Set(orders.filter((o) => o.status === "delivered" && o.mobile).map((o) => o.mobile))];
+    const scored = mobiles
+      .map((m) => computeReferralPropensity(m, orders))
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 50);
+    // Attach a display name from their most recent order, purely for the
+    // admin UI - not part of the scoring itself.
+    scored.forEach((s) => {
+      const latest = orders.filter((o) => o.mobile === s.mobile).sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""))[0];
+      s.name = (latest && latest.name) || "";
+    });
+    res.json(scored);
+  } catch (err) {
+    console.error("Referral propensity error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------
+// Phase 28 — one daily AI briefing (2026-08-27)
+// ---------------------------------------------------------------------
+// By this point there are half a dozen separate signals scattered across
+// different tabs (low stock, near-expiry, replenishment due, demand
+// forecast stock-outs, urgent engagement, referral-propensity leads) - all
+// genuinely useful, but nobody has time to check six panels every morning.
+// This pulls them into one short daily read. Deliberately cached per
+// calendar day (not regenerated on every page load) to avoid burning AI
+// calls for the same content repeatedly, with an explicit refresh button
+// for when something changes mid-day. Completes Tier 2 of the AI Upgrade
+// Roadmap.
+const BRIEFING_FILE = path.join(JSON_DATA_DIR, "daily_briefing.json");
+if (!fs.existsSync(BRIEFING_FILE)) fs.writeFileSync(BRIEFING_FILE, JSON.stringify({ date: null, text: null, generatedAt: null, configured: null }));
+
+// The only I/O-touching part - gathers today's numbers from the same
+// functions/logic every other tab already uses, so the briefing can never
+// disagree with what staff sees elsewhere.
+function gatherBriefingSignals() {
+  const orders = readJson(ORDERS_FILE);
+  const inventory = readJson(INVENTORY_FILE);
+  const lowStock = aiTool_getLowStock();
+  const nearExpiry = aiTool_getNearExpiry();
+  const replenishmentDue = computeReplenishmentDue(orders, inventory, readJson(REPLENISH_DISMISSED_FILE));
+  const stockingOutSoon = computeDemandForecast(orders, inventory).filter((f) => f.willStockOutSoon);
+  const engagement = readJson(SOCIAL_ENGAGEMENT_FILE);
+  const urgentEngagement = engagement.filter((e) => e.priority === "high" && e.status === "pending");
+  const deliveredMobiles = [...new Set(orders.filter((o) => o.status === "delivered" && o.mobile).map((o) => o.mobile))];
+  const topReferralCandidates = deliveredMobiles
+    .map((m) => computeReferralPropensity(m, orders))
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3);
+  return {
+    lowStock, nearExpiry, replenishmentDue, stockingOutSoon, urgentEngagement, topReferralCandidates,
+    leads: aiTool_getLeadsSummary(), orderStats: aiTool_getOrdersSummary(),
+  };
+}
+
+// Pure function - no I/O. Turns the gathered signals into a plain bullet
+// list, used both as the always-available fallback (AI not configured) and
+// as the input handed to the AI for the natural-language version.
+function summarizeBriefingSignals(signals) {
+  const lines = [];
+  if (signals.lowStock.length) lines.push(`${signals.lowStock.length} item(s) at/below their low-stock threshold: ${signals.lowStock.map((i) => i.name).slice(0, 5).join(", ")}`);
+  if (signals.nearExpiry.length) lines.push(`${signals.nearExpiry.length} batch(es) expiring within 60 days`);
+  if (signals.stockingOutSoon.length) lines.push(`${signals.stockingOutSoon.length} item(s) projected to stock out within 14 days based on recent sales velocity: ${signals.stockingOutSoon.map((i) => i.name).slice(0, 5).join(", ")}`);
+  if (signals.replenishmentDue.length) lines.push(`${signals.replenishmentDue.length} customer(s) likely ready to reorder`);
+  if (signals.urgentEngagement.length) lines.push(`${signals.urgentEngagement.length} urgent social comment(s)/DM(s) awaiting a reply`);
+  if (signals.topReferralCandidates.length) lines.push(`Best referral-ask candidates today: ${signals.topReferralCandidates.map((c) => `${c.mobile} (score ${c.score})`).join(", ")}`);
+  if (signals.leads.total) lines.push(`${signals.leads.total} total leads on file (${Object.entries(signals.leads.byStatus).map(([k, v]) => `${v} ${k}`).join(", ")})`);
+  if (signals.orderStats.total) lines.push(`${signals.orderStats.total} total orders, ₹${signals.orderStats.totalSales.toLocaleString("en-IN")} total sales`);
+  if (!lines.length) lines.push("Nothing urgent to flag today — all clear across inventory, engagement, and reorders.");
+  return lines;
+}
+
+async function generateDailyBriefing() {
+  const signals = gatherBriefingSignals();
+  const bulletLines = summarizeBriefingSignals(signals);
+  const fallbackText = bulletLines.map((l) => `• ${l}`).join("\n");
+
+  const system = `You write a short, warm daily operations briefing for the founder of AIRX PLUS Healthcare, an
+Ayurvedic D2C + MLM business. Turn the bullet-point signals below into 3-5 short sentences, prioritizing anything
+urgent first (urgent engagement, stock-outs) before routine numbers. Plain language, no jargon, no markdown headers.
+Output ONLY the briefing text.`;
+  try {
+    const result = await callAI({
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: bulletLines.join("\n") },
+      ],
+      max_tokens: 300,
+    });
+    if (!result.configured || !result.text) return { text: fallbackText, configured: false, signals };
+    return { text: result.text.trim(), configured: true, signals };
+  } catch (err) {
+    console.error("Daily briefing generation failed:", err.message);
+    return { text: fallbackText, configured: false, signals };
+  }
+}
+
+app.get("/api/briefing/daily", requireAccess("dashboard"), async (req, res) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const cached = readJson(BRIEFING_FILE);
+    if (cached.date === today && req.query.refresh !== "true") {
+      return res.json(cached);
+    }
+    const { text, configured, signals } = await generateDailyBriefing();
+    const briefing = { date: today, text, configured, generatedAt: new Date().toISOString(), signalCounts: {
+      lowStock: signals.lowStock.length, nearExpiry: signals.nearExpiry.length, stockingOutSoon: signals.stockingOutSoon.length,
+      replenishmentDue: signals.replenishmentDue.length, urgentEngagement: signals.urgentEngagement.length,
+    } };
+    writeJson(BRIEFING_FILE, briefing);
+    res.json(briefing);
+  } catch (err) {
+    console.error("Daily briefing error:", err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get("/health", (req, res) => res.json({ ok: true, time: new Date().toISOString() }));

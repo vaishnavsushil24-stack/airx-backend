@@ -19,12 +19,14 @@ Leads and orders are stored in `data/leads.json` / `data/orders.json` — good
 enough to start today; swap for a real database later if volume grows past a
 few thousand records.
 
-## Pending items — only you can do these (updated 2026-08-25)
+## Pending items — only you can do these (updated 2026-08-27)
 
-Everything buildable without new external permissions or business decisions
-has been built, tested, and deployed (through Phase 17 below). These five
-are genuinely stuck on someone/something outside this server, so they're
-listed here together instead of scattered across sections:
+Everything buildable without new external permissions, a new paid vendor
+key, or a business decision has been built, tested, and deployed (through
+Phase 29 below — the full AI Upgrade Roadmap is now complete except for
+what's listed here). These seven are genuinely stuck on someone/something
+outside this server, so they're listed here together instead of scattered
+across sections:
 
 1. **India Post IP whitelisting** — still not approved on India Post's side.
    Submit `64.227.141.75` on `/customer-selfservice/whitelist-ip-address`
@@ -66,6 +68,24 @@ listed here together instead of scattered across sections:
    setting `META_PAGE_ID`, `META_IG_BUSINESS_ID`, and
    `META_ADS_ACCOUNT_ID` on Render. Full detail in Phase 16 below. Until
    then, posts/replies/campaigns all save fine in the admin and just wait.
+6. **AI-generated post/ad imagery** — the Social Media Hub (Phase 16) and
+   Ads Manager (Phase 25) can suggest captions and ad copy via the
+   configured text AI, but generating the actual image needs a separate
+   image-generation API key (e.g. OpenAI's `gpt-image-1` / DALL-E, or
+   Stability AI) that hasn't been provided. Until then, the media
+   URL/upload fields work fine with images you supply yourself. Flagged as
+   a Tier 3 AI Upgrade Roadmap item, not built.
+7. **Voice AI for phone orders** — letting customers place or check orders
+   by phone call would need a voice/telephony vendor integration (e.g.
+   Twilio + a speech-to-text/text-to-speech pipeline) that hasn't been set
+   up — a genuinely new vendor relationship and cost, not a code change.
+   Flagged as a Tier 3 AI Upgrade Roadmap item, not built.
+
+WhatsApp-native multi-turn AI conversations (the other Tier 3 roadmap
+item) are covered by pending item #2 above — the moment WhatsApp is
+connected, the same AI assistant that already answers on the website
+(Phase 13) can be wired to answer inbound WhatsApp messages too; no
+separate blocker.
 
 Also worth a periodic manual check (no diagnostic endpoint for this one):
 Meta Lead Ads' "Standard Access" review on the `leads_retrieval` /
@@ -77,9 +97,16 @@ full data backup/export (Phase 15), the Social Media Hub's post
 composer/scheduler and AI-drafted engagement replies (Phase 16, minus the
 Meta-permission-gated live posting/ads noted above), the referral bridge
 (Phase 17 — tracking is live now, just waiting on you to pick a reward
-amount whenever you're ready, no rush and no permission needed), inventory/
-batch/expiry tracking, staff performance, multi-user admin auth, and the
-rest of the MLM feature set — is live and already working autonomously.
+amount whenever you're ready, no rush and no permission needed), automated
+tests on every push (Phase 18), semantic KB search (Phase 19), the AI eval
+harness (Phase 20), per-customer replenishment timing (Phase 21),
+sentiment-aware engagement triage (Phase 22), personalized reminder drafts
+(Phase 23), AI demand forecasting (Phase 24), ad-creative variant testing
+(Phase 25), payout anomaly detection (Phase 26), referral-propensity
+scoring (Phase 27), the daily AI briefing (Phase 28), tiered AI model
+routing (Phase 29), inventory/batch/expiry tracking, staff performance,
+multi-user admin auth, and the rest of the MLM feature set — is live and
+already working autonomously.
 
 ## 1. Deploy it (10 minutes, free tier is enough to start)
 
@@ -1573,6 +1600,158 @@ No new external permission needed — real ad spend still requires the
 same explicit Launch → review in Meta → Activate (`confirm:true`) flow
 from Phase 16, untouched by this phase.
 
-**Next up (Tier 2, continuing in sequence):** distributor payout anomaly
-detection (Phase 26) — flagging payout amounts that deviate sharply from
-a member's own history before they're paid out.
+## Phase 26 — distributor payout anomaly detection (2026-08-27)
+
+**Why:** the weekly matching payout run computes dozens of members'
+payouts automatically from PV ledger data — a data-entry mistake upstream
+(a duplicate order counted twice, a wrongly-placed member) could silently
+produce one member's payout being far larger than usual, with nothing
+forcing a human to notice before it's committed and real money moves.
+This is Tier 2 item 3 from the AI Upgrade Roadmap.
+
+- **`detectPayoutAnomalies(currentMembers, historicalPayoutsByMember)`** —
+  pure function. Flags a member's payout when it's more than 3x their own
+  historical average (using their real past committed payouts), or — for
+  a first-time member with no history — more than 5x this run's median
+  payout. **Review only**: nothing is blocked, changed, or auto-corrected,
+  exactly the same "surface it, admin decides" principle as the low-stock
+  and near-expiry banners.
+- **`getHistoricalPayoutsByMember`** — the one DB-touching helper, kept
+  separate so the actual detection logic stays a pure, unit-testable
+  function.
+- **`GET /api/payouts/preview`** and **`POST /api/payouts/commit`** both
+  now return an `anomalies` array; commit additionally logs any anomalies
+  server-side for the audit trail. Commit is **not** blocked by an
+  anomaly — the admin already reviews the full preview before committing,
+  same as before this phase.
+- Admin UI: the Payouts tab's preview now shows a ⚠️ flagged-for-review
+  panel (member, net amount, and why) above the full breakdown when any
+  anomalies are found.
+- **`test_phase26.js`** (10 assertions) — median calculation (odd/even/
+  empty), normal-vs-anomalous payouts against own history, the exact
+  multiplier boundary not being flagged, first-time-member comparison
+  against the run median, zero-payout members never flagged, and multiple
+  anomalies in one run all being reported.
+- Full regression suite (`test_phase3/6/7/8/9/14/15/16/17/19/20/21/22/23/24/25/26.js`
+  + `test_migration.js`, 18 files) passes.
+
+No new external permission needed — this only re-derives numbers already
+in the `payouts` table.
+
+## Phase 27 — referral-propensity scoring (2026-08-27)
+
+**Why:** the Phase 17 referral bridge is entirely reactive — it only
+records a referral after someone already used a referral code. There was
+no way to tell staff which delivered customers are actually worth
+proactively asking. This is Tier 2 item 4 from the AI Upgrade Roadmap.
+
+- **`computeReferralPropensity(mobile, orders, now)`** — pure function.
+  Deliberately a simple, explainable points-based heuristic, not a
+  trained model — there isn't remotely enough referral history yet to
+  train one, and a black-box score staff can't explain to a customer
+  isn't useful anyway. Every point has a stated reason in the output.
+  Signals: +20 baseline for any delivered customer, +30 for having
+  already referred someone else (the strongest signal — proven behavior),
+  up to +30 for repeat-purchase loyalty (10 pts/extra delivered order,
+  capped), +15 if their most recent delivery was within 30 days. Capped
+  at 100 total.
+- **`GET /api/referrals/propensity`** — behind `requireAccess("orders")`,
+  scores every customer with at least one delivered order and returns
+  the top 50 by score.
+- Admin UI: new "Referral-Propensity Scoring" panel on the Orders tab's
+  Referral Bridge section — customer, mobile, score, and the specific
+  reasons behind it.
+- **`test_phase27.js`** (8 assertions) — no-delivered-orders returns null,
+  baseline-only scoring, the recency bonus, loyalty points and their cap,
+  the proven-referrer bonus, all signals combining under the 100 cap,
+  cross-customer isolation, and every fired signal having a reason.
+- Full regression suite (`test_phase3/6/7/8/9/14/.../26/27.js` +
+  `test_migration.js`, 19 files) passes.
+
+No new external permission needed — this only re-derives numbers already
+in `orders.json`. Nothing is contacted or changed automatically; it's a
+ranking aid for staff.
+
+## Phase 28 — one daily AI briefing (2026-08-27)
+
+**Why:** by this point there are half a dozen separate signals scattered
+across different tabs — low stock, near-expiry, replenishment due,
+demand-forecast stock-outs, urgent engagement, referral-propensity leads
+— all genuinely useful, but nobody has time to check six panels every
+morning. This pulls them into one short daily read. This is Tier 2 item
+5, the last item, and **completes Tier 2** of the AI Upgrade Roadmap.
+
+- **`gatherBriefingSignals()`** — pulls from the exact same
+  functions/logic every other tab already uses (low-stock/near-expiry
+  tools, `computeReplenishmentDue`, `computeDemandForecast`, urgent
+  engagement items, `computeReferralPropensity`, leads/orders summaries),
+  so the briefing can never disagree with what staff sees elsewhere.
+- **`summarizeBriefingSignals(signals)`** — pure function. Turns the
+  gathered signals into a plain bullet list — only signals with actual
+  data produce a line, and an all-clear day says so explicitly rather
+  than returning nothing.
+- **`generateDailyBriefing()`** — hands that bullet list to the configured
+  AI provider for a short, warm 3-5 sentence version; always falls back
+  to the plain bulleted list (same "inert until configured" pattern as
+  the rest of the app) if no AI provider is set or the call fails.
+- **`GET /api/briefing/daily`** — behind `requireAccess("dashboard")`.
+  Cached per calendar day (`daily_briefing.json`) so it isn't
+  regenerated — and doesn't burn an AI call — on every page load;
+  `?refresh=true` forces regeneration.
+- Admin UI: new "📋 Today's briefing" panel at the top of the Dashboard
+  tab, with a Regenerate button.
+- **`test_phase28.js`** (11 assertions) — all-clear messaging, per-signal
+  line formatting (low stock, urgent engagement, replenishment,
+  referral candidates with scores, leads/order stats with sub-breakdowns),
+  and the AI-configured/not-configured/thrown-error paths of the briefing
+  generator.
+- Full regression suite (`test_phase3/6/7/8/9/14/.../27/28.js` +
+  `test_migration.js`, 20 files) passes.
+
+No new external permission needed — this only summarizes numbers already
+surfaced elsewhere in the app. **This completes Tier 2 of the AI Upgrade
+Roadmap.**
+
+## Phase 29 — tiered AI model routing (2026-08-27)
+
+**Why:** every AI call in this app went through one fixed model per
+provider. That was already cheap on OpenAI (`gpt-4o-mini` was always the
+default), but on Anthropic every single call — including short
+customer-facing replies and caption suggestions — was hitting the full
+Sonnet model. Most of what this app asks an AI to do (answer from a fixed
+Knowledge Base, draft a short reply, suggest a caption, summarize today's
+numbers) doesn't need the strongest available model; only the staff
+copilot's multi-step tool-calling genuinely benefits from it. This is the
+one buildable Tier 3 item from the AI Upgrade Roadmap.
+
+- **`selectAIModel(provider, tier)`** — pure function. `callAI()` now
+  takes an optional `tier: "fast"|"smart"` (defaults to `"fast"`).
+  OpenAI fast tier stays `gpt-4o-mini` (zero behavior change), smart tier
+  steps up to `gpt-4o`. Anthropic fast tier now defaults to
+  `claude-3-5-haiku-20241022` (a real cost reduction), smart tier keeps
+  the original `claude-sonnet-4-5-20250929` default.
+- The staff system copilot (`/api/ai/ask`, which calls tools over live
+  system data across multiple rounds) is the only call site switched to
+  `tier: "smart"`. Every other AI call in the app (customer assistant,
+  social reply drafts, caption suggestions, AI evals, replenishment
+  drafts, daily briefing) now runs on the fast tier by default.
+- All four model choices stay overridable via env vars
+  (`OPENAI_MODEL_FAST/SMART`, `ANTHROPIC_MODEL_FAST/SMART`) — see the new
+  "AI Assistant" section added to `.env.example` (which also now properly
+  documents `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` themselves, a
+  pre-existing gap from Phase 13 this phase happened to touch).
+- **`test_phase29.js`** (7 assertions) — correct model per provider/tier
+  combination, the unspecified-tier default matching `callAI`'s own
+  default parameter, an unknown provider returning null rather than
+  throwing, and an unrecognized tier string safely falling back to the
+  cheaper fast tier rather than accidentally routing to the expensive one.
+- Full regression suite (`test_phase3/6/7/8/9/14/.../28/29.js` +
+  `test_migration.js`, 21 files) passes.
+
+No new external permission needed. **This completes the buildable portion
+of the AI Upgrade Roadmap** — Tier 1 and Tier 2 are fully complete, and
+this is the one Tier 3 item that didn't require a new vendor/API key. The
+remaining Tier 3 items (WhatsApp-native AI conversations, AI-generated
+imagery, voice AI for phone orders) are documented in the "Pending items"
+list at the top of this README rather than built, since each genuinely
+needs something only the founder can provide.
