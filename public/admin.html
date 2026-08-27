@@ -456,6 +456,24 @@ async function loadDashboard() {
       api('/api/reports/payout-health'),
     ]);
 
+    // Daily AI briefing (Phase 28): best-effort, same "swallow quietly on
+    // missing permission" pattern as the banners below.
+    let briefingBanner = '';
+    try {
+      const briefing = await api('/api/briefing/daily');
+      briefingBanner = `
+        <div class="panel" style="background:rgba(80,120,220,0.08);border:1px solid rgba(80,120,220,0.30)">
+          <div class="row" style="justify-content:space-between;align-items:flex-start">
+            <h2 style="margin-top:0">📋 Today's briefing</h2>
+            <button class="secondary" id="briefingRefreshBtn" style="padding:3px 8px;font-size:11px">Regenerate</button>
+          </div>
+          <p style="white-space:pre-wrap;margin:4px 0 0">${esc(briefing.text)}</p>
+          ${briefing.configured === false ? '<p class="muted" style="font-size:11px;margin-top:6px">Plain summary shown — connect an AI provider for a written version.</p>' : ''}
+        </div>`;
+    } catch (briefingErr) {
+      // no dashboard access or briefing fetch failed — skip silently
+    }
+
     // Low-stock / near-expiry banners: best-effort — a staff user without
     // the "inventory" module permission will get a 403 here, which we
     // swallow quietly (banners just don't show, dashboard still renders).
@@ -528,6 +546,7 @@ async function loadDashboard() {
     }
 
     el.innerHTML = `
+      ${briefingBanner}
       ${lowStockBanner}
       ${expiryBanner}
       ${replenishBanner}
@@ -549,6 +568,12 @@ async function loadDashboard() {
         <p class="muted">Reminder: this dashboard reflects AIRX Ops' own database, migrated from admin.airxplus.com's member roster (verified: Active count and Total count match exactly). Historical PV/BV/payout data could not be recovered from the legacy system — it isn't stored anywhere accessible there — so incoming/outgoing above reflects only activity recorded going forward in this system.</p>
       </div>
     `;
+    const briefingRefreshBtn = document.getElementById('briefingRefreshBtn');
+    if (briefingRefreshBtn) briefingRefreshBtn.addEventListener('click', async () => {
+      briefingRefreshBtn.disabled = true; briefingRefreshBtn.textContent = 'Regenerating…';
+      try { await api('/api/briefing/daily?refresh=true'); toast('Briefing refreshed', 'success'); loadDashboard(); }
+      catch (e) { toast('Failed: ' + e.message, 'error'); briefingRefreshBtn.disabled = false; briefingRefreshBtn.textContent = 'Regenerate'; }
+    });
     document.querySelectorAll('[data-remind]').forEach(b => b.addEventListener('click', async () => {
       const [orderId, sku, mobile, name, product] = b.dataset.remind.split('|');
       b.disabled = true;
@@ -902,6 +927,14 @@ async function loadPayouts() {
           <div class="card"><div class="label">Payout Ratio</div><div class="value">${result.payout_ratio_percent}%</div></div>
           <div class="card"><div class="label">Members Matched</div><div class="value">${matched.length}</div></div>
         </div>
+        ${result.anomalies && result.anomalies.length ? `
+          <div class="panel" style="background:rgba(220,80,80,0.10);border:1px solid rgba(220,80,80,0.35);margin-top:12px">
+            <h2 style="margin-top:0">⚠️ ${result.anomalies.length} payout${result.anomalies.length > 1 ? 's' : ''} flagged for review</h2>
+            <p class="muted">Unusual compared to the member's own history (or this run's median for a first-time payout) — for review only, nothing is blocked or changed automatically.</p>
+            <table><thead><tr><th>Member</th><th>Net</th><th>Why flagged</th></tr></thead><tbody>
+              ${result.anomalies.map(a => `<tr><td>${esc(a.member_code)}</td><td>₹${a.net_amount.toLocaleString('en-IN')}</td><td>${esc(a.reason)}</td></tr>`).join('')}
+            </tbody></table>
+          </div>` : ''}
         ${matched.length ? `<table><thead><tr><th>Member</th><th>Left</th><th>Right</th><th>Pairs</th><th>Net</th></tr></thead><tbody>
           ${matched.slice(0,100).map(m => `<tr><td>${esc(m.member_code)}</td><td>${m.left_total}</td><td>${m.right_total}</td><td>${m.matched_pairs}</td><td>₹${m.net_amount.toLocaleString('en-IN')}</td></tr>`).join('')}
         </tbody></table>` : '<div class="empty">No matched pairs this period.</div>'}
@@ -1573,6 +1606,9 @@ async function loadOrders() {
     </div>
     <div id="referralSettingsNote" class="muted" style="margin-top:6px;font-size:12px"></div>
     <div id="referralsTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
+  </div>
+  <div class="panel"><h2>Referral-Propensity Scoring <span class="muted" style="font-weight:normal">(which delivered customers are worth proactively asking for a referral — explainable points, not a black-box score)</span></h2>
+    <div id="propensityTable"><div class="empty">Loading…</div></div>
   </div>`;
   let ordersCache = [];
   function passesFilter(o) {
@@ -1718,6 +1754,21 @@ async function loadOrders() {
   }
   refreshReferralSettings().catch(e => { document.getElementById('referralSettingsNote').textContent = 'Failed: ' + e.message; });
   refreshReferrals().catch(e => { document.getElementById('referralsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+
+  // ---- Referral-propensity scoring (Phase 27) ----
+  async function refreshPropensity() {
+    const rows = await api('/api/referrals/propensity');
+    document.getElementById('propensityTable').innerHTML = rows.length
+      ? `<table><thead><tr><th>Customer</th><th>Mobile</th><th>Score</th><th>Why</th></tr></thead><tbody>
+          ${rows.map(r => `<tr>
+            <td>${esc(r.name) || '—'}</td><td>${esc(r.mobile)}</td>
+            <td><b>${r.score}</b>/100</td>
+            <td style="font-size:12px" class="muted">${r.reasons.map(esc).join(' · ')}</td>
+          </tr>`).join('')}
+        </tbody></table>`
+      : '<div class="empty">No delivered customers yet to score.</div>';
+  }
+  refreshPropensity().catch(e => { document.getElementById('propensityTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
 }
 
 // ---------- Leads (Meta Lead Ads — captured automatically via /webhook/meta) ----------
