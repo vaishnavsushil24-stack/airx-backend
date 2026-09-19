@@ -446,6 +446,161 @@ function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+// ---------------------------------------------------------------------
+// Phase 31 — CSV export (any module) + lightweight canvas charts. No
+// chart library / no extra dependency, same zero-extra-asset philosophy
+// as playAlertBeep() below — plain <canvas> drawing, using this page's
+// own CSS custom properties for colors so charts match light/dark theme
+// automatically.
+// ---------------------------------------------------------------------
+async function exportCsv(path, filename) {
+  const authHeader = SESSION_TOKEN ? { 'Authorization': 'Bearer ' + SESSION_TOKEN } : { 'x-api-key': API_KEY };
+  try {
+    const res = await fetch(API_BASE + path, { headers: authHeader });
+    if (!res.ok) {
+      const body = await res.json().catch(() => null);
+      throw new Error((body && body.error) || ('HTTP ' + res.status));
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) { toast('Export failed: ' + e.message, 'error'); }
+}
+
+function chartColors() {
+  const css = getComputedStyle(document.documentElement);
+  const v = (name, fallback) => (css.getPropertyValue(name) || '').trim() || fallback;
+  return {
+    accent: v('--accent', '#2f9e6e'),
+    accent2: v('--accent-2', '#3b82f6'),
+    warn: v('--warn', '#d97706'),
+    danger: v('--danger', '#dc2626'),
+    dim: v('--text-dim', '#9fb0bf'),
+    border: v('--border', '#2a3947'),
+  };
+}
+
+function chartSetup(canvas) {
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 260, h = canvas.clientHeight || 120;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  return { ctx, w, h };
+}
+
+function drawEmptyChart(ctx, w, h, msg) {
+  ctx.fillStyle = chartColors().dim;
+  ctx.font = '11px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText(msg || 'No data yet', 10, h / 2);
+}
+
+// points: [{ y, label }]
+function drawLineChart(canvas, points, opts) {
+  opts = opts || {};
+  const { ctx, w, h } = chartSetup(canvas);
+  const C = chartColors();
+  if (!points.length) return drawEmptyChart(ctx, w, h);
+  const pad = { top: 10, right: 10, bottom: 18, left: 40 };
+  const plotW = w - pad.left - pad.right, plotH = h - pad.top - pad.bottom;
+  const values = points.map(p => p.y);
+  const maxV = Math.max(...values, 1);
+  const minV = Math.min(...values, 0);
+  const range = (maxV - minV) || 1;
+  const xStep = points.length > 1 ? plotW / (points.length - 1) : 0;
+  const xy = (i, v) => [pad.left + i * xStep, pad.top + plotH - ((v - minV) / range) * plotH];
+  ctx.strokeStyle = C.border; ctx.lineWidth = 1;
+  for (let g = 0; g <= 3; g++) {
+    const y = pad.top + (plotH / 3) * g;
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(w - pad.right, y); ctx.stroke();
+    const val = maxV - (range / 3) * g;
+    ctx.fillStyle = C.dim; ctx.font = '10px sans-serif'; ctx.textAlign = 'right';
+    ctx.fillText(opts.yFormat ? opts.yFormat(val) : Math.round(val), pad.left - 6, y + 3);
+  }
+  ctx.beginPath();
+  points.forEach((p, i) => { const [x, y] = xy(i, p.y); i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y); });
+  ctx.lineTo(pad.left + (points.length - 1) * xStep, pad.top + plotH);
+  ctx.lineTo(pad.left, pad.top + plotH);
+  ctx.closePath();
+  const color = opts.color || C.accent2;
+  const grad = ctx.createLinearGradient(0, pad.top, 0, pad.top + plotH);
+  grad.addColorStop(0, color + '4d');
+  grad.addColorStop(1, color + '00');
+  ctx.fillStyle = grad; ctx.fill();
+  ctx.beginPath();
+  points.forEach((p, i) => { const [x, y] = xy(i, p.y); i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y); });
+  ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.stroke();
+  const [lx, ly] = xy(points.length - 1, points[points.length - 1].y);
+  ctx.beginPath(); ctx.arc(lx, ly, 3, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill();
+  ctx.fillStyle = C.dim; ctx.font = '10px sans-serif'; ctx.textAlign = 'center';
+  [0, Math.floor((points.length - 1) / 2), points.length - 1].forEach(i => {
+    if (!points[i]) return;
+    const [x] = xy(i, points[i].y);
+    ctx.fillText(points[i].label || '', x, h - 4);
+  });
+}
+
+// bars: [{ y, label }]
+function drawBarChart(canvas, bars, opts) {
+  opts = opts || {};
+  const { ctx, w, h } = chartSetup(canvas);
+  const C = chartColors();
+  if (!bars.length) return drawEmptyChart(ctx, w, h);
+  const pad = { top: 10, right: 10, bottom: 18, left: 40 };
+  const plotW = w - pad.left - pad.right, plotH = h - pad.top - pad.bottom;
+  const maxV = Math.max(...bars.map(b => b.y), 1);
+  const slot = plotW / bars.length;
+  const barW = Math.max(4, slot * 0.55);
+  ctx.strokeStyle = C.border;
+  ctx.beginPath(); ctx.moveTo(pad.left, pad.top + plotH); ctx.lineTo(w - pad.right, pad.top + plotH); ctx.stroke();
+  ctx.fillStyle = C.dim; ctx.font = '10px sans-serif'; ctx.textAlign = 'right';
+  ctx.fillText(opts.yFormat ? opts.yFormat(maxV) : Math.round(maxV), pad.left - 6, pad.top + 8);
+  bars.forEach((b, i) => {
+    const x = pad.left + i * slot + (slot - barW) / 2;
+    const barH = (b.y / maxV) * plotH;
+    const y = pad.top + plotH - barH;
+    ctx.fillStyle = opts.color || C.accent;
+    ctx.fillRect(x, y, barW, barH);
+  });
+  ctx.fillStyle = C.dim; ctx.font = '10px sans-serif'; ctx.textAlign = 'center';
+  bars.forEach((b, i) => ctx.fillText(b.label || '', pad.left + i * slot + slot / 2, h - 4));
+}
+
+// slices: [{ label, value }]
+function drawDonutChart(canvas, slices, opts) {
+  opts = opts || {};
+  const { ctx, w, h } = chartSetup(canvas);
+  const C = chartColors();
+  const total = slices.reduce((s, x) => s + x.value, 0);
+  if (!total) return drawEmptyChart(ctx, w, h);
+  const cx = 42, cy = h / 2, rOuter = Math.min(38, h / 2 - 4), rInner = rOuter * 0.6;
+  const palette = [C.accent, C.accent2, C.warn, C.danger, '#8b5cf6', '#14b8a6'];
+  let start = -Math.PI / 2;
+  slices.forEach((s, i) => {
+    const angle = (s.value / total) * Math.PI * 2;
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.arc(cx, cy, rOuter, start, start + angle); ctx.closePath();
+    ctx.fillStyle = palette[i % palette.length]; ctx.fill();
+    start += angle;
+  });
+  ctx.globalCompositeOperation = 'destination-out';
+  ctx.beginPath(); ctx.arc(cx, cy, rInner, 0, Math.PI * 2); ctx.fill();
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.font = '11px sans-serif'; ctx.textAlign = 'left';
+  let ly = 10;
+  slices.slice(0, 5).forEach((s, i) => {
+    ctx.fillStyle = palette[i % palette.length];
+    ctx.fillRect(94, ly, 8, 8);
+    ctx.fillStyle = C.dim;
+    ctx.fillText(`${s.label} — ₹${Math.round(s.value).toLocaleString('en-IN')}`, 106, ly + 8);
+    ly += 16;
+  });
+}
+
 // Short two-tone "new order" beep, generated on the fly (Web Audio API) —
 // no external audio file needed, matches this app's zero-extra-asset style.
 function playAlertBeep() {
@@ -564,6 +719,49 @@ async function loadDashboard() {
       // no orders access or replenishment fetch failed — skip the banner silently
     }
 
+    // Phase 31 — trend charts + recent activity: best-effort, same
+    // "swallow quietly on missing permission" pattern as every banner above.
+    let chartsData = null;
+    try { chartsData = await api('/api/reports/dashboard-charts'); } catch (chartsErr) { /* skip charts panel */ }
+    let activityRows = [];
+    try { activityRows = await api('/api/activity-log?limit=12'); } catch (actErr) { /* skip activity panel */ }
+
+    const chartsPanel = chartsData ? `
+      <div class="panel">
+        <h2 style="margin-top:0">📊 Trends</h2>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px">
+          <div>
+            <div class="muted" style="font-size:11px;margin-bottom:4px">Orders — last 30 days</div>
+            <canvas id="chartSales" style="width:100%;height:120px;display:block"></canvas>
+          </div>
+          <div>
+            <div class="muted" style="font-size:11px;margin-bottom:4px">Member growth — last 12 weeks (cumulative)</div>
+            <canvas id="chartMembers" style="width:100%;height:120px;display:block"></canvas>
+          </div>
+          <div>
+            <div class="muted" style="font-size:11px;margin-bottom:4px">Payout run totals — last ${chartsData.payoutTrend.length || 0} committed runs</div>
+            <canvas id="chartPayouts" style="width:100%;height:120px;display:block"></canvas>
+          </div>
+          <div>
+            <div class="muted" style="font-size:11px;margin-bottom:4px">Inventory value by category (at DP price)</div>
+            <canvas id="chartInventory" style="width:100%;height:120px;display:block"></canvas>
+          </div>
+        </div>
+      </div>` : '';
+
+    const activityPanel = activityRows.length ? `
+      <div class="panel">
+        <h2 style="margin-top:0">🕓 Recent activity</h2>
+        <table><thead><tr><th>When</th><th>Who</th><th>Action</th><th>Detail</th></tr></thead><tbody>
+          ${activityRows.map(a => `<tr>
+            <td>${esc((a.created_at || '').replace('T', ' ').slice(0, 16))}</td>
+            <td>${esc(a.actor || a.entity_id || '—')}</td>
+            <td>${esc((a.action || '').replace(/_/g, ' '))}</td>
+            <td class="muted">${esc(a.detail) || '—'}</td>
+          </tr>`).join('')}
+        </tbody></table>
+      </div>` : '';
+
     el.innerHTML = `
       ${briefingBanner}
       ${lowStockBanner}
@@ -577,16 +775,32 @@ async function loadDashboard() {
         <div class="card"><div class="label">Total Outgoing (Net Payouts)</div><div class="value">₹${health.total_outgoing_net.toLocaleString('en-IN')}</div></div>
         <div class="card"><div class="label">Payout Ratio</div><div class="value">${health.overall_payout_ratio_percent}%</div></div>
       </div>
+      ${chartsPanel}
       <div class="panel">
         <h2>Committed payout runs</h2>
         ${health.runs.length ? `<table><thead><tr><th>Period</th><th>Incoming BV</th><th>Outgoing Net</th><th>Ratio</th><th>Committed</th></tr></thead><tbody>
           ${health.runs.map(r => `<tr><td>${esc(r.period_label)}</td><td>₹${r.total_incoming_bv.toLocaleString('en-IN')}</td><td>₹${r.total_outgoing_net.toLocaleString('en-IN')}</td><td>${r.payout_ratio_percent}%</td><td>${esc(r.committed_at)}</td></tr>`).join('')}
         </tbody></table>` : '<div class="empty">No payout runs committed yet — see the Payouts tab.</div>'}
       </div>
+      ${activityPanel}
       <div class="panel">
         <p class="muted">Reminder: this dashboard reflects AIRX Ops' own database, migrated from admin.airxplus.com's member roster (verified: Active count and Total count match exactly). Historical PV/BV/payout data could not be recovered from the legacy system — it isn't stored anywhere accessible there — so incoming/outgoing above reflects only activity recorded going forward in this system.</p>
       </div>
     `;
+
+    if (chartsData) {
+      requestAnimationFrame(() => {
+        const salesEl = document.getElementById('chartSales');
+        if (salesEl) drawLineChart(salesEl, chartsData.salesTrend.map(d => ({ y: d.orders, label: d.date.slice(5) })), { color: chartColors().accent2 });
+        const membersEl = document.getElementById('chartMembers');
+        if (membersEl) drawLineChart(membersEl, chartsData.memberGrowth.map(d => ({ y: d.cumulativeMembers, label: d.week.slice(5) })), { color: chartColors().accent });
+        const payoutsEl = document.getElementById('chartPayouts');
+        if (payoutsEl) drawBarChart(payoutsEl, chartsData.payoutTrend.map(d => ({ y: d.total_outgoing_net, label: d.period_label.slice(0, 8) })), { color: chartColors().warn, yFormat: v => '₹' + Math.round(v).toLocaleString('en-IN') });
+        const invEl = document.getElementById('chartInventory');
+        if (invEl) drawDonutChart(invEl, chartsData.inventoryValue.map(d => ({ label: d.category, value: d.value })));
+      });
+    }
+
     const briefingRefreshBtn = document.getElementById('briefingRefreshBtn');
     if (briefingRefreshBtn) briefingRefreshBtn.addEventListener('click', async () => {
       briefingRefreshBtn.disabled = true; briefingRefreshBtn.textContent = 'Regenerating…';
@@ -657,6 +871,7 @@ async function loadMembers() {
           <option value="dummy">Likely dummy only</option>
         </select>
         <button class="secondary" id="addMemberBtn">+ Add member</button>
+        <button class="secondary" id="exportMembersBtn">⬇ Export CSV</button>
       </div>
       <div id="membersTableWrap"><div class="empty">Loading…</div></div>
     </div>
@@ -671,6 +886,7 @@ async function loadMembers() {
   document.getElementById('memberStatusFilter').addEventListener('change', renderMembersTable);
   document.getElementById('memberDummyFilter').addEventListener('change', renderMembersTable);
   document.getElementById('addMemberBtn').addEventListener('click', () => openMemberDetail(null));
+  document.getElementById('exportMembersBtn').addEventListener('click', () => exportCsv('/api/export/members', 'airx-members.csv'));
 }
 
 function renderMembersTable() {
@@ -926,10 +1142,14 @@ async function loadPayouts() {
       <div id="previewResult"></div>
     </div>
     <div class="panel">
-      <h2>Committed run history</h2>
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <h2 style="margin:0">Committed run history</h2>
+        <button class="secondary" id="exportPayoutsBtn">⬇ Export CSV</button>
+      </div>
       <div id="runsHistory"><div class="empty">Loading…</div></div>
     </div>
   `;
+  document.getElementById('exportPayoutsBtn').addEventListener('click', () => exportCsv('/api/export/payouts', 'airx-payouts.csv'));
   let lastPreviewPeriod = null;
   document.getElementById('previewBtn').addEventListener('click', async () => {
     const period = document.getElementById('periodLabel').value.trim();
@@ -1249,9 +1469,13 @@ async function loadProducts() {
       <button class="secondary" id="cancelProductEditBtn" style="display:none">Cancel</button>
     </div>
     <div class="hint muted" style="font-size:12px;margin-top:4px">Status (Active/Inactive) controls MLM/distributor eligibility. "Show on public storefront" is separate — lets a product stay Active for distributors while hidden from /shop.html (e.g. out of retail stock).</div>
+    <div class="row" style="margin-top:10px">
+      <input class="search-input" id="p_search" placeholder="Search by SKU, name or category…" style="flex:1;min-width:200px" />
+    </div>
     <div id="productsTable" style="margin-top:12px"><div class="empty">Loading…</div></div>
   </div>`;
   let editingSku = null;
+  let productsCache = [];
   let pendingImageBase64 = null;
   const fileInput = document.getElementById('p_image_file');
   const preview = document.getElementById('p_image_preview');
@@ -1294,7 +1518,14 @@ async function loadProducts() {
     document.getElementById('cancelProductEditBtn').style.display = 'inline-block';
   }
   async function refresh() {
-    const products = await api('/api/products');
+    productsCache = await api('/api/products');
+    renderProductsTable();
+  }
+  function renderProductsTable() {
+    const q = (document.getElementById('p_search').value || '').toLowerCase();
+    const products = q
+      ? productsCache.filter(p => (p.sku || '').toLowerCase().includes(q) || (p.name || '').toLowerCase().includes(q) || (p.category || '').toLowerCase().includes(q))
+      : productsCache;
     document.getElementById('productsTable').innerHTML = products.length
       ? `<table><thead><tr><th></th><th>SKU</th><th>Name</th><th>Category</th><th>DP</th><th>MRP</th><th>PV</th><th>BV</th><th>Status</th><th>Storefront</th><th></th></tr></thead><tbody>
           ${products.map(p => `<tr>
@@ -1309,7 +1540,7 @@ async function loadProducts() {
             </td>
           </tr>`).join('')}
         </tbody></table>`
-      : '<div class="empty">No products yet.</div>';
+      : (productsCache.length ? '<div class="empty">No products match your search.</div>' : '<div class="empty">No products yet.</div>');
     const bySku = {};
     products.forEach(p => { bySku[p.sku] = p; });
     document.querySelectorAll('[data-edit]').forEach(b => b.addEventListener('click', () => fillForm(bySku[b.dataset.edit])));
@@ -1347,6 +1578,7 @@ async function loadProducts() {
     } catch (e) { toast('Failed: ' + e.message, 'error'); }
   });
   document.getElementById('cancelProductEditBtn').addEventListener('click', resetForm);
+  document.getElementById('p_search').addEventListener('input', renderProductsTable);
   refresh().catch(e => { document.getElementById('productsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
 }
 
@@ -1355,6 +1587,10 @@ async function loadFranchises() {
   const el = document.getElementById('tab-franchises');
   el.innerHTML = `
     <div class="panel"><h2>Franchises <span class="muted" style="font-weight:normal">(Franchise details — mirrors store.airxplus.com)</span></h2>
+      <div class="row">
+        <input class="search-input" id="fr_search" placeholder="Search by code, name or state…" style="flex:1;min-width:200px" />
+        <button class="secondary" id="exportFranchisesBtn">⬇ Export CSV</button>
+      </div>
       <div class="row">
         <input id="fr_code" placeholder="Franchise code" style="max-width:130px" />
         <input id="fr_name" placeholder="Name" />
@@ -1431,9 +1667,16 @@ async function loadFranchises() {
     ['ws_franchise', 'ws_adj_franchise'].forEach(id => {
       document.getElementById(id).innerHTML = '<option value="">Franchise…</option>' + parentOptions;
     });
-    document.getElementById('franchisesTable').innerHTML = franchisesCache.length
+    renderFranchisesTableOnly();
+  }
+  function renderFranchisesTableOnly() {
+    const q = (document.getElementById('fr_search').value || '').toLowerCase();
+    const visible = q
+      ? franchisesCache.filter(f => (f.franchise_code || '').toLowerCase().includes(q) || (f.franchise_name || '').toLowerCase().includes(q) || (f.state || '').toLowerCase().includes(q))
+      : franchisesCache;
+    document.getElementById('franchisesTable').innerHTML = visible.length
       ? `<table><thead><tr><th>Code</th><th>Name</th><th>Parent</th><th>State</th><th>Contact</th><th>Status</th><th></th></tr></thead><tbody>
-          ${franchisesCache.map(f => `<tr>
+          ${visible.map(f => `<tr>
             <td>${esc(f.franchise_code)}</td><td>${esc(f.franchise_name)}</td>
             <td>${esc(f.parent_franchise_code) || '—'}</td><td>${esc(f.state) || '—'}</td>
             <td>${esc(f.contact_name) || '—'}${f.contact_mobile ? ' (' + esc(f.contact_mobile) + ')' : ''}</td>
@@ -1443,7 +1686,7 @@ async function loadFranchises() {
               <button class="danger" data-del="${esc(f.franchise_code)}" style="padding:3px 8px;font-size:11px">Delete</button>
             </td>
           </tr>`).join('')}
-        </tbody></table>` : '<div class="empty">No franchises yet.</div>';
+        </tbody></table>` : (franchisesCache.length ? '<div class="empty">No franchises match your search.</div>' : '<div class="empty">No franchises yet.</div>');
     const byCode = {};
     franchisesCache.forEach(f => { byCode[f.franchise_code] = f; });
     document.querySelectorAll('[data-edit]').forEach(b => b.addEventListener('click', () => fillForm(byCode[b.dataset.edit])));
@@ -1523,6 +1766,8 @@ async function loadFranchises() {
     } catch (e) { toast('Failed: ' + e.message, 'error'); }
   });
   refreshFranchises().catch(e => { document.getElementById('franchisesTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+  document.getElementById('fr_search').addEventListener('input', renderFranchisesTableOnly);
+  document.getElementById('exportFranchisesBtn').addEventListener('click', () => exportCsv('/api/export/franchises', 'airx-franchises.csv'));
   refreshProductOptions().catch(() => {});
   refreshStock().catch(e => { document.getElementById('stockTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
 }
@@ -1638,6 +1883,7 @@ async function loadOrders() {
         <option value="shopify">Shopify</option>
         <option value="whatsapp">WhatsApp / manual</option>
       </select>
+      <button class="secondary" id="exportOrdersBtn">⬇ Export CSV</button>
     </div>
     <details style="margin-top:8px"><summary style="cursor:pointer;color:var(--accent)">+ Add order manually (WhatsApp-sourced)</summary>
       <div class="row" style="margin-top:8px">
@@ -1761,6 +2007,7 @@ async function loadOrders() {
   document.getElementById('ord_search').addEventListener('input', render);
   document.getElementById('ord_status_filter').addEventListener('change', render);
   document.getElementById('ord_source_filter').addEventListener('change', render);
+  document.getElementById('exportOrdersBtn').addEventListener('click', () => exportCsv('/api/export/orders', 'airx-orders.csv'));
   document.getElementById('syncShopifyBtn').addEventListener('click', async () => {
     try { const r = await api('/api/shopify/sync-orders', { method: 'POST' }); toast(`Synced ${r.synced} new order(s) (${r.total} total)`, 'success'); refresh(); }
     catch (e) { toast('Sync failed: ' + e.message, 'error'); }
@@ -1909,11 +2156,19 @@ async function loadOrders() {
 async function loadLeads() {
   const el = document.getElementById('tab-leads');
   el.innerHTML = `<div class="panel"><h2>Leads <span class="muted" style="font-weight:normal">(Meta / Facebook Lead Ads — captured automatically)</span></h2>
+    <div class="row" style="margin-bottom:8px">
+      <input class="search-input" id="leadSearch" placeholder="Search by name, phone or email…" style="flex:1;min-width:200px" />
+      <button class="secondary" id="exportLeadsBtn">⬇ Export CSV</button>
+    </div>
     <div id="leadsTable"><div class="empty">Loading…</div></div>
   </div>`;
   const STATUSES = ['new', 'contacted', 'converted', 'lost'];
-  async function refresh() {
-    const leads = await api('/api/leads');
+  let leadsCache = [];
+  function renderLeadsTable() {
+    const q = (document.getElementById('leadSearch').value || '').toLowerCase();
+    const leads = q
+      ? leadsCache.filter(l => (l.name || '').toLowerCase().includes(q) || (l.phone || '').toLowerCase().includes(q) || (l.email || '').toLowerCase().includes(q))
+      : leadsCache;
     document.getElementById('leadsTable').innerHTML = leads.length
       ? `<table><thead><tr><th>Date</th><th>Name</th><th>Phone</th><th>Email</th><th>Status</th><th></th></tr></thead><tbody>
           ${leads.map(l => `<tr>
@@ -1923,7 +2178,10 @@ async function loadLeads() {
             <td><button class="secondary" data-draft="${esc(l.id)}" style="padding:3px 8px;font-size:11px" ${l.phone ? '' : 'disabled title="no phone on this lead"'}>AI: Draft follow-up</button></td>
           </tr>`).join('')}
         </tbody></table>`
-      : '<div class="empty">No leads yet — they will appear here automatically once Meta Lead Ads is sending webhooks.</div>';
+      : (leadsCache.length ? '<div class="empty">No leads match your search.</div>' : '<div class="empty">No leads yet — they will appear here automatically once Meta Lead Ads is sending webhooks.</div>');
+    wireLeadRowHandlers(leads);
+  }
+  function wireLeadRowHandlers(leads) {
     document.querySelectorAll('[data-lead]').forEach(sel => sel.addEventListener('change', async () => {
       try { await api('/api/leads/' + encodeURIComponent(sel.dataset.lead), { method: 'PATCH', body: JSON.stringify({ status: sel.value }) }); toast('Lead updated', 'success'); }
       catch (e) { toast('Failed: ' + e.message, 'error'); }
@@ -1960,7 +2218,14 @@ async function loadLeads() {
       }
     }));
   }
-  refresh().catch(e => { document.getElementById('leadsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+  try {
+    leadsCache = await api('/api/leads');
+    renderLeadsTable();
+  } catch (e) {
+    document.getElementById('leadsTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`;
+  }
+  document.getElementById('leadSearch').addEventListener('input', renderLeadsTable);
+  document.getElementById('exportLeadsBtn').addEventListener('click', () => exportCsv('/api/export/leads', 'airx-leads.csv'));
 }
 
 // ---------- D2C Inventory (storefront SKU stock — separate from franchise warehouse stock) ----------
@@ -1986,10 +2251,45 @@ async function loadInventory() {
       <button id="addInventoryBtn">+ Add</button>
     </div>
     <div id="inventoryTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
+    <details style="margin-top:10px"><summary style="cursor:pointer;color:var(--accent)">⚙️ WhatsApp alerts for low-stock / near-expiry</summary>
+      <div class="row" style="margin-top:8px;align-items:center">
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;font-weight:normal;margin:0">
+          <input type="checkbox" id="invAlertEnabled" style="width:auto" /> WhatsApp staff (numbers set in Orders tab → Alert Settings) about low-stock/near-expiry items
+        </label>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <label class="muted" style="font-size:12px">Re-alert every</label>
+        <input id="invAlertHours" type="number" style="max-width:90px" /> <span class="muted" style="font-size:12px">hours (per item, if still applicable)</span>
+        <button class="secondary" id="invAlertSaveBtn">Save</button>
+      </div>
+      <p class="muted" style="font-size:11px;margin-top:6px" id="invAlertNote"></p>
+    </details>
   </div>
   <div class="panel"><h2>Demand Forecast <span class="muted" style="font-weight:normal">(projects days-of-stock-remaining from each item's actual sales velocity over the last 90 days — catches a fast seller before it hits the low-stock threshold)</span></h2>
     <div id="forecastTable"><div class="empty">Loading…</div></div>
   </div>`;
+  async function refreshInventoryAlertSettings() {
+    try {
+      const s = await api('/api/settings/inventory-alerts');
+      document.getElementById('invAlertEnabled').checked = !!s.enabled;
+      document.getElementById('invAlertHours').value = s.sweepEveryHours;
+      document.getElementById('invAlertNote').textContent = s.updatedAt ? `Last changed ${new Date(s.updatedAt).toLocaleString('en-IN')}` : 'Uses the same staff WhatsApp number(s) configured in the Orders tab.';
+    } catch (e) { /* no "inventory" permission — settings block just won't work, rest of tab still fine */ }
+  }
+  refreshInventoryAlertSettings();
+  document.getElementById('invAlertSaveBtn').addEventListener('click', async () => {
+    try {
+      await api('/api/settings/inventory-alerts', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          enabled: document.getElementById('invAlertEnabled').checked,
+          sweepEveryHours: Number(document.getElementById('invAlertHours').value) || 6,
+        }),
+      });
+      toast('Saved', 'success');
+      refreshInventoryAlertSettings();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
   async function refresh() {
     const items = await api('/api/inventory');
     document.getElementById('inventoryTable').innerHTML = items.length
@@ -2072,12 +2372,15 @@ async function loadAiAssistant() {
   const el = document.getElementById('tab-ai_assistant');
   el.innerHTML = `
     <div class="panel">
-      <h2>Ask AIRX Ops <span class="muted" style="font-weight:normal">(natural-language questions about live data — low stock, near-expiry, leads, orders, staff, order-booking risk)</span></h2>
+      <h2>Ask AIRX Ops <span class="muted" style="font-weight:normal">(natural-language questions about live data — low stock, near-expiry, leads, orders, staff, order-booking risk, demand forecast, payout anomalies, referrals)</span></h2>
       <div id="aiChatLog" style="max-height:340px;overflow-y:auto;margin-bottom:10px"></div>
       <div class="row" style="flex-wrap:wrap;gap:6px;margin-bottom:8px">
         <button class="secondary" data-ask="Which orders need attention right now — pending too long, high COD value, or repeat-cancellation customers?" style="padding:3px 8px;font-size:11px">⚠️ Orders needing attention</button>
         <button class="secondary" data-ask="Which items are low on stock?" style="padding:3px 8px;font-size:11px">Low stock?</button>
         <button class="secondary" data-ask="How is the team doing on order bookings this week?" style="padding:3px 8px;font-size:11px">Staff performance?</button>
+        <button class="secondary" data-ask="Which items are about to stock out based on actual sales velocity, not just the static threshold?" style="padding:3px 8px;font-size:11px">📉 Stock running out?</button>
+        <button class="secondary" data-ask="Were there any unusually large payouts flagged in the most recent payout run?" style="padding:3px 8px;font-size:11px">🚩 Payout anomalies?</button>
+        <button class="secondary" data-ask="Who are the top customers worth asking for a referral right now?" style="padding:3px 8px;font-size:11px">🤝 Referral candidates?</button>
       </div>
       <div class="row">
         <input id="aiChatInput" placeholder="e.g. 'which orders need attention?' or 'how many leads came in this week?'" style="flex:1" />
