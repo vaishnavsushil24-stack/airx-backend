@@ -1879,3 +1879,53 @@ customers are told to shop) at `/shop.html` once Shopify is switched off
 is a DNS/business step, not a code change — and if a real payment gateway
 is ever wanted instead of COD-only, that's a new vendor relationship (KYC,
 settlement account) the same way WhatsApp/India Post/voice AI are.
+
+### Phase 31 — Shopify catalog import + storefront UX polish
+
+Phase 30 built the storefront and its ordering pipeline, but the live
+`products` table was empty — there was no real catalog behind it yet. This
+phase imported the business's actual product list (27 products, previously
+managed on Shopify) into AIRX Ops so the native storefront actually has
+something to sell, and fixed a UX problem that surfaced once real product
+data was in place.
+
+- **`scripts/import-shopify.js`** (new) — one-off, idempotent migration
+  script. Reads a `shopify_products.json` snapshot (pulled from Shopify's
+  public, unauthenticated `https://<shop>.myshopify.com/products.json`
+  endpoint — no admin credentials needed) and, for each product: maps
+  title/price/category into this app's schema (`price` → both `dp_price`
+  and `mrp_price`, since Shopify-sourced products don't have a separate
+  distributor price; the storefront only ever reads `mrp_price`), strips
+  Shopify's HTML-formatted marketing description down to plain text
+  (capped at 2000 chars), and downloads the product's primary image from
+  Shopify's CDN into `public/uploads/products/` so the storefront no
+  longer depends on Shopify staying online. Matches by `sku` and UPDATEs
+  existing rows instead of duplicating them, so it's safe to re-run.
+  Production run: `{"created":25,"updated":2,"imgOk":27,"imgFail":0,"total":27}`
+  — all 27 products imported, all 27 images downloaded successfully, zero
+  failures.
+- **`public/shop.html` — card truncation + product detail modal** — once
+  real (long, marketing-heavy) descriptions were in the catalog, the
+  storefront's product cards rendered every description in full, making
+  cards enormous and the page heavy/unattractive. Fixed with:
+  - CSS `-webkit-line-clamp: 3` on the card's description so every card
+    stays a consistent, scannable size, plus a "View details" affordance
+    and a hover elevation effect on the whole card.
+  - A new click-to-expand product detail modal (`#pmodalOverlay`) — clicking
+    anywhere on a card (other than the Add button, which still adds to
+    cart directly via `stopPropagation()`) opens a modal with the full
+    image, full untruncated description, price, and its own Add-to-cart
+    control that reflects current cart quantity.
+  - No backend changes needed — the modal reads from the same
+    `/api/public/products` payload already fetched for the grid.
+- Confirmed live on `https://www.airxhealth.in/shop.html`: all 27 imported
+  products render with clamped card descriptions and working detail
+  modals; storefront remains fully usable without any login, per the
+  original "visitors can browse and order without an account" requirement.
+
+Not yet done (flagged, not requested this phase): the category taxonomy
+inherited directly from Shopify's `product_type`/tags is inconsistent
+(e.g. `"Ayurvedic Churan"` vs `"Ayurvedic Churna"`, combined values like
+`"Health & Wellness > Ayurvedic Medicine"`) — left as-is since it may
+reflect intentional business categorization and wasn't part of what was
+asked for.
