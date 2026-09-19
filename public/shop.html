@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Shop — AIRX PLUS</title>
+<style>
+  :root {
+    --green: #14532d;
+    --green-light: #16a34a;
+    --bg: #f6f8f4;
+    --card: #ffffff;
+    --border: #e2e8dd;
+    --text: #1f2a1f;
+    --muted: #6b7a6b;
+    --accent: #b45309;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding-bottom: 60px;
+  }
+  a { color: var(--green); }
+  header.top {
+    background: var(--card);
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 20;
+  }
+  .top-inner {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 14px 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .brand { display: flex; flex-direction: column; }
+  .brand b { color: var(--green); font-size: 19px; letter-spacing: 0.4px; }
+  .brand span { color: var(--muted); font-size: 12px; }
+  .top-links { display: flex; align-items: center; gap: 14px; font-size: 13px; }
+  .top-links a { text-decoration: none; color: var(--text); }
+  .top-links a:hover { color: var(--green); }
+  #cartBtn {
+    position: relative;
+    background: var(--green);
+    color: #fff;
+    border: none;
+    padding: 9px 16px;
+    border-radius: 999px;
+    font-size: 13px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  #cartBtn:hover { background: var(--green-light); }
+  #cartCount {
+    display: inline-block;
+    background: #fff;
+    color: var(--green);
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 800;
+    padding: 1px 7px;
+    margin-left: 6px;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 24px 16px 10px; }
+  .hero {
+    background: linear-gradient(135deg, var(--green) 0%, #1e6b3a 100%);
+    color: #fff;
+    border-radius: 16px;
+    padding: 28px 24px;
+    margin-bottom: 22px;
+  }
+  .hero h1 { margin: 0 0 6px; font-size: 24px; }
+  .hero p { margin: 0; opacity: 0.9; font-size: 14px; max-width: 560px; }
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 18px;
+  }
+  .filter-chip {
+    border: 1px solid var(--border);
+    background: var(--card);
+    color: var(--text);
+    padding: 6px 14px;
+    border-radius: 999px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .filter-chip.active { background: var(--green); color: #fff; border-color: var(--green); }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 16px;
+  }
+  .p-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  }
+  .p-img {
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    background: #eef2ea;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    font-size: 12px;
+    overflow: hidden;
+  }
+  .p-img img { width: 100%; height: 100%; object-fit: cover; }
+  .p-body { padding: 12px 14px 14px; display: flex; flex-direction: column; gap: 6px; flex: 1; }
+  .p-cat { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); }
+  .p-name { font-weight: 700; font-size: 15px; line-height: 1.3; }
+  .p-desc { font-size: 12.5px; color: var(--muted); line-height: 1.4; flex: 1; }
+  .p-bottom { display: flex; align-items: center; justify-content: space-between; margin-top: 6px; }
+  .p-price { font-weight: 800; font-size: 16px; color: var(--green); }
+  .p-add {
+    background: var(--green);
+    color: #fff;
+    border: none;
+    padding: 7px 14px;
+    border-radius: 8px;
+    font-size: 12.5px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .p-add:hover { background: var(--green-light); }
+  .p-add.in-cart { background: #eef2ea; color: var(--green); }
+  .empty, .msg { font-size: 14px; padding: 14px; border-radius: 10px; text-align: center; }
+  .msg.error { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
+  .empty { color: var(--muted); }
+
+  /* Drawer (cart + checkout) */
+  .overlay {
+    display: none;
+    position: fixed; inset: 0;
+    background: rgba(20,30,20,0.4);
+    z-index: 30;
+  }
+  .overlay.show { display: block; }
+  .drawer {
+    position: fixed; top: 0; right: 0; bottom: 0;
+    width: min(420px, 100vw);
+    background: var(--card);
+    z-index: 31;
+    transform: translateX(100%);
+    transition: transform 0.25s ease;
+    display: flex;
+    flex-direction: column;
+    box-shadow: -4px 0 20px rgba(0,0,0,0.15);
+  }
+  .drawer.show { transform: translateX(0); }
+  .drawer-head {
+    padding: 16px 18px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .drawer-head h2 { margin: 0; font-size: 17px; }
+  .drawer-close { background: none; border: none; font-size: 20px; cursor: pointer; color: var(--muted); }
+  .drawer-body { flex: 1; overflow-y: auto; padding: 14px 18px; }
+  .drawer-foot { border-top: 1px solid var(--border); padding: 14px 18px; }
+  .cart-line { display: flex; gap: 10px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--border); }
+  .cart-line:last-child { border-bottom: none; }
+  .cart-line-name { flex: 1; font-size: 13.5px; font-weight: 600; }
+  .cart-line-price { font-size: 12px; color: var(--muted); }
+  .qty-ctrl { display: flex; align-items: center; gap: 6px; }
+  .qty-ctrl button {
+    width: 24px; height: 24px; border-radius: 6px; border: 1px solid var(--border);
+    background: #fff; cursor: pointer; font-size: 14px; line-height: 1;
+  }
+  .qty-ctrl span { min-width: 18px; text-align: center; font-size: 13px; font-weight: 700; }
+  .remove-line { background: none; border: none; color: #b91c1c; font-size: 12px; cursor: pointer; margin-left: 4px; }
+  .cart-total-row { display: flex; justify-content: space-between; font-size: 15px; font-weight: 800; margin-bottom: 12px; }
+  label { display: block; font-size: 12.5px; font-weight: 600; margin: 10px 0 4px; }
+  input[type="text"], input[type="tel"], textarea, select {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    font-size: 14px;
+    font-family: inherit;
+    outline: none;
+  }
+  input:focus, textarea:focus, select:focus { border-color: var(--green-light); }
+  textarea { resize: vertical; min-height: 50px; }
+  .place-order-btn {
+    width: 100%;
+    background: var(--green);
+    color: #fff;
+    border: none;
+    padding: 13px 20px;
+    border-radius: 10px;
+    font-size: 15px;
+    font-weight: 700;
+    cursor: pointer;
+    margin-top: 6px;
+  }
+  .place-order-btn:hover:not(:disabled) { background: var(--green-light); }
+  .place-order-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+  .cod-note { font-size: 11.5px; color: var(--muted); margin-top: 8px; text-align: center; }
+  .success {
+    text-align: center;
+    padding: 30px 10px;
+  }
+  .success .check {
+    width: 56px; height: 56px; border-radius: 50%;
+    background: #dcfce7; color: #166534;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 28px; margin: 0 auto 14px;
+  }
+  .success h3 { margin: 0 0 6px; }
+  .success p { color: var(--muted); font-size: 13.5px; margin: 4px 0; }
+  .footer { text-align: center; font-size: 12px; color: var(--muted); margin-top: 30px; }
+  .spinner {
+    display: inline-block;
+    width: 14px; height: 14px;
+    border: 2px solid rgba(255,255,255,0.5);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    vertical-align: middle;
+    margin-right: 6px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="top-inner">
+    <div class="brand"><b>AIRX PLUS</b><span>Ayurvedic Healthcare</span></div>
+    <div class="top-links">
+      <a href="/track.html">Track order</a>
+      <a href="/assistant.html">Help</a>
+      <button id="cartBtn">Cart <span id="cartCount">0</span></button>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="hero">
+    <h1>Authentic Ayurvedic wellness, delivered.</h1>
+    <p>Browse our full range and order directly — Cash on Delivery, no account needed. Same products, same delivery, now booked right here.</p>
+  </div>
+
+  <div class="filters" id="filters"></div>
+  <div id="productGrid" class="grid"><div class="empty">Loading products…</div></div>
+
+  <div class="footer">AIRX PLUS Healthcare Private Limited · <a href="/track.html">Track your order</a> · <a href="/assistant.html">Ask a question</a></div>
+</div>
+
+<div class="overlay" id="overlay"></div>
+<div class="drawer" id="drawer">
+  <div class="drawer-head">
+    <h2 id="drawerTitle">Your Cart</h2>
+    <button class="drawer-close" id="drawerClose">&times;</button>
+  </div>
+  <div class="drawer-body" id="drawerBody"></div>
+  <div class="drawer-foot" id="drawerFoot"></div>
+</div>
+
+<script>
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+
+  // Cart persisted in localStorage - a real, per-visitor shopping cart,
+  // not something that needs to sync between visitors or devices, so
+  // browser storage (rather than a server-side session) is the right tool.
+  let cart = [];
+  try { cart = JSON.parse(localStorage.getItem("airx_cart") || "[]"); } catch (e) { cart = []; }
+  function saveCart() {
+    try { localStorage.setItem("airx_cart", JSON.stringify(cart)); } catch (e) {}
+    renderCartCount();
+  }
+  function renderCartCount() {
+    document.getElementById("cartCount").textContent = cart.reduce((s, l) => s + l.qty, 0);
+  }
+
+  let products = [];
+  let activeCategory = "";
+
+  async function loadProducts() {
+    const grid = document.getElementById("productGrid");
+    try {
+      const res = await fetch("/api/public/products");
+      const data = await res.json();
+      products = data.products || [];
+      if (!products.length) {
+        grid.innerHTML = '<div class="empty">No products available right now — please check back soon.</div>';
+        return;
+      }
+      renderFilters();
+      renderGrid();
+    } catch (err) {
+      grid.innerHTML = '<div class="msg error">Could not load products. Please refresh the page.</div>';
+    }
+  }
+
+  function renderFilters() {
+    const cats = [...new Set(products.map((p) => p.category).filter(Boolean))];
+    const filtersEl = document.getElementById("filters");
+    if (!cats.length) { filtersEl.innerHTML = ""; return; }
+    filtersEl.innerHTML = ["All", ...cats].map((c) => {
+      const val = c === "All" ? "" : c;
+      return `<button class="filter-chip ${activeCategory === val ? "active" : ""}" data-cat="${esc(val)}">${esc(c)}</button>`;
+    }).join("");
+    filtersEl.querySelectorAll("[data-cat]").forEach((btn) => {
+      btn.addEventListener("click", () => { activeCategory = btn.dataset.cat; renderFilters(); renderGrid(); });
+    });
+  }
+
+  function renderGrid() {
+    const grid = document.getElementById("productGrid");
+    const shown = activeCategory ? products.filter((p) => p.category === activeCategory) : products;
+    if (!shown.length) { grid.innerHTML = '<div class="empty">No products in this category.</div>'; return; }
+    grid.innerHTML = shown.map((p) => {
+      const inCart = cart.find((l) => l.sku === p.sku);
+      return `
+      <div class="p-card">
+        <div class="p-img">${p.image_url ? `<img src="${esc(p.image_url)}" alt="${esc(p.name)}" loading="lazy" />` : "No image"}</div>
+        <div class="p-body">
+          ${p.category ? `<div class="p-cat">${esc(p.category)}</div>` : ""}
+          <div class="p-name">${esc(p.name)}</div>
+          ${p.description ? `<div class="p-desc">${esc(p.description)}</div>` : ""}
+          <div class="p-bottom">
+            <div class="p-price">₹${p.mrp_price}</div>
+            <button class="p-add ${inCart ? "in-cart" : ""}" data-add="${esc(p.sku)}">${inCart ? `In cart (${inCart.qty})` : "Add"}</button>
+          </div>
+        </div>
+      </div>`;
+    }).join("");
+    grid.querySelectorAll("[data-add]").forEach((btn) => {
+      btn.addEventListener("click", () => addToCart(btn.dataset.add));
+    });
+  }
+
+  function addToCart(sku) {
+    const p = products.find((x) => x.sku === sku);
+    if (!p) return;
+    const line = cart.find((l) => l.sku === sku);
+    if (line) line.qty = Math.min(20, line.qty + 1);
+    else cart.push({ sku: p.sku, name: p.name, price: p.mrp_price, image_url: p.image_url, qty: 1 });
+    saveCart();
+    renderGrid();
+  }
+
+  function setQty(sku, qty) {
+    const line = cart.find((l) => l.sku === sku);
+    if (!line) return;
+    if (qty <= 0) { cart = cart.filter((l) => l.sku !== sku); }
+    else { line.qty = Math.min(20, qty); }
+    saveCart();
+    renderCartDrawer();
+    renderGrid();
+  }
+
+  function cartTotal() {
+    return cart.reduce((s, l) => s + l.price * l.qty, 0);
+  }
+
+  // ---------- Drawer: cart view <-> checkout form ----------
+  const overlay = document.getElementById("overlay");
+  const drawer = document.getElementById("drawer");
+  const drawerTitle = document.getElementById("drawerTitle");
+  const drawerBody = document.getElementById("drawerBody");
+  const drawerFoot = document.getElementById("drawerFoot");
+
+  function openDrawer() {
+    overlay.classList.add("show");
+    drawer.classList.add("show");
+    renderCartDrawer();
+  }
+  function closeDrawer() {
+    overlay.classList.remove("show");
+    drawer.classList.remove("show");
+  }
+  document.getElementById("cartBtn").addEventListener("click", openDrawer);
+  document.getElementById("drawerClose").addEventListener("click", closeDrawer);
+  overlay.addEventListener("click", closeDrawer);
+
+  function renderCartDrawer() {
+    drawerTitle.textContent = "Your Cart";
+    if (!cart.length) {
+      drawerBody.innerHTML = '<div class="empty">Your cart is empty. Add a product to get started.</div>';
+      drawerFoot.innerHTML = "";
+      return;
+    }
+    drawerBody.innerHTML = cart.map((l) => `
+      <div class="cart-line">
+        <div style="flex:1">
+          <div class="cart-line-name">${esc(l.name)}</div>
+          <div class="cart-line-price">₹${l.price} each</div>
+        </div>
+        <div class="qty-ctrl">
+          <button data-dec="${esc(l.sku)}">−</button>
+          <span>${l.qty}</span>
+          <button data-inc="${esc(l.sku)}">+</button>
+        </div>
+        <button class="remove-line" data-remove="${esc(l.sku)}">Remove</button>
+      </div>
+    `).join("");
+    drawerBody.querySelectorAll("[data-inc]").forEach((b) => b.addEventListener("click", () => setQty(b.dataset.inc, (cart.find((l) => l.sku === b.dataset.inc)||{qty:0}).qty + 1)));
+    drawerBody.querySelectorAll("[data-dec]").forEach((b) => b.addEventListener("click", () => setQty(b.dataset.dec, (cart.find((l) => l.sku === b.dataset.dec)||{qty:0}).qty - 1)));
+    drawerBody.querySelectorAll("[data-remove]").forEach((b) => b.addEventListener("click", () => setQty(b.dataset.remove, 0)));
+
+    drawerFoot.innerHTML = `
+      <div class="cart-total-row"><span>Total</span><span>₹${cartTotal()}</span></div>
+      <button class="place-order-btn" id="goCheckoutBtn">Checkout</button>
+      <div class="cod-note">Cash on Delivery — pay when your order arrives.</div>
+    `;
+    document.getElementById("goCheckoutBtn").addEventListener("click", renderCheckoutForm);
+  }
+
+  function renderCheckoutForm() {
+    drawerTitle.textContent = "Delivery details";
+    drawerBody.innerHTML = `
+      <div class="cart-total-row"><span>Order total</span><span>₹${cartTotal()}</span></div>
+      <label for="cf_name">Full name</label>
+      <input type="text" id="cf_name" autocomplete="name" />
+      <label for="cf_mobile">Mobile number</label>
+      <input type="tel" id="cf_mobile" maxlength="10" inputmode="numeric" autocomplete="tel" placeholder="10-digit mobile number" />
+      <label for="cf_address">Delivery address</label>
+      <textarea id="cf_address" autocomplete="street-address" placeholder="House no, street, locality"></textarea>
+      <label for="cf_city">City</label>
+      <input type="text" id="cf_city" autocomplete="address-level2" />
+      <label for="cf_state">State</label>
+      <input type="text" id="cf_state" autocomplete="address-level1" />
+      <label for="cf_pincode">Pincode</label>
+      <input type="text" id="cf_pincode" maxlength="6" inputmode="numeric" autocomplete="postal-code" />
+      <label for="cf_notes">Notes (optional)</label>
+      <textarea id="cf_notes" placeholder="Anything we should know about your delivery"></textarea>
+      <div id="checkoutMsg"></div>
+    `;
+    document.getElementById("cf_mobile").addEventListener("input", (e) => { e.target.value = e.target.value.replace(/\D/g, "").slice(0, 10); });
+    document.getElementById("cf_pincode").addEventListener("input", (e) => { e.target.value = e.target.value.replace(/\D/g, "").slice(0, 6); });
+
+    drawerFoot.innerHTML = `
+      <button class="place-order-btn" id="placeOrderBtn">Place order (COD)</button>
+      <div class="cod-note">Cash on Delivery — pay when your order arrives.</div>
+    `;
+    document.getElementById("placeOrderBtn").addEventListener("click", placeOrder);
+  }
+
+  async function placeOrder() {
+    const name = document.getElementById("cf_name").value.trim();
+    const mobile = document.getElementById("cf_mobile").value.trim();
+    const address = document.getElementById("cf_address").value.trim();
+    const city = document.getElementById("cf_city").value.trim();
+    const state = document.getElementById("cf_state").value.trim();
+    const pincode = document.getElementById("cf_pincode").value.trim();
+    const notes = document.getElementById("cf_notes").value.trim();
+    const msgEl = document.getElementById("checkoutMsg");
+
+    if (!name) return (msgEl.innerHTML = '<div class="msg error">Please enter your name.</div>');
+    if (mobile.length !== 10) return (msgEl.innerHTML = '<div class="msg error">Enter a valid 10-digit mobile number.</div>');
+    if (!address) return (msgEl.innerHTML = '<div class="msg error">Please enter your delivery address.</div>');
+    if (pincode.length !== 6) return (msgEl.innerHTML = '<div class="msg error">Enter a valid 6-digit pincode.</div>');
+
+    const btn = document.getElementById("placeOrderBtn");
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>Placing order...';
+    msgEl.innerHTML = "";
+
+    try {
+      const res = await fetch("/api/public/order", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name, mobile, address, city, state, pincode, notes,
+          items: cart.map((l) => ({ sku: l.sku, qty: l.qty })),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        msgEl.innerHTML = `<div class="msg error">${esc(data.error || "Something went wrong. Please try again.")}</div>`;
+        btn.disabled = false;
+        btn.textContent = "Place order (COD)";
+        return;
+      }
+      cart = [];
+      saveCart();
+      renderGrid();
+      drawerTitle.textContent = "Order placed!";
+      drawerBody.innerHTML = `
+        <div class="success">
+          <div class="check">✓</div>
+          <h3>Thank you, ${esc(name.split(" ")[0])}!</h3>
+          <p>Your order <b>${esc(data.orderId)}</b> has been placed.</p>
+          <p>Amount payable on delivery: <b>₹${esc(data.codAmount)}</b></p>
+          <p>We'll confirm by phone/WhatsApp before dispatch.</p>
+          <p><a href="/track.html">Track this order</a></p>
+        </div>
+      `;
+      drawerFoot.innerHTML = '<button class="place-order-btn" id="closeSuccessBtn">Continue shopping</button>';
+      document.getElementById("closeSuccessBtn").addEventListener("click", closeDrawer);
+    } catch (err) {
+      msgEl.innerHTML = '<div class="msg error">Could not reach the server. Please check your connection and try again.</div>';
+      btn.disabled = false;
+      btn.textContent = "Place order (COD)";
+    }
+  }
+
+  renderCartCount();
+  loadProducts();
+</script>
+</body>
+</html>

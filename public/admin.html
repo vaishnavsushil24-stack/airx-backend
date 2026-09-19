@@ -1207,7 +1207,7 @@ const PRODUCT_CATEGORIES = ['General', 'Mens', 'Women', 'Special Wellness'];
 
 async function loadProducts() {
   const el = document.getElementById('tab-products');
-  el.innerHTML = `<div class="panel"><h2>Products <span class="muted" style="font-weight:normal">(Master / Product — mirrors store.airxplus.com)</span></h2>
+  el.innerHTML = `<div class="panel"><h2>Products <span class="muted" style="font-weight:normal">(Master / Product — mirrors store.airxplus.com, and feeds the public storefront at /shop.html)</span></h2>
     <div class="row">
       <input id="p_sku" placeholder="SKU" style="max-width:110px" />
       <input id="p_name" placeholder="Name" />
@@ -1216,22 +1216,50 @@ async function loadProducts() {
       <input id="p_mrp" placeholder="MRP" type="number" style="max-width:100px" />
       <input id="p_pv" placeholder="PV" type="number" style="max-width:80px" />
       <input id="p_bv" placeholder="BV" type="number" style="max-width:80px" />
+    </div>
+    <div class="row" style="margin-top:8px">
+      <textarea id="p_desc" placeholder="Storefront description (shown to customers on /shop.html)" style="flex:1;min-height:44px;padding:8px 10px;border:1px solid var(--border,#ddd);border-radius:8px;font-family:inherit;font-size:13px"></textarea>
+    </div>
+    <div class="row" style="margin-top:8px;align-items:center">
+      <input type="file" id="p_image_file" accept="image/png,image/jpeg,image/webp,image/gif" style="max-width:220px" />
+      <img id="p_image_preview" style="display:none;width:40px;height:40px;object-fit:cover;border-radius:6px;border:1px solid var(--border,#ddd)" />
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;font-weight:normal;margin:0">
+        <input type="checkbox" id="p_show_in_store" checked style="width:auto" /> Show on public storefront
+      </label>
       <button id="addProductBtn">+ Add</button>
       <button class="secondary" id="cancelProductEditBtn" style="display:none">Cancel</button>
     </div>
-    <div id="productsTable"><div class="empty">Loading…</div></div>
+    <div class="hint muted" style="font-size:12px;margin-top:4px">Status (Active/Inactive) controls MLM/distributor eligibility. "Show on public storefront" is separate — lets a product stay Active for distributors while hidden from /shop.html (e.g. out of retail stock).</div>
+    <div id="productsTable" style="margin-top:12px"><div class="empty">Loading…</div></div>
   </div>`;
   let editingSku = null;
+  let pendingImageBase64 = null;
+  const fileInput = document.getElementById('p_image_file');
+  const preview = document.getElementById('p_image_preview');
+  fileInput.addEventListener('change', () => {
+    const file = fileInput.files[0];
+    if (!file) { pendingImageBase64 = null; preview.style.display = 'none'; return; }
+    if (file.size > 6 * 1024 * 1024) { toast('Image too large (max 6MB)', 'error'); fileInput.value = ''; return; }
+    const reader = new FileReader();
+    reader.onload = () => { pendingImageBase64 = reader.result; preview.src = reader.result; preview.style.display = 'inline-block'; };
+    reader.readAsDataURL(file);
+  });
   function resetForm() {
     editingSku = null;
-    ['p_sku', 'p_name', 'p_dp', 'p_mrp', 'p_pv', 'p_bv'].forEach(f => { document.getElementById(f).value = ''; });
+    pendingImageBase64 = null;
+    ['p_sku', 'p_name', 'p_dp', 'p_mrp', 'p_pv', 'p_bv', 'p_desc'].forEach(f => { document.getElementById(f).value = ''; });
     document.getElementById('p_category').value = '';
+    document.getElementById('p_show_in_store').checked = true;
+    fileInput.value = '';
+    preview.style.display = 'none';
     document.getElementById('p_sku').disabled = false;
     document.getElementById('addProductBtn').textContent = '+ Add';
     document.getElementById('cancelProductEditBtn').style.display = 'none';
   }
   function fillForm(p) {
     editingSku = p.sku;
+    pendingImageBase64 = null;
+    fileInput.value = '';
     document.getElementById('p_sku').value = p.sku;
     document.getElementById('p_sku').disabled = true; // SKU is the primary key — not editable in place
     document.getElementById('p_name').value = p.name;
@@ -1240,17 +1268,22 @@ async function loadProducts() {
     document.getElementById('p_mrp').value = p.mrp_price;
     document.getElementById('p_pv').value = p.pv;
     document.getElementById('p_bv').value = p.bv;
+    document.getElementById('p_desc').value = p.description || '';
+    document.getElementById('p_show_in_store').checked = p.show_in_store !== 0;
+    if (p.image_url) { preview.src = p.image_url; preview.style.display = 'inline-block'; } else { preview.style.display = 'none'; }
     document.getElementById('addProductBtn').textContent = 'Save changes';
     document.getElementById('cancelProductEditBtn').style.display = 'inline-block';
   }
   async function refresh() {
     const products = await api('/api/products');
     document.getElementById('productsTable').innerHTML = products.length
-      ? `<table><thead><tr><th>SKU</th><th>Name</th><th>Category</th><th>DP</th><th>MRP</th><th>PV</th><th>BV</th><th>Status</th><th></th></tr></thead><tbody>
+      ? `<table><thead><tr><th></th><th>SKU</th><th>Name</th><th>Category</th><th>DP</th><th>MRP</th><th>PV</th><th>BV</th><th>Status</th><th>Storefront</th><th></th></tr></thead><tbody>
           ${products.map(p => `<tr>
+            <td>${p.image_url ? `<img src="${esc(p.image_url)}" style="width:28px;height:28px;object-fit:cover;border-radius:5px" />` : ''}</td>
             <td>${esc(p.sku)}</td><td>${esc(p.name)}</td><td>${esc(p.category) || '—'}</td>
             <td>₹${p.dp_price}</td><td>₹${p.mrp_price}</td><td>${p.pv}</td><td>${p.bv}</td>
             <td><span class="badge ${p.status === 'Active' ? 'active' : 'inactive'}">${esc(p.status)}</span></td>
+            <td><span class="badge ${p.show_in_store !== 0 ? 'active' : 'inactive'}">${p.show_in_store !== 0 ? 'Visible' : 'Hidden'}</span></td>
             <td>
               <button class="secondary" data-edit="${esc(p.sku)}" style="padding:3px 8px;font-size:11px">Edit</button>
               <button class="danger" data-del="${esc(p.sku)}" style="padding:3px 8px;font-size:11px">Delete</button>
@@ -1274,15 +1307,22 @@ async function loadProducts() {
       mrp_price: Number(document.getElementById('p_mrp').value) || 0,
       pv: Number(document.getElementById('p_pv').value) || 0,
       bv: Number(document.getElementById('p_bv').value) || 0,
+      description: document.getElementById('p_desc').value.trim(),
+      show_in_store: document.getElementById('p_show_in_store').checked,
     };
     try {
+      let sku = editingSku;
       if (editingSku) {
         await api('/api/products/' + encodeURIComponent(editingSku), { method: 'PATCH', body: JSON.stringify(body) });
         toast('Product updated', 'success');
       } else {
         body.sku = document.getElementById('p_sku').value.trim();
+        sku = body.sku;
         await api('/api/products', { method: 'POST', body: JSON.stringify(body) });
         toast('Product added', 'success');
+      }
+      if (pendingImageBase64 && sku) {
+        await api('/api/products/' + encodeURIComponent(sku) + '/image', { method: 'POST', body: JSON.stringify({ imageBase64: pendingImageBase64 }) });
       }
       resetForm(); refresh();
     } catch (e) { toast('Failed: ' + e.message, 'error'); }
@@ -1558,10 +1598,10 @@ async function loadFranchiseCommission() {
 // ---------- Orders (D2C: Shopify + WhatsApp-sourced, India Post booking, WhatsApp automation) ----------
 async function loadOrders() {
   const el = document.getElementById('tab-orders');
-  el.innerHTML = `<div class="panel"><h2>Orders <span class="muted" style="font-weight:normal">(Shopify + WhatsApp-sourced — one list for both)</span></h2>
+  el.innerHTML = `<div class="panel"><h2>Orders <span class="muted" style="font-weight:normal">(Storefront + Shopify + WhatsApp-sourced — one list for all)</span></h2>
     <div class="row">
       <button id="syncShopifyBtn">⟳ Sync from Shopify</button>
-      <span class="muted" id="autoSyncNote" style="font-size:11px">Auto-syncs every 5 minutes on its own too.</span>
+      <span class="muted" id="autoSyncNote" style="font-size:11px">Auto-syncs every 5 minutes on its own too. Storefront (/shop.html) orders land here immediately, no sync needed.</span>
     </div>
     <div class="row" style="margin-top:8px">
       <input id="ord_search" placeholder="Search name / mobile / product…" style="flex:1;min-width:200px" />
@@ -1573,6 +1613,7 @@ async function loadOrders() {
       </select>
       <select id="ord_source_filter">
         <option value="">All sources</option>
+        <option value="storefront">Storefront (native)</option>
         <option value="shopify">Shopify</option>
         <option value="whatsapp">WhatsApp / manual</option>
       </select>
@@ -1616,8 +1657,9 @@ async function loadOrders() {
     const statusF = document.getElementById('ord_status_filter').value;
     const sourceF = document.getElementById('ord_source_filter').value;
     if (statusF && o.status !== statusF) return false;
+    if (sourceF === 'storefront' && o.source !== 'storefront') return false;
     if (sourceF === 'shopify' && o.source !== 'shopify') return false;
-    if (sourceF === 'whatsapp' && o.source === 'shopify') return false;
+    if (sourceF === 'whatsapp' && (o.source === 'shopify' || o.source === 'storefront')) return false;
     if (q) {
       const hay = `${o.name || ''} ${o.mobile || ''} ${o.product || ''}`.toLowerCase();
       if (!hay.includes(q)) return false;
@@ -1634,7 +1676,7 @@ async function loadOrders() {
       ? `<table><thead><tr><th>Date</th><th>Source</th><th>Name</th><th>Mobile</th><th>Product</th><th>COD</th><th>Status</th><th>Shipment</th><th></th></tr></thead><tbody>
           ${rows.map(o => `<tr>
             <td>${esc((o.createdAt || '').slice(0, 10))}</td>
-            <td><span class="badge ${o.source === 'shopify' ? 'active' : 'inactive'}">${esc(o.source || 'manual')}</span></td>
+            <td><span class="badge ${o.source === 'storefront' ? 'real' : o.source === 'shopify' ? 'active' : 'inactive'}">${esc(o.source || 'manual')}</span></td>
             <td>${esc(o.name)}</td><td>${esc(o.mobile)}</td>
             <td style="max-width:220px">${esc(o.product)}</td>
             <td>₹${o.codAmount || 0}</td>
