@@ -19,12 +19,12 @@ Leads and orders are stored in `data/leads.json` / `data/orders.json` — good
 enough to start today; swap for a real database later if volume grows past a
 few thousand records.
 
-## Pending items — only you can do these (updated 2026-08-27)
+## Pending items — only you can do these (updated 2026-09-19)
 
 Everything buildable without new external permissions, a new paid vendor
 key, or a business decision has been built, tested, and deployed (through
-Phase 29 below — the full AI Upgrade Roadmap is now complete except for
-what's listed here). These seven are genuinely stuck on someone/something
+Phase 30 below — the full AI Upgrade Roadmap is now complete except for
+what's listed here). These items are genuinely stuck on someone/something
 outside this server, so they're listed here together instead of scattered
 across sections:
 
@@ -39,12 +39,13 @@ across sections:
    to Render as `WHATSAPP_PHONE_ID` / `WHATSAPP_TOKEN`), plus four message
    templates approved by Meta: `cod_confirmation`, `tracking_update`,
    `delivery_followup`, and `replenishment_reminder` (new in Phase 14). See
-   section 7.
-3. **Abandoned-cart recovery** — needs you to re-approve the Shopify app
-   with one extra permission (`read_checkouts`) by revisiting
-   `/shopify/install` and clicking through Shopify's consent screen again.
-   Deliberately not something this server does on its own — an OAuth
-   consent screen always needs a human click.
+   section 7. This now also covers the storefront's own order confirmation
+   (Phase 30, below) — same `cod_confirmation` template, no new one needed.
+3. ~~Abandoned-cart recovery via Shopify `read_checkouts`~~ — **superseded.**
+   Shopify is being shut down (business decision, 2026-09), so this Shopify
+   permission is no longer relevant. Phase 30 (below) replaces Shopify's
+   storefront/checkout with a native one built directly into this server;
+   see that section for the plan going forward once Shopify itself is gone.
 4. **Retiring store.airxplus.com / admin.airxplus.com (the "Cutover" step,
    `MLM_INTEGRATION_PLAN.md` Phase 5)** — everything those two legacy
    systems do has now been rebuilt here (Phases 1–9 below), but switching
@@ -151,7 +152,16 @@ Once steps 1–6 are done, every new Lead Ad submission lands in
 Once steps 1–6 are done, every new Lead Ad submission lands in
 `GET /api/leads` automatically — zero manual work, exactly what you asked for.
 
-## 3. Connect Shopify (already partly done)
+## 3. Connect Shopify (being retired — see Phase 30)
+
+**Update 2026-09-19: Shopify is being shut down.** This section (and the
+`/shopify/*` routes it describes) is left as-is for reference and for
+existing synced-order history, but is no longer where new work goes —
+Phase 30 (below) builds Shopify's customer-facing job (product listing +
+placing an order) natively into this server instead, at `/shop.html`. Once
+Shopify is actually switched off, `/api/shopify/sync-orders` simply has
+nothing left to pull (it fails gracefully, same as before Shopify was ever
+connected) and can be ignored; nothing else in this app depends on it.
 
 The Shopify custom app **"AIRX Ops Connector"** is already created and
 installed on your store, with the right permissions (orders, fulfillments,
@@ -1755,3 +1765,117 @@ remaining Tier 3 items (WhatsApp-native AI conversations, AI-generated
 imagery, voice AI for phone orders) are documented in the "Pending items"
 list at the top of this README rather than built, since each genuinely
 needs something only the founder can provide.
+
+## Phase 30 — native storefront, replacing Shopify entirely (2026-09-19)
+
+**Why:** the business decided to shut Shopify down completely rather than
+keep paying for/maintaining it, on a roughly two-day timeline. Shopify was
+only ever doing two jobs for this business: (1) showing customers a product
+listing, and (2) letting them place an order. Both are now built directly
+into this server, so nothing customer-facing breaks when Shopify goes away
+— and every order this new page creates flows into the exact same pipeline
+(admin Orders tab, India Post booking, inventory decrement, WhatsApp
+confirmations, replenishment reminders, referral scoring) that WhatsApp-
+and Shopify-sourced orders already used, so nothing downstream needed to
+change.
+
+**Scope decision, stated explicitly since there wasn't time for a back-and-
+forth before building:** this is COD-only, matching how every existing
+order in this app already works (`codAmount` is the only pricing concept
+used anywhere — there was never a payment gateway integration in this
+codebase to begin with, on Shopify's side or here). Wiring up real online
+payment collection (Razorpay/PayU/etc.) needs its own KYC/settlement setup
+with a provider and deserves its own review — it was deliberately left out
+rather than rushed in under this deadline. A customer "checks out" on the
+storefront the same way a WhatsApp order has always worked: they place a
+COD order, and it shows up for staff to confirm and book, same as always.
+If/when a real gateway is wanted, only the checkout step needs to change —
+the whole rest of the pipeline (this section) stays the same.
+
+- **`public/shop.html`** — the storefront itself. No login. Product grid
+  (image, category, name, description, price), a category filter, a cart
+  (persisted in the browser's `localStorage` so it survives a page reload —
+  this is a genuinely per-visitor, disposable piece of state, not something
+  that needs to sync across devices or be readable by staff, so browser
+  storage is the right tool here unlike the account-level admin data
+  elsewhere in this app), and a checkout drawer collecting name/mobile/
+  address/city/state/pincode. Reachable at `/shop.html`, `/shop`, or
+  `/store` (all three redirect to the same page — whichever short link
+  ends up shared).
+- **`products` table gets four new columns** (`db.js` migration, same
+  defensive `PRAGMA table_info` + `ALTER TABLE` pattern as every other
+  migration in this file): `description`, `image_url`, `slug` (auto-
+  generated from the product name, de-duplicated against every other
+  product's slug — see `uniqueSlug()`), and `show_in_store` (defaults to
+  `1`/visible for every existing product, so nothing already in the
+  catalog silently vanishes from the new storefront). `show_in_store` is
+  deliberately separate from the existing `status` field: `status`
+  controls MLM/distributor eligibility, `show_in_store` controls whether a
+  product appears on the public storefront — a product can be Active for
+  distributors while hidden from retail customers (out of retail stock,
+  distributor-only SKU), or vice versa.
+- **Admin → Products tab** now has a description field, an image upload
+  (see below), and a "Show on public storefront" checkbox, with a
+  Visible/Hidden badge in the product table so staff can see at a glance
+  what's actually live on `/shop.html`.
+- **Product image upload — `POST /api/products/:sku/image`** (admin-only,
+  `requireAccess("products")`). No image-hosting dependency (no `multer`,
+  no cloud storage SDK) is installed in this app, so this accepts a
+  base64-encoded `data:image/...;base64,...` URL in the JSON body — the
+  Express JSON body limit was raised from the 100kb default to 8mb to fit
+  it — decodes it, and writes it straight into `public/uploads/products/`,
+  which Express is already serving statically. Good enough for a small
+  product catalog's photos without adding a new paid dependency; can be
+  swapped for real object storage later if the catalog grows large enough
+  for that to matter.
+- **`GET /api/public/products`** and **`GET /api/public/products/:slug`** —
+  public, no auth, no rate limit needed (read-only, cheap). Only returns
+  `status = 'Active' AND show_in_store = 1` products, and only the fields a
+  storefront actually needs (`sku, name, category, description, image_url,
+  slug, mrp_price`) — `dp_price`/`pv`/`bv` (internal MLM economics) never
+  go out over this route, same principle as the existing public
+  tracking/assistant routes never exposing internal data.
+- **`POST /api/public/order`** — public, no auth, rate-limited per IP (8
+  orders / 30 minutes — its own bucket, separate from `/api/public/track`'s
+  limiter, so a burst of order attempts can't also lock a customer out of
+  tracking their existing order). Validates name/mobile/address/pincode,
+  then — critically — **re-reads every item's price from the database**,
+  never trusting whatever total the client's JavaScript computed; a
+  tampered cart total or fabricated price in the request body is simply
+  ignored. An item that's out of stock in the sense of no longer being
+  `show_in_store`/`Active` is rejected even if its SKU is guessed directly.
+  On success, it writes into the same `orders.json` every other order
+  source uses (`source: "storefront"`), calls the existing
+  `decrementInventoryForOrder()` so stock stays accurate, and best-effort
+  sends the existing `cod_confirmation` WhatsApp template (inert/logged
+  until WhatsApp is activated — pending item #2 — same as every other
+  WhatsApp call in this app; the order still saves either way).
+- **Admin → Orders tab** — the source filter and badge now recognize
+  `storefront` orders (blue badge, same style used elsewhere for "real"
+  data) alongside the existing Shopify/WhatsApp ones, and the panel
+  subtitle/hint text was updated to mention storefront orders land
+  immediately with no sync step needed (unlike Shopify orders, which still
+  need the periodic sync while any of that history is being kept around).
+- **`test_phase30.js`** (23 assertions) — the migration actually adds the
+  right columns with the right default; `slugify()`/`uniqueSlug()`
+  behavior including de-duplication and not colliding with a product's own
+  existing slug when re-saving it unchanged; the public catalog query only
+  ever returns Active + show_in_store products and never leaks
+  `dp_price`/`pv`/`bv`; and — the most safety-critical part — the order-
+  pricing logic: a normal cart prices correctly from the DB, a tampered/
+  fake client-supplied price is silently ignored in favor of the real DB
+  price, a hidden or inactive product can't be ordered even by guessing its
+  SKU, an unknown SKU is rejected with a clear per-line error instead of a
+  crash, and quantities are clamped to a sane 1–20 range.
+- Full regression suite (`test_phase3/6/7/8/9/14/.../28/29/30.js` +
+  `test_migration.js`, 22 files) passes — zero regressions in any earlier
+  phase.
+
+No new external permission needed — this was fully buildable with what
+this app already had (SQLite, Express static file serving, the existing
+orders/inventory/WhatsApp pipeline). What's still genuinely outside this
+server's control: actually pointing `store.airxplus.com` (or wherever
+customers are told to shop) at `/shop.html` once Shopify is switched off
+is a DNS/business step, not a code change — and if a real payment gateway
+is ever wanted instead of COD-only, that's a new vendor relationship (KYC,
+settlement account) the same way WhatsApp/India Post/voice AI are.

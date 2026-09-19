@@ -187,6 +187,56 @@ for (const [col, type] of memberMigrations) {
 }
 
 // ---------------------------------------------------------------------
+// Migration: storefront columns on products (2026-09-19). Shopify is being
+// shut down by the business owner, so the product catalog + a public
+// storefront now need to live natively in AIRX Ops instead of Shopify's
+// product listing. description/image_url/slug give each product what a
+// storefront needs to display; show_in_store is separate from the existing
+// `status` field (Active/Inactive, which drives MLM/DP eligibility) so
+// staff can, e.g., keep a product Active for distributors while hiding it
+// from the public storefront (out of retail stock, B2B-only SKU, etc.)
+// without touching its MLM status.
+// ---------------------------------------------------------------------
+const productCols = db.prepare("PRAGMA table_info(products)").all().map((c) => c.name);
+const productMigrations = [
+  ["description", "TEXT"],
+  ["image_url", "TEXT"],
+  ["slug", "TEXT"],
+  ["show_in_store", "INTEGER NOT NULL DEFAULT 1"],
+];
+for (const [col, type] of productMigrations) {
+  if (!productCols.includes(col)) {
+    db.exec(`ALTER TABLE products ADD COLUMN ${col} ${type}`);
+  }
+}
+// Backfill slug for any existing product rows (added before this column
+// existed, or created without one) so old catalog data still gets a working
+// storefront URL - not just newly added products.
+function slugify(name) {
+  return String(name || "")
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "");
+}
+const needsSlug = db.prepare("SELECT sku, name FROM products WHERE slug IS NULL OR slug = ''").all();
+if (needsSlug.length) {
+  const existingSlugs = new Set(db.prepare("SELECT slug FROM products WHERE slug IS NOT NULL AND slug != ''").all().map((r) => r.slug));
+  const updateSlug = db.prepare("UPDATE products SET slug = ? WHERE sku = ?");
+  for (const row of needsSlug) {
+    let base = slugify(row.name) || slugify(row.sku) || "product";
+    let candidate = base;
+    let n = 2;
+    while (existingSlugs.has(candidate)) {
+      candidate = `${base}-${n}`;
+      n++;
+    }
+    existingSlugs.add(candidate);
+    updateSlug.run(candidate, row.sku);
+  }
+}
+
+// ---------------------------------------------------------------------
 // Phase 3 continued — compensation engine tables added once the business
 // owner decided how to proceed (2026-08-23): admin.airxplus.com does not
 // store its matching-bonus formula anywhere accessible (Reward Master,
@@ -435,4 +485,4 @@ for (const [col, type] of franchiseMigrations) {
   }
 }
 
-module.exports = { db };
+module.exports = { db, slugify };

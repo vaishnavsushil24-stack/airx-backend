@@ -28,7 +28,7 @@ const { HttpsProxyAgent } = require("https-proxy-agent");
 // Phase 0 of the store.airxplus.com / admin.airxplus.com integration —
 // see MLM_INTEGRATION_PLAN.md. Products/franchises/members/etc. live in a
 // real SQLite database (db.js) rather than flat JSON files.
-const { db } = require("./db.js");
+const { db, slugify } = require("./db.js");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -60,8 +60,13 @@ app.use((req, res, next) => {
 });
 
 // Keep the raw body around (needed to verify Meta's signature) while still parsing JSON.
+// Limit raised from Express's 100kb default to 8mb so the storefront product
+// image upload (POST /api/products/:sku/image, base64-encoded in the JSON
+// body - see Phase 30) fits; everything else on this app is small JSON, so
+// the higher ceiling costs nothing in practice.
 app.use(
   express.json({
+    limit: "8mb",
     verify: (req, res, buf) => {
       req.rawBody = buf;
     },
@@ -76,6 +81,12 @@ app.use(
 app.use(express.static(path.join(__dirname, "public")));
 app.get("/", (req, res) => res.redirect("/admin.html"));
 app.get("/admin", (req, res) => res.redirect("/admin.html"));
+// Public storefront (Phase 30 - native Shopify replacement). /shop and
+// /store both work since either is a natural guess for a customer-facing
+// link (e.g. when store.airxplus.com is repointed here after Shopify is
+// shut down, or shared directly as a short link in the meantime).
+app.get("/shop", (req, res) => res.redirect("/shop.html"));
+app.get("/store", (req, res) => res.redirect("/shop.html"));
 
 // ---------- tiny file-based storage ----------
 function ensureDataFiles() {
@@ -1174,6 +1185,128 @@ app.get("/api/public/track", (req, res) => {
 });
 
 // =====================================================================
+// PHASE 30 — NATIVE STOREFRONT (Shopify replacement). The business is
+// shutting Shopify down entirely, so the two things it was providing —
+// a public product listing and a way for a customer to place an order —
+// now live directly in AIRX Ops: public/shop.html is the storefront page,
+// and the two routes below are what it calls. No payment gateway is wired
+// up anywhere in this codebase (every existing order — WhatsApp-pasted or
+// synced from Shopify — is COD, tracked via codAmount), so the storefront
+// stays COD-only too rather than bolting on an unreviewed payment
+// integration under a two-day deadline: a customer "checks out" by placing
+// a COD order, which lands in the exact same ORDERS_FILE/orders pipeline
+// (admin Orders tab, India Post booking, inventory decrement, WhatsApp
+// confirmations, replenishment reminders, referral scoring) as every other
+// order source already does. If/when a real payment gateway is wanted,
+// only the checkout step in shop.html + this order route need to change —
+// nothing downstream does.
+// =====================================================================
+
+// Public catalog: only products explicitly marked show_in_store (Phase 29
+// migration default: on) AND Active are ever exposed here - a product can
+// be Active for MLM/distributor purposes while hidden from the public
+// storefront (out of retail stock, distributor-only SKU, etc.) Only the
+// fields a storefront actually needs go out; dp_price/pv/bv are internal
+// MLM economics and never belong in a public response.
+app.get("/api/public/products", (req, res) => {
+  const rows = db
+    .prepare("SELECT sku, name, category, description, image_url, slug, mrp_price FROM products WHERE status = 'Active' AND show_in_store = 1 ORDER BY name")
+    .all();
+  res.json({ products: rows });
+});
+
+app.get("/api/public/products/:slug", (req, res) => {
+  const row = db
+    .prepare("SELECT sku, name, category, description, image_url, slug, mrp_price FROM products WHERE slug = ? AND status = 'Active' AND show_in_store = 1")
+    .get(req.params.slug);
+  if (!row) return res.status(404).json({ error: "not found" });
+  res.json(row);
+});
+
+// Same lightweight per-IP throttle shape as /api/public/track and
+// /api/public/assistant, in its own bucket so a burst of order attempts
+// can't also lock a customer out of tracking or the assistant.
+const orderAttempts = new Map(); // ip -> [timestamps]
+const ORDER_RATE_LIMIT = 8; // orders
+const ORDER_RATE_WINDOW_MS = 30 * 60 * 1000; // per 30 minutes
+function isOrderRateLimited(ip) {
+  const now = Date.now();
+  const attempts = (orderAttempts.get(ip) || []).filter((t) => now - t < ORDER_RATE_WINDOW_MS);
+  attempts.push(now);
+  orderAttempts.set(ip, attempts);
+  return attempts.length > ORDER_RATE_LIMIT;
+}
+
+app.post("/api/public/order", async (req, res) => {
+  const forwardedFor = req.header("x-forwarded-for");
+  const ip = (forwardedFor ? forwardedFor.split(",")[0].trim() : "") || req.socket.remoteAddress || "unknown";
+  if (isOrderRateLimited(ip)) {
+    return res.status(429).json({ error: "Too many orders from this connection — please try again in a while, or message us directly." });
+  }
+
+  const { name, mobile, address, city, state, pincode, items, notes } = req.body;
+  const cleanMobile = String(mobile || "").replace(/\D/g, "").slice(-10);
+  if (!name || !String(name).trim()) return res.status(400).json({ error: "Name is required." });
+  if (cleanMobile.length !== 10) return res.status(400).json({ error: "Enter a valid 10-digit mobile number." });
+  if (!address || !String(address).trim()) return res.status(400).json({ error: "Delivery address is required." });
+  if (!pincode || !/^\d{6}$/.test(String(pincode).trim())) return res.status(400).json({ error: "Enter a valid 6-digit pincode." });
+  if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: "Cart is empty." });
+  if (items.length > 20) return res.status(400).json({ error: "Too many different items in one order." });
+
+  // Prices and product names are always re-read from the database here,
+  // never trusted from the request body — a tampered client-side cart
+  // total must never change what the business actually charges/records.
+  let codAmount = 0;
+  const productParts = [];
+  const orderItems = [];
+  for (const raw of items) {
+    const sku = String((raw && raw.sku) || "").trim();
+    const qty = Math.max(1, Math.min(20, Number(raw && raw.qty) || 1));
+    const product = db.prepare("SELECT sku, name, mrp_price FROM products WHERE sku = ? AND status = 'Active' AND show_in_store = 1").get(sku);
+    if (!product) return res.status(400).json({ error: `One of the items in your cart is no longer available (${sku || "unknown item"}). Please refresh and try again.` });
+    codAmount += product.mrp_price * qty;
+    productParts.push(`${product.name} x${qty}`);
+    orderItems.push({ sku: product.sku, name: product.name, qty, price: product.mrp_price });
+  }
+
+  const orders = readJson(ORDERS_FILE);
+  const order = {
+    id: "o" + Date.now(),
+    createdAt: new Date().toISOString(),
+    source: "storefront",
+    name: String(name).trim(),
+    mobile: cleanMobile,
+    address: String(address).trim(),
+    city: city ? String(city).trim() : "",
+    state: state ? String(state).trim() : "",
+    pincode: String(pincode).trim(),
+    product: productParts.join(", "),
+    items: orderItems,
+    codAmount: Math.round(codAmount * 100) / 100,
+    status: "pending",
+    notes: notes ? String(notes).trim().slice(0, 500) : "",
+  };
+  orders.unshift(order);
+  writeJson(ORDERS_FILE, orders);
+  decrementInventoryForOrder(order);
+
+  // Best-effort WhatsApp confirmation - inert (logs and returns
+  // {skipped:true}) until WHATSAPP_TOKEN/WHATSAPP_PHONE_ID are set, same as
+  // every other WhatsApp call in this app, so a customer placing an order
+  // is never blocked by messaging not being configured yet.
+  try {
+    await sendWhatsApp(cleanMobile, {
+      template: "cod_confirmation",
+      templateParams: [order.name, order.product, String(order.codAmount)],
+    });
+  } catch (err) {
+    console.error("Storefront order WhatsApp confirmation failed (order was still saved):", err.message);
+  }
+
+  res.json({ orderId: order.id, codAmount: order.codAmount, message: "Order placed! We'll confirm by phone/WhatsApp before dispatch." });
+});
+
+// =====================================================================
 // INVENTORY — stock tracking, auto-decrement on booking
 // =====================================================================
 
@@ -1661,13 +1794,34 @@ app.get("/api/products/:sku", requireAccess("products"), (req, res) => {
   res.json(row);
 });
 
+// Turns a requested slug (or the product name, if no slug was given) into a
+// clean, unique storefront URL segment - unique among every OTHER product
+// (excludeSku lets an edit keep its own slug without tripping over itself).
+function uniqueSlug(desired, excludeSku) {
+  let base = slugify(desired) || "product";
+  const taken = new Set(
+    db
+      .prepare(`SELECT slug FROM products WHERE slug IS NOT NULL AND slug != '' ${excludeSku ? "AND sku != ?" : ""}`)
+      .all(...(excludeSku ? [excludeSku] : []))
+      .map((r) => r.slug)
+  );
+  let candidate = base;
+  let n = 2;
+  while (taken.has(candidate)) {
+    candidate = `${base}-${n}`;
+    n++;
+  }
+  return candidate;
+}
+
 app.post("/api/products", requireAccess("products"), (req, res) => {
-  const { sku, name, category, dp_price, mrp_price, pv, bv, status } = req.body;
+  const { sku, name, category, dp_price, mrp_price, pv, bv, status, description, image_url, show_in_store } = req.body;
   if (!sku || !name) return res.status(400).json({ error: "sku and name are required" });
+  const slug = uniqueSlug(req.body.slug || name);
   try {
     db.prepare(
-      `INSERT INTO products (sku, name, category, dp_price, mrp_price, pv, bv, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO products (sku, name, category, dp_price, mrp_price, pv, bv, status, description, image_url, slug, show_in_store)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       sku,
       name,
@@ -1676,7 +1830,11 @@ app.post("/api/products", requireAccess("products"), (req, res) => {
       Number(mrp_price) || 0,
       Number(pv) || 0,
       Number(bv) || 0,
-      status || "Active"
+      status || "Active",
+      description || null,
+      image_url || null,
+      slug,
+      show_in_store === false || show_in_store === 0 ? 0 : 1
     );
   } catch (err) {
     if (String(err.message).includes("UNIQUE")) {
@@ -1692,9 +1850,17 @@ app.patch("/api/products/:sku", requireAccess("products"), (req, res) => {
   const existing = db.prepare("SELECT * FROM products WHERE sku = ?").get(req.params.sku);
   if (!existing) return res.status(404).json({ error: "not found" });
   const merged = { ...existing, ...req.body };
+  // Only recompute the slug if the caller actually touched name/slug -
+  // otherwise a plain "toggle show_in_store" PATCH shouldn't silently
+  // change a product's storefront URL out from under any link already
+  // shared for it.
+  const slug =
+    req.body.slug !== undefined || req.body.name !== undefined
+      ? uniqueSlug(req.body.slug || merged.name, req.params.sku)
+      : existing.slug || uniqueSlug(merged.name, req.params.sku);
   db.prepare(
     `UPDATE products SET name=?, category=?, dp_price=?, mrp_price=?, pv=?, bv=?, status=?,
-     updated_at=datetime('now') WHERE sku=?`
+     description=?, image_url=?, slug=?, show_in_store=?, updated_at=datetime('now') WHERE sku=?`
   ).run(
     merged.name,
     merged.category,
@@ -1703,6 +1869,10 @@ app.patch("/api/products/:sku", requireAccess("products"), (req, res) => {
     Number(merged.pv) || 0,
     Number(merged.bv) || 0,
     merged.status,
+    merged.description || null,
+    merged.image_url || null,
+    slug,
+    merged.show_in_store === false || merged.show_in_store === 0 ? 0 : 1,
     req.params.sku
   );
   const row = db.prepare("SELECT * FROM products WHERE sku = ?").get(req.params.sku);
@@ -1712,6 +1882,36 @@ app.patch("/api/products/:sku", requireAccess("products"), (req, res) => {
 app.delete("/api/products/:sku", requireAccess("products"), (req, res) => {
   const result = db.prepare("DELETE FROM products WHERE sku = ?").run(req.params.sku);
   res.json({ deleted: result.changes > 0 });
+});
+
+// ---------- Product image upload (for the storefront - Phase 30) ----------
+// No image-hosting dependency (no multer, no cloud storage SDK) is
+// installed in this app, so this accepts a base64 data URL in the JSON
+// body and writes it straight to public/uploads/products/ - Express is
+// already serving public/ as static, so the resulting file is reachable
+// immediately with no extra wiring. Good enough for a small product
+// catalog's photos; if the catalog grows large enough for this to matter,
+// swap in real object storage later without changing the storefront.
+const PRODUCT_UPLOADS_DIR = path.join(__dirname, "public", "uploads", "products");
+if (!fs.existsSync(PRODUCT_UPLOADS_DIR)) fs.mkdirSync(PRODUCT_UPLOADS_DIR, { recursive: true });
+const ALLOWED_IMAGE_TYPES = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif" };
+
+app.post("/api/products/:sku/image", requireAccess("products"), (req, res) => {
+  const existing = db.prepare("SELECT * FROM products WHERE sku = ?").get(req.params.sku);
+  if (!existing) return res.status(404).json({ error: "not found" });
+  const dataUrl = String(req.body.imageBase64 || "");
+  const match = dataUrl.match(/^data:(image\/[a-zA-Z+]+);base64,(.+)$/);
+  if (!match) return res.status(400).json({ error: "imageBase64 must be a data:image/...;base64,... URL" });
+  const ext = ALLOWED_IMAGE_TYPES[match[1]];
+  if (!ext) return res.status(400).json({ error: `unsupported image type "${match[1]}" - use JPEG, PNG, WEBP or GIF` });
+  const buffer = Buffer.from(match[2], "base64");
+  if (buffer.length > 6 * 1024 * 1024) return res.status(400).json({ error: "image too large (max 6MB)" });
+  const filename = `${req.params.sku.replace(/[^a-zA-Z0-9_-]/g, "")}-${Date.now()}.${ext}`;
+  fs.writeFileSync(path.join(PRODUCT_UPLOADS_DIR, filename), buffer);
+  const image_url = `/uploads/products/${filename}`;
+  db.prepare("UPDATE products SET image_url = ?, updated_at = datetime('now') WHERE sku = ?").run(image_url, req.params.sku);
+  const row = db.prepare("SELECT * FROM products WHERE sku = ?").get(req.params.sku);
+  res.json(row);
 });
 
 // ---------- Franchises ----------
