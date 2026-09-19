@@ -124,7 +124,13 @@
   .p-body { padding: 12px 14px 14px; display: flex; flex-direction: column; gap: 6px; flex: 1; }
   .p-cat { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); }
   .p-name { font-weight: 700; font-size: 15px; line-height: 1.3; }
-  .p-desc { font-size: 12.5px; color: var(--muted); line-height: 1.4; flex: 1; }
+  .p-desc {
+    font-size: 12.5px; color: var(--muted); line-height: 1.4; flex: 1;
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden;
+  }
+  .p-card { cursor: pointer; transition: box-shadow 0.15s ease, transform 0.15s ease; }
+  .p-card:hover { box-shadow: 0 4px 14px rgba(0,0,0,0.08); transform: translateY(-2px); }
+  .p-view { font-size: 11.5px; color: var(--green); font-weight: 700; margin-top: 2px; }
   .p-bottom { display: flex; align-items: center; justify-content: space-between; margin-top: 6px; }
   .p-price { font-weight: 800; font-size: 16px; color: var(--green); }
   .p-add {
@@ -226,6 +232,42 @@
   .success h3 { margin: 0 0 6px; }
   .success p { color: var(--muted); font-size: 13.5px; margin: 4px 0; }
   .footer { text-align: center; font-size: 12px; color: var(--muted); margin-top: 30px; }
+
+  /* Product detail modal */
+  .pmodal-overlay {
+    display: none;
+    position: fixed; inset: 0;
+    background: rgba(20,30,20,0.45);
+    z-index: 40;
+    padding: 24px 16px;
+    overflow-y: auto;
+  }
+  .pmodal-overlay.show { display: flex; align-items: flex-start; justify-content: center; }
+  .pmodal {
+    background: var(--card);
+    border-radius: 16px;
+    max-width: 640px;
+    width: 100%;
+    margin: auto;
+    overflow: hidden;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.25);
+  }
+  .pmodal-img { width: 100%; aspect-ratio: 4 / 3; background: #eef2ea; overflow: hidden; }
+  .pmodal-img img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .pmodal-body { padding: 18px 22px 22px; }
+  .pmodal-close {
+    position: absolute; top: 12px; right: 12px;
+    background: rgba(255,255,255,0.9); border: none; border-radius: 50%;
+    width: 30px; height: 30px; font-size: 18px; cursor: pointer; color: var(--text);
+  }
+  .pmodal-wrap { position: relative; }
+  .pmodal-cat { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); margin-bottom: 4px; }
+  .pmodal-name { font-weight: 800; font-size: 19px; line-height: 1.3; margin-bottom: 10px; }
+  .pmodal-desc {
+    font-size: 13.5px; color: var(--text); line-height: 1.65; white-space: pre-line;
+    max-height: 40vh; overflow-y: auto; padding-right: 4px; margin-bottom: 16px;
+  }
+  .pmodal-bottom { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 14px; border-top: 1px solid var(--border); }
   .spinner {
     display: inline-block;
     width: 14px; height: 14px;
@@ -262,6 +304,24 @@
   <div id="productGrid" class="grid"><div class="empty">Loading products…</div></div>
 
   <div class="footer">AIRX PLUS Healthcare Private Limited · <a href="/track.html">Track your order</a> · <a href="/assistant.html">Ask a question</a></div>
+</div>
+
+<div class="pmodal-overlay" id="pmodalOverlay">
+  <div class="pmodal">
+    <div class="pmodal-wrap">
+      <button class="pmodal-close" id="pmodalClose">&times;</button>
+      <div class="pmodal-img" id="pmodalImg"></div>
+      <div class="pmodal-body">
+        <div class="pmodal-cat" id="pmodalCat"></div>
+        <div class="pmodal-name" id="pmodalName"></div>
+        <div class="pmodal-desc" id="pmodalDesc"></div>
+        <div class="pmodal-bottom">
+          <div class="p-price" id="pmodalPrice"></div>
+          <button class="p-add" id="pmodalAdd"></button>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <div class="overlay" id="overlay"></div>
@@ -332,12 +392,13 @@
     grid.innerHTML = shown.map((p) => {
       const inCart = cart.find((l) => l.sku === p.sku);
       return `
-      <div class="p-card">
+      <div class="p-card" data-view="${esc(p.sku)}">
         <div class="p-img">${p.image_url ? `<img src="${esc(p.image_url)}" alt="${esc(p.name)}" loading="lazy" />` : "No image"}</div>
         <div class="p-body">
           ${p.category ? `<div class="p-cat">${esc(p.category)}</div>` : ""}
           <div class="p-name">${esc(p.name)}</div>
           ${p.description ? `<div class="p-desc">${esc(p.description)}</div>` : ""}
+          ${p.description ? `<div class="p-view">View details</div>` : ""}
           <div class="p-bottom">
             <div class="p-price">₹${p.mrp_price}</div>
             <button class="p-add ${inCart ? "in-cart" : ""}" data-add="${esc(p.sku)}">${inCart ? `In cart (${inCart.qty})` : "Add"}</button>
@@ -346,9 +407,31 @@
       </div>`;
     }).join("");
     grid.querySelectorAll("[data-add]").forEach((btn) => {
-      btn.addEventListener("click", () => addToCart(btn.dataset.add));
+      btn.addEventListener("click", (e) => { e.stopPropagation(); addToCart(btn.dataset.add); });
+    });
+    grid.querySelectorAll("[data-view]").forEach((card) => {
+      card.addEventListener("click", () => openProductModal(card.dataset.view));
     });
   }
+
+  // ---------- Product detail modal ----------
+  const pmodalOverlay = document.getElementById("pmodalOverlay");
+  function openProductModal(sku) {
+    const p = products.find((x) => x.sku === sku);
+    if (!p) return;
+    document.getElementById("pmodalImg").innerHTML = p.image_url ? `<img src="${esc(p.image_url)}" alt="${esc(p.name)}" />` : "";
+    document.getElementById("pmodalCat").textContent = p.category || "";
+    document.getElementById("pmodalName").textContent = p.name;
+    document.getElementById("pmodalDesc").textContent = p.description || "";
+    document.getElementById("pmodalPrice").textContent = `₹${p.mrp_price}`;
+    const inCart = cart.find((l) => l.sku === p.sku);
+    const addBtn = document.getElementById("pmodalAdd");
+    addBtn.textContent = inCart ? `In cart (${inCart.qty})` : "Add to cart";
+    addBtn.onclick = () => { addToCart(p.sku); openProductModal(p.sku); };
+    pmodalOverlay.classList.add("show");
+  }
+  document.getElementById("pmodalClose").addEventListener("click", () => pmodalOverlay.classList.remove("show"));
+  pmodalOverlay.addEventListener("click", (e) => { if (e.target === pmodalOverlay) pmodalOverlay.classList.remove("show"); });
 
   function addToCart(sku) {
     const p = products.find((x) => x.sku === sku);
