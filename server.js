@@ -44,6 +44,7 @@ const JSON_DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 const LEADS_FILE = path.join(JSON_DATA_DIR, "leads.json");
 const ORDERS_FILE = path.join(JSON_DATA_DIR, "orders.json");
 const SHOP_FILE = path.join(JSON_DATA_DIR, "shopify.json");
+const ORDER_ALERT_SETTINGS_FILE = path.join(JSON_DATA_DIR, "order_alert_settings.json");
 
 // CORS — needed so the legacy-data migration (Phase 5) can run fetch()
 // calls directly from admin.airxplus.com's own page context straight into
@@ -1018,9 +1019,23 @@ app.post("/api/indiapost/book", requireAccess("orders"), async (req, res) => {
       }
     }
 
-    // Booking = committed shipment, so this is the right moment to draw down stock.
+    // Booking = committed shipment, so this is normally the right moment to
+    // draw down stock — EXCEPT storefront orders, which already decremented
+    // at placement time (order.inventoryDecremented) to stop two customers
+    // both "buying" the last unit before staff gets to booking it. Only
+    // decrement here if that hasn't already happened, and flag it either way.
     try {
-      decrementInventoryForOrder(order);
+      if (!order.inventoryDecremented) {
+        decrementInventoryForOrder(order);
+        if (req.body.orderId) {
+          const ordersForFlag = readJson(ORDERS_FILE);
+          const flagIdx = ordersForFlag.findIndex((o) => o.id === req.body.orderId);
+          if (flagIdx !== -1) {
+            ordersForFlag[flagIdx].inventoryDecremented = true;
+            writeJson(ORDERS_FILE, ordersForFlag);
+          }
+        }
+      }
     } catch (invErr) {
       console.warn("Inventory decrement skipped (non-fatal):", invErr.message);
     }
@@ -1288,7 +1303,12 @@ app.post("/api/public/order", async (req, res) => {
   };
   orders.unshift(order);
   writeJson(ORDERS_FILE, orders);
+  // Decrement now (not at booking time) so two customers can't both "buy"
+  // the last unit before staff gets around to booking it. Flagged so the
+  // India Post booking step below doesn't decrement a second time.
   decrementInventoryForOrder(order);
+  order.inventoryDecremented = true;
+  writeJson(ORDERS_FILE, orders);
 
   // Best-effort WhatsApp confirmation - inert (logs and returns
   // {skipped:true}) until WHATSAPP_TOKEN/WHATSAPP_PHONE_ID are set, same as
@@ -1301,6 +1321,20 @@ app.post("/api/public/order", async (req, res) => {
     });
   } catch (err) {
     console.error("Storefront order WhatsApp confirmation failed (order was still saved):", err.message);
+  }
+
+  // Staff alert - "a client just placed an order, come look" - the whole
+  // point of this being real-time instead of staff having to keep the
+  // Orders tab open and refresh it. Best-effort: never blocks the order.
+  try {
+    const alertSettings = getOrderAlertSettings();
+    if (alertSettings.newOrderAlertEnabled) {
+      await alertStaffWhatsApp(
+        `🛒 New order on airxhealth.in\n${order.name} — ${order.product}\nCOD ₹${order.codAmount}\n${order.city || order.pincode}, mobile ${order.mobile}\nOpen the Orders tab to book it.`
+      );
+    }
+  } catch (err) {
+    console.error("Staff new-order alert failed (order was still saved):", err.message);
   }
 
   res.json({ orderId: order.id, codAmount: order.codAmount, message: "Order placed! We'll confirm by phone/WhatsApp before dispatch." });
@@ -1728,6 +1762,104 @@ async function sendWhatsApp(toPhone, { text, template, templateParams } = {}) {
   });
   return resp.json();
 }
+
+// =====================================================================
+// ORDER ALERTS — staff notification + "stuck order" reminder settings.
+// Every knob here is admin-configurable (Orders tab → Alert Settings)
+// rather than hardcoded, so staff can change the alert number(s) or
+// thresholds any time without a code change/redeploy — same philosophy
+// as referral_settings.json and commission_settings above.
+// =====================================================================
+
+const ORDER_ALERT_DEFAULTS = {
+  staffWhatsappNumbers: [], // e.g. ["919876543210"] — no alerts sent until at least one is added
+  newOrderAlertEnabled: true, // WhatsApp staff the moment a storefront order lands
+  stuckOrderReminderEnabled: true, // nudge staff about orders sitting un-booked too long
+  stuckOrderHours: 3, // "too long" threshold, in hours
+  highCodAmountThreshold: 1500, // AI risk-flag: pending order at/above this COD amount
+  updatedAt: null,
+};
+if (!fs.existsSync(ORDER_ALERT_SETTINGS_FILE)) {
+  fs.writeFileSync(ORDER_ALERT_SETTINGS_FILE, JSON.stringify(ORDER_ALERT_DEFAULTS, null, 2));
+}
+function getOrderAlertSettings() {
+  const saved = readJson(ORDER_ALERT_SETTINGS_FILE);
+  return { ...ORDER_ALERT_DEFAULTS, ...saved };
+}
+
+app.get("/api/settings/order-alerts", requireAccess("orders"), (req, res) => {
+  res.json(getOrderAlertSettings());
+});
+
+app.patch("/api/settings/order-alerts", requireAccess("orders"), (req, res) => {
+  const settings = getOrderAlertSettings();
+  const body = req.body || {};
+  if (body.staffWhatsappNumbers !== undefined) {
+    // Accept either an array or a comma/newline-separated string from the
+    // admin UI's textarea; store as a clean array of digit-only numbers.
+    const raw = Array.isArray(body.staffWhatsappNumbers)
+      ? body.staffWhatsappNumbers
+      : String(body.staffWhatsappNumbers).split(/[\n,]+/);
+    settings.staffWhatsappNumbers = raw.map((n) => String(n).replace(/\D/g, "")).filter((n) => n.length >= 10);
+  }
+  if (body.newOrderAlertEnabled !== undefined) settings.newOrderAlertEnabled = !!body.newOrderAlertEnabled;
+  if (body.stuckOrderReminderEnabled !== undefined) settings.stuckOrderReminderEnabled = !!body.stuckOrderReminderEnabled;
+  if (body.stuckOrderHours !== undefined) settings.stuckOrderHours = Math.max(0.5, Number(body.stuckOrderHours) || ORDER_ALERT_DEFAULTS.stuckOrderHours);
+  if (body.highCodAmountThreshold !== undefined) settings.highCodAmountThreshold = Math.max(0, Number(body.highCodAmountThreshold) || 0);
+  settings.updatedAt = new Date().toISOString();
+  writeJson(ORDER_ALERT_SETTINGS_FILE, settings);
+  res.json(settings);
+});
+
+// Best-effort broadcast to every configured staff number. Never throws —
+// a WhatsApp failure (or nothing configured yet) must never block the
+// order itself, same principle as every other WhatsApp call in this app.
+async function alertStaffWhatsApp(text) {
+  const settings = getOrderAlertSettings();
+  if (!settings.staffWhatsappNumbers.length) return { skipped: true, reason: "no staff numbers configured" };
+  const results = [];
+  for (const number of settings.staffWhatsappNumbers) {
+    try {
+      results.push(await sendWhatsApp(number, { text }));
+    } catch (err) {
+      console.error("Staff WhatsApp alert failed for", number, err.message);
+      results.push({ error: err.message });
+    }
+  }
+  return { results };
+}
+
+// "Stuck order" reminder — staff can miss the initial new-order alert
+// (phone silenced, busy with another customer, etc.), so this sweeps
+// periodically for orders that have sat un-booked past the configured
+// threshold and sends ONE reminder each (flagged via stuckReminderSentAt
+// so the same order doesn't re-alert every sweep).
+const STUCK_ORDER_SWEEP_MS = 20 * 60 * 1000; // check every 20 minutes
+setInterval(() => {
+  try {
+    const settings = getOrderAlertSettings();
+    if (!settings.stuckOrderReminderEnabled) return;
+    const thresholdMs = settings.stuckOrderHours * 60 * 60 * 1000;
+    const orders = readJson(ORDERS_FILE);
+    const stuck = orders.filter((o) => {
+      if (o.indiaPostBarcode) return false; // already booked
+      if (o.status === "delivered" || o.status === "cancelled") return false;
+      if (o.stuckReminderSentAt) return false; // already reminded once
+      if (!o.createdAt) return false;
+      return Date.now() - new Date(o.createdAt).getTime() >= thresholdMs;
+    });
+    if (!stuck.length) return;
+    const lines = stuck.slice(0, 10).map((o) => `• ${o.name} — ₹${o.codAmount || 0} — placed ${String(o.createdAt).slice(0, 16).replace("T", " ")}`);
+    alertStaffWhatsApp(
+      `⏰ ${stuck.length} order(s) still not booked after ${settings.stuckOrderHours}h:\n${lines.join("\n")}${stuck.length > 10 ? `\n…and ${stuck.length - 10} more` : ""}\nOpen the Orders tab.`
+    ).catch((err) => console.error("[Stuck-order reminder] WhatsApp send failed:", err.message));
+    const stuckIds = new Set(stuck.map((o) => o.id));
+    const updated = orders.map((o) => (stuckIds.has(o.id) ? { ...o, stuckReminderSentAt: new Date().toISOString() } : o));
+    writeJson(ORDERS_FILE, updated);
+  } catch (err) {
+    console.error("[Stuck-order reminder] sweep failed:", err.message);
+  }
+}, STUCK_ORDER_SWEEP_MS);
 
 // Send a COD confirmation request before booking (reduces RTO / fake orders).
 // Template name is a placeholder - create+approve one in Meta Business
@@ -4369,12 +4501,61 @@ function aiTool_getStaffSummary() {
   return Object.values(byStaff).sort((a, b) => b.totalSales - a.totalSales);
 }
 
+// Order-booking risk summary for staff (and for the AI copilot below) —
+// deliberately READ-ONLY: it flags which orders need a human's attention
+// and why, it never books/cancels/messages anything itself. Booking stays
+// a staff decision; this just makes sure nothing risky slips through.
+function aiTool_getOrderRiskFlags() {
+  const settings = getOrderAlertSettings();
+  const orders = readJson(ORDERS_FILE);
+  const now = Date.now();
+  const thresholdMs = settings.stuckOrderHours * 60 * 60 * 1000;
+  const notBookedOrDone = orders.filter((o) => !o.indiaPostBarcode && o.status !== "delivered" && o.status !== "cancelled");
+
+  const pendingTooLong = notBookedOrDone
+    .filter((o) => o.createdAt && now - new Date(o.createdAt).getTime() >= thresholdMs)
+    .map((o) => ({
+      id: o.id,
+      name: o.name,
+      mobile: o.mobile,
+      codAmount: o.codAmount || 0,
+      hoursWaiting: Math.round((now - new Date(o.createdAt).getTime()) / 3600000),
+    }))
+    .sort((a, b) => b.hoursWaiting - a.hoursWaiting);
+
+  const highValuePending = notBookedOrDone
+    .filter((o) => Number(o.codAmount || 0) >= settings.highCodAmountThreshold)
+    .map((o) => ({ id: o.id, name: o.name, mobile: o.mobile, codAmount: o.codAmount || 0 }));
+
+  // Mobiles with 2+ past cancelled orders — worth a confirmation call
+  // before booking again (repeat cancellation / RTO risk).
+  const cancelCounts = {};
+  orders.forEach((o) => {
+    if (o.status === "cancelled" && o.mobile) cancelCounts[o.mobile] = (cancelCounts[o.mobile] || 0) + 1;
+  });
+  const riskyMobileSet = new Set(Object.keys(cancelCounts).filter((m) => cancelCounts[m] >= 2));
+  const pendingFromRepeatCancelCustomers = notBookedOrDone
+    .filter((o) => riskyMobileSet.has(o.mobile))
+    .map((o) => ({ id: o.id, name: o.name, mobile: o.mobile, codAmount: o.codAmount || 0, priorCancellations: cancelCounts[o.mobile] }));
+
+  return {
+    stuckOrderThresholdHours: settings.stuckOrderHours,
+    highCodAmountThreshold: settings.highCodAmountThreshold,
+    pendingTooLongCount: pendingTooLong.length,
+    pendingTooLong: pendingTooLong.slice(0, 15),
+    highValuePendingCount: highValuePending.length,
+    highValuePending: highValuePending.slice(0, 15),
+    pendingFromRepeatCancelCustomers,
+  };
+}
+
 const AI_TOOLS = [
   { name: "get_low_stock", description: "Get D2C inventory items at or below their low-stock threshold.", parameters: { type: "object", properties: {} } },
   { name: "get_near_expiry", description: "Get inventory batches expiring within 60 days or already expired.", parameters: { type: "object", properties: {} } },
   { name: "get_leads_summary", description: "Get a summary of Meta lead ads leads by status, plus the 10 most recent.", parameters: { type: "object", properties: {} } },
   { name: "get_orders_summary", description: "Get order counts by status and total sales value.", parameters: { type: "object", properties: {} } },
   { name: "get_staff_summary", description: "Get per-staff order counts, sales, delivered/pending breakdown.", parameters: { type: "object", properties: {} } },
+  { name: "get_order_risk_flags", description: "Get orders that need staff attention before booking: pending too long past the configured threshold, high COD value still pending, and pending orders from customers with 2+ prior cancellations.", parameters: { type: "object", properties: {} } },
 ];
 const AI_TOOL_IMPL = {
   get_low_stock: aiTool_getLowStock,
@@ -4382,6 +4563,7 @@ const AI_TOOL_IMPL = {
   get_leads_summary: aiTool_getLeadsSummary,
   get_orders_summary: aiTool_getOrdersSummary,
   get_staff_summary: aiTool_getStaffSummary,
+  get_order_risk_flags: aiTool_getOrderRiskFlags,
 };
 
 app.post("/api/ai/ask", requireAccess("ai_assistant"), async (req, res) => {
@@ -4389,8 +4571,10 @@ app.post("/api/ai/ask", requireAccess("ai_assistant"), async (req, res) => {
   if (!question) return res.status(400).json({ error: "question is required" });
   try {
     const system = `You are the AIRX Ops internal system copilot for staff. You can call tools to look up live data
-about inventory, leads, orders, and staff performance. Always call a tool rather than guessing when the question is
-about current data. Answer concisely, in plain language, with numbers where relevant.`;
+about inventory, leads, orders, staff performance, and order-booking risk flags (pending too long, high COD value,
+repeat-cancellation customers). You never book, cancel, or message anyone yourself — booking stays a staff decision;
+you only surface what needs attention and why. Always call a tool rather than guessing when the question is about
+current data. Answer concisely, in plain language, with numbers where relevant.`;
     let messages = [
       { role: "system", content: system },
       { role: "user", content: question },
