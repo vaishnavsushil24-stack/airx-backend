@@ -485,4 +485,29 @@ for (const [col, type] of franchiseMigrations) {
   }
 }
 
+// ---------------------------------------------------------------------
+// Phase 31 — general activity/audit log (2026-09-19). member_audit_log
+// (Phase 6) only ever covered the 3 admin-only member actions (Manual
+// Active, Reset Status, Change User). Every other write action — payout
+// runs committed, commission settings changed, products/franchises
+// edited, fund requests approved/rejected, KYC documents reviewed — had
+// no "who did it" trail at all, even though every authenticated request
+// already carries req.identity.user for free (Phase 8 multi-user auth).
+// This is a single generic table any route can write to via
+// logActivity() in server.js, read back as one combined timeline on the
+// Dashboard/Reports tabs — matters for MLM payout compliance and
+// dispute resolution ("who approved this?").
+// ---------------------------------------------------------------------
+db.exec(`
+CREATE TABLE IF NOT EXISTS activity_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  actor TEXT NOT NULL,
+  action TEXT NOT NULL,
+  entity_type TEXT,
+  entity_id TEXT,
+  detail TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+`);
+
 module.exports = { db, slugify };

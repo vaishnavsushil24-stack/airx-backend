@@ -1929,3 +1929,93 @@ inherited directly from Shopify's `product_type`/tags is inconsistent
 `"Health & Wellness > Ayurvedic Medicine"`) — left as-is since it may
 reflect intentional business categorization and wasn't part of what was
 asked for.
+
+## Phase 31 — order-to-booking alerts + a hi-tech upgrade pack (2026-09-19)
+
+**Context:** the founder asked for a plan turning "customer places an order
+→ it lands in the system → staff or the AI copilot handles booking from
+there" into something real, then asked to sweep the rest of the existing
+system for gaps and upgrade them, deliberately deferring anything that
+would need a new paid API key or outsourced service (payment gateway, SMS
+provider, cloud storage) for later. Everything below runs on what the app
+already had: the existing SQLite DB, the existing (inert-until-configured)
+WhatsApp/AI hooks, and in-app logic/UI — no new dependency, no new env var
+required to deploy (some are optional overrides).
+
+**Order-to-booking alerts** (`ORDER_ALERT_SETTINGS_FILE`, Orders tab →
+"⚙️ Alert Settings"): every knob admin-configurable, no code change needed.
+- New storefront/WhatsApp order → staff WhatsApp'd immediately (if a number
+  is configured) + a live dashboard badge/sound in the Orders tab while
+  it's open (Web Audio API beep, no audio asset file).
+- "Stuck order" sweep (every 20 min) — nudges staff about orders sitting
+  un-booked past a configurable hours threshold, once per order.
+- `aiTool_getOrderRiskFlags` — a new read-only AI copilot tool surfacing
+  pending-too-long, high-COD-value, and repeat-cancellation-customer
+  orders, with quick-ask chips in the AI Assistant tab. Deliberately kept
+  the AI 100% advisory — it never books, cancels, or messages; that stays
+  a staff decision (an explicit choice, not a default: real courier
+  bookings cost money and carry fraud/RTO risk).
+- Fixed a bug found along the way: storefront orders were double-
+  decrementing inventory (once at order placement, again at India Post
+  booking time). Now tracked via an `order.inventoryDecremented` flag.
+
+**Hi-tech upgrade pack** — a follow-up gap sweep across the rest of the
+app (Dashboard/Reports/AI/security/exports/search), same "no new external
+dependency" constraint:
+- **Dashboard trend charts** (`GET /api/reports/dashboard-charts`) — sales
+  (30d), member growth (12wk cumulative), payout run totals (last 8
+  committed runs), and inventory value by category, rendered as plain
+  `<canvas>` line/bar/donut charts in `admin.html` (no chart library — a
+  handful of ~60-line draw functions using this page's own CSS custom
+  properties for color, so they match light/dark automatically). Every
+  number here already existed somewhere in the app; nothing before this
+  showed it as a trend.
+- **General activity/audit log** (`activity_log` table, `logActivity()`
+  helper, `GET /api/activity-log`) — until now only 3 member actions had
+  any "who did it" trail (`member_audit_log`, Phase 6). Every authenticated
+  request already carries `req.identity.user` for free (Phase 8 auth), so
+  this is one generic table any write route can log to. Wired into: payout
+  run commits, fund request approve/reject, product create/update/delete,
+  franchise create/update, commission settings changes, KYC document
+  review, and the 3 existing member actions (mirrored for a unified
+  timeline). Shown as a "🕓 Recent activity" panel on the Dashboard.
+  Matters for MLM payout compliance/dispute resolution ("who approved
+  this?").
+- **AI copilot tool parity** — `computeDemandForecast` (Phase 24),
+  `detectPayoutAnomalies` (Phase 26), and `computeReferralPropensity`
+  (Phase 27) already powered their own tabs/the daily briefing, but
+  weren't reachable from "Ask AIRX Ops" chat itself. Added as three more
+  read-only tools (`get_demand_forecast`, `get_payout_anomalies`,
+  `get_referral_candidates`) with matching quick-ask chips.
+- **Proactive inventory alerts** (`INVENTORY_ALERT_SETTINGS_FILE`, D2C
+  Inventory tab → "⚙️ WhatsApp alerts") — low-stock/near-expiry were
+  passive Dashboard banners only (Phase 11b/12), easy to miss on a day
+  nobody opens that tab. Now an hourly sweep WhatsApps staff too (reusing
+  the same staff-number list from Order Alerts — one "who gets
+  operational alerts" list for the app), with a per-item cooldown so the
+  same item doesn't re-alert every sweep.
+- **CSV export** (`GET /api/export/:type` — members, orders, payouts,
+  leads, franchises) — the existing `/api/backup/export` covers "everything
+  as JSON" for a full backup; staff/accountants routinely need just one
+  table as a spreadsheet (share with a CA, reconcile offline). One generic
+  serializer + a small per-type registry instead of a bespoke route each.
+  "⬇ Export CSV" buttons added to the Members, Orders, Payouts, Leads, and
+  Franchises tabs.
+- **Search added** to the Leads, Products, and Franchises tabs (client-
+  side, matching the existing Members/Orders search pattern) — these three
+  previously had no way to find a row except scrolling the full table.
+- **Security hardening** — the `/api/diag/*` connectivity-check routes
+  (used only while debugging the India Post proxy chain) compared against
+  a literal string committed to source. Replaced with a single `DIAG_KEY`
+  constant, overridable via env without a code change, falling back to the
+  original value so already-deployed tooling keeps working either way.
+
+**Deliberately not done this round** (flagged as next-step candidates, not
+silently skipped): pagination on `/api/members`/`/api/orders` (fine at
+today's scale, worth revisiting as either table grows large); a global
+cross-entity search (member + order + lead in one box); auto-disbursing the
+Phase 17 referral-bridge reward into a member's wallet instead of just
+computing eligibility (a real-money automation decision, not a pure
+technical gap — needs an explicit founder call, same reasoning as the COD
+gate staying staff-discretion); PWA basics (manifest/service worker) for
+offline/installable use on staff phones.

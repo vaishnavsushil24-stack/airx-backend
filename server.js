@@ -198,6 +198,56 @@ function requireAccess(moduleKey) {
   };
 }
 
+// ---------------------------------------------------------------------
+// Phase 31 — general activity/audit log. Call from any write route with
+// the request (for actor identity, already resolved by requireAccess
+// above), a short action string, and optionally which entity it touched.
+// Never throws — a logging failure must never break the actual write
+// it's describing, same "never block the real thing" principle as
+// sendWhatsApp()/alertStaffWhatsApp() elsewhere in this app.
+// ---------------------------------------------------------------------
+function logActivity(req, action, entityType, entityId, detail) {
+  try {
+    const actor =
+      (req.identity && req.identity.user && req.identity.user.username) ||
+      (req.identity && req.identity.type) ||
+      "system";
+    db.prepare(
+      `INSERT INTO activity_log (actor, action, entity_type, entity_id, detail) VALUES (?, ?, ?, ?, ?)`
+    ).run(actor, action, entityType || null, entityId ? String(entityId) : null, detail || null);
+  } catch (err) {
+    console.error("activity log write failed:", err.message);
+  }
+}
+
+// Combined timeline for the Dashboard/Reports "Recent Activity" panel —
+// this table plus the older member_audit_log (Phase 6), merged and
+// sorted so staff see one list instead of two. Read-only, module-gated
+// by "dashboard" (broad visibility is the point of an audit trail).
+app.get("/api/activity-log", requireAccess("dashboard"), (req, res) => {
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
+  const generalRows = db
+    .prepare("SELECT actor, action, entity_type, entity_id, detail, created_at FROM activity_log ORDER BY id DESC LIMIT ?")
+    .all(limit)
+    .map((r) => ({ ...r, source: "activity_log" }));
+  const memberRows = db
+    .prepare("SELECT member_code, action, detail, created_at FROM member_audit_log ORDER BY id DESC LIMIT ?")
+    .all(limit)
+    .map((r) => ({
+      actor: null,
+      action: r.action,
+      entity_type: "member",
+      entity_id: r.member_code,
+      detail: r.detail,
+      created_at: r.created_at,
+      source: "member_audit_log",
+    }));
+  const merged = [...generalRows, ...memberRows]
+    .sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""))
+    .slice(0, limit);
+  res.json(merged);
+});
+
 // =====================================================================
 // META (FACEBOOK) LEAD ADS WEBHOOK
 // =====================================================================
@@ -670,11 +720,22 @@ if (!fs.existsSync(PROXY_STATUS_FILE)) {
   fs.writeFileSync(PROXY_STATUS_FILE, "[]");
 }
 
+// Phase 31 security fix: this check header used to be a literal string
+// repeated at every /api/diag/* route below — hardcoded secrets committed
+// to source are bad practice even for low-risk diagnostic endpoints (no
+// credentials are ever exposed by them, but they shouldn't be guessable
+// from the public GitHub repo either). Now a single named constant,
+// overridable via DIAG_KEY without any code change/redeploy — same
+// "admin/env configurable" philosophy as everything else in this file.
+// Falls back to the original value only so already-deployed diagnostic
+// tooling keeps working until DIAG_KEY is set.
+const DIAG_KEY = process.env.DIAG_KEY || "airx-diag-check-2026";
+
 app.post(
   "/api/diag/proxy-status-report",
   express.text({ type: "*/*", limit: "200kb" }),
   (req, res) => {
-    if (req.headers["x-diag-key"] !== "airx-diag-check-2026") {
+    if (req.headers["x-diag-key"] !== DIAG_KEY) {
       return res.status(401).json({ error: "unauthorized" });
     }
     let reports = [];
@@ -691,7 +752,7 @@ app.post(
 );
 
 app.get("/api/diag/proxy-status-report", (req, res) => {
-  if (req.headers["x-diag-key"] !== "airx-diag-check-2026") {
+  if (req.headers["x-diag-key"] !== DIAG_KEY) {
     return res.status(401).json({ error: "unauthorized" });
   }
   let reports = [];
@@ -710,7 +771,7 @@ app.get("/api/diag/proxy-status-report", (req, res) => {
 // can be tested independently while debugging connectivity. Doesn't expose any
 // credentials - only port-open/closed status and whether login succeeded.
 app.get("/api/diag/indiapost-proxy", async (req, res) => {
-  if (req.headers["x-diag-key"] !== "airx-diag-check-2026") {
+  if (req.headers["x-diag-key"] !== DIAG_KEY) {
     return res.status(401).json({ error: "unauthorized" });
   }
   const start = Date.now();
@@ -750,7 +811,7 @@ app.get("/api/diag/indiapost-proxy", async (req, res) => {
 // ConnectPort not allowed, connection reset = something else) instead of
 // just "TLS failed", which could be caused by several different problems.
 app.get("/api/diag/proxy-connect-test", async (req, res) => {
-  if (req.headers["x-diag-key"] !== "airx-diag-check-2026") {
+  if (req.headers["x-diag-key"] !== DIAG_KEY) {
     return res.status(401).json({ error: "unauthorized" });
   }
   try {
@@ -813,7 +874,7 @@ app.get("/api/diag/proxy-connect-test", async (req, res) => {
 // is generic to any TLS-through-this-tunnel, or specific to the
 // node-fetch/https-proxy-agent code path used by the real login call.
 app.get("/api/diag/proxy-tls-test", async (req, res) => {
-  if (req.headers["x-diag-key"] !== "airx-diag-check-2026") {
+  if (req.headers["x-diag-key"] !== DIAG_KEY) {
     return res.status(401).json({ error: "unauthorized" });
   }
   try {
@@ -1861,6 +1922,80 @@ setInterval(() => {
   }
 }, STUCK_ORDER_SWEEP_MS);
 
+// =====================================================================
+// Phase 31 — INVENTORY ALERTS: proactive WhatsApp for low-stock/near-
+// expiry items, reusing the same alertStaffWhatsApp() + staff number list
+// already configured above (Orders tab → Alert Settings) rather than a
+// second separate number list — one "who gets operational alerts" list
+// for the whole app. Until now low-stock/near-expiry were passive
+// Dashboard banners only (Phase 11b/12) — easy to miss on a day nobody
+// happens to open the Dashboard tab. aiTool_getLowStock/aiTool_getNearExpiry
+// (defined further below) are plain function declarations, hoisted, so
+// they're safe to call here even though they're written later in the file.
+// =====================================================================
+const INVENTORY_ALERT_SETTINGS_FILE = path.join(JSON_DATA_DIR, "inventory_alert_settings.json");
+const INVENTORY_ALERT_DEFAULTS = {
+  enabled: true,
+  sweepEveryHours: 6, // re-alert (if still applicable) at most this often per item
+  updatedAt: null,
+};
+if (!fs.existsSync(INVENTORY_ALERT_SETTINGS_FILE)) {
+  fs.writeFileSync(INVENTORY_ALERT_SETTINGS_FILE, JSON.stringify(INVENTORY_ALERT_DEFAULTS, null, 2));
+}
+function getInventoryAlertSettings() {
+  return { ...INVENTORY_ALERT_DEFAULTS, ...readJson(INVENTORY_ALERT_SETTINGS_FILE) };
+}
+
+app.get("/api/settings/inventory-alerts", requireAccess("inventory"), (req, res) => {
+  res.json(getInventoryAlertSettings());
+});
+
+app.patch("/api/settings/inventory-alerts", requireAccess("inventory"), (req, res) => {
+  const settings = getInventoryAlertSettings();
+  const body = req.body || {};
+  if (body.enabled !== undefined) settings.enabled = !!body.enabled;
+  if (body.sweepEveryHours !== undefined) {
+    settings.sweepEveryHours = Math.max(1, Number(body.sweepEveryHours) || INVENTORY_ALERT_DEFAULTS.sweepEveryHours);
+  }
+  settings.updatedAt = new Date().toISOString();
+  writeJson(INVENTORY_ALERT_SETTINGS_FILE, settings);
+  res.json(settings);
+});
+
+const INVENTORY_ALERT_SWEEP_MS = 60 * 60 * 1000; // evaluate hourly; actual re-alert cadence per item is sweepEveryHours above
+setInterval(() => {
+  try {
+    const settings = getInventoryAlertSettings();
+    if (!settings.enabled) return;
+    const items = readJson(INVENTORY_FILE);
+    if (!items.length) return;
+    const now = Date.now();
+    const gapMs = settings.sweepEveryHours * 60 * 60 * 1000;
+
+    const candidatesBySku = {};
+    aiTool_getLowStock().forEach((i) => (candidatesBySku[i.sku] = { ...i, reasons: ["low stock"] }));
+    aiTool_getNearExpiry().forEach((i) => {
+      if (candidatesBySku[i.sku]) candidatesBySku[i.sku].reasons.push("near expiry");
+      else candidatesBySku[i.sku] = { ...i, reasons: ["near expiry"] };
+    });
+    const due = Object.values(candidatesBySku).filter((i) => {
+      const last = i.lastAlertSentAt ? new Date(i.lastAlertSentAt).getTime() : 0;
+      return now - last >= gapMs;
+    });
+    if (!due.length) return;
+
+    const lines = due.slice(0, 10).map((i) => `• ${i.name} (${i.sku}) — ${i.reasons.join(" + ")}${i.stock !== undefined ? `, stock ${i.stock}` : ""}`);
+    alertStaffWhatsApp(
+      `📦 ${due.length} inventory item(s) need attention:\n${lines.join("\n")}${due.length > 10 ? `\n…and ${due.length - 10} more` : ""}\nOpen D2C Inventory tab.`
+    ).catch((err) => console.error("[Inventory alert] WhatsApp send failed:", err.message));
+    const alertedSkus = new Set(due.map((i) => i.sku));
+    const updatedItems = items.map((i) => (alertedSkus.has(i.sku) ? { ...i, lastAlertSentAt: new Date().toISOString() } : i));
+    writeJson(INVENTORY_FILE, updatedItems);
+  } catch (err) {
+    console.error("[Inventory alert] sweep failed:", err.message);
+  }
+}, INVENTORY_ALERT_SWEEP_MS);
+
 // Send a COD confirmation request before booking (reduces RTO / fake orders).
 // Template name is a placeholder - create+approve one in Meta Business
 // Manager named "cod_confirmation" (or change the name below to match).
@@ -1975,6 +2110,7 @@ app.post("/api/products", requireAccess("products"), (req, res) => {
     return res.status(500).json({ error: err.message });
   }
   const row = db.prepare("SELECT * FROM products WHERE sku = ?").get(sku);
+  logActivity(req, "product_created", "product", sku, name);
   res.json(row);
 });
 
@@ -2008,11 +2144,13 @@ app.patch("/api/products/:sku", requireAccess("products"), (req, res) => {
     req.params.sku
   );
   const row = db.prepare("SELECT * FROM products WHERE sku = ?").get(req.params.sku);
+  logActivity(req, "product_updated", "product", req.params.sku, merged.name);
   res.json(row);
 });
 
 app.delete("/api/products/:sku", requireAccess("products"), (req, res) => {
   const result = db.prepare("DELETE FROM products WHERE sku = ?").run(req.params.sku);
+  if (result.changes > 0) logActivity(req, "product_deleted", "product", req.params.sku, null);
   res.json({ deleted: result.changes > 0 });
 });
 
@@ -2123,6 +2261,7 @@ app.post("/api/franchises", requireAccess("franchises"), (req, res) => {
     return res.status(500).json({ error: err.message });
   }
   const row = db.prepare("SELECT * FROM franchises WHERE franchise_code = ?").get(franchise_code);
+  logActivity(req, "franchise_created", "franchise", franchise_code, franchise_name);
   res.json(row);
 });
 
@@ -2157,6 +2296,7 @@ app.patch("/api/franchises/:code", requireAccess("franchises"), (req, res) => {
   const row = db
     .prepare("SELECT * FROM franchises WHERE franchise_code = ?")
     .get(req.params.code);
+  logActivity(req, "franchise_updated", "franchise", req.params.code, merged.franchise_name);
   res.json(row);
 });
 
@@ -2900,10 +3040,13 @@ app.put("/api/settings/commission", requireAccess("commission"), (req, res) => {
      VALUES (?, ?, COALESCE((SELECT label FROM commission_settings WHERE setting_key = ?), ?))
      ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value, updated_at = datetime('now')`
   );
+  const changedKeys = [];
   for (const [key, value] of Object.entries(updates)) {
     if (typeof value !== "number" || Number.isNaN(value)) continue;
     stmt.run(key, value, key, key);
+    changedKeys.push(`${key}=${value}`);
   }
+  if (changedKeys.length) logActivity(req, "commission_settings_updated", "commission_settings", null, changedKeys.join(", "));
   res.json(db.prepare("SELECT * FROM commission_settings ORDER BY setting_key").all());
 });
 
@@ -3022,6 +3165,14 @@ app.post("/api/payouts/commit", requireAccess("payouts"), (req, res) => {
   db.prepare("UPDATE pv_ledger SET consumed_in_period = ? WHERE consumed_in_period IS NULL").run(period_label);
   insertRun.run(period_label, result.total_incoming_bv, result.total_outgoing_net, result.payout_ratio_percent);
 
+  logActivity(
+    req,
+    "payout_run_committed",
+    "payout_run",
+    period_label,
+    `₹${result.total_outgoing_net} paid across ${result.members.filter((m) => m.matched_pairs > 0).length} member(s)${anomalies.length ? `, ${anomalies.length} anomaly flag(s)` : ""}`
+  );
+
   res.json({ committed: true, ...result, anomalies });
 });
 
@@ -3041,6 +3192,99 @@ app.get("/api/reports/payout-health", requireAccess("dashboard"), (req, res) => 
     total_outgoing_net: totalOutgoing,
     overall_payout_ratio_percent: totalIncoming > 0 ? round2((totalOutgoing / totalIncoming) * 100) : 0,
   });
+});
+
+// ---------------------------------------------------------------------
+// Phase 31 — Dashboard trend charts. Until now every number on the
+// Dashboard/Reports tabs was a static table or a single figure — no time
+// series, despite orders/members/payouts/inventory all carrying real
+// timestamps already. This aggregates four series in one call (kept
+// server-side/SQL-driven rather than shipping raw rows to the browser to
+// crunch) for the admin.html Dashboard tab's new charts panel.
+// ---------------------------------------------------------------------
+app.get("/api/reports/dashboard-charts", requireAccess("dashboard"), (req, res) => {
+  try {
+    const now = Date.now();
+    const dayKey = (ms) => new Date(ms).toISOString().slice(0, 10);
+
+    // Sales trend — last 30 days, orders placed + COD value (cancelled
+    // orders excluded, same convention as aiTool_getOrdersSummary).
+    const SALES_DAYS = 30;
+    const salesByDay = {};
+    for (let i = SALES_DAYS - 1; i >= 0; i--) {
+      const k = dayKey(now - i * 86400000);
+      salesByDay[k] = { date: k, orders: 0, revenue: 0 };
+    }
+    readJson(ORDERS_FILE).forEach((o) => {
+      if (o.status === "cancelled" || !o.createdAt) return;
+      const ms = new Date(o.createdAt).getTime();
+      if (isNaN(ms) || ms < now - SALES_DAYS * 86400000 || ms > now) return;
+      const bucket = salesByDay[dayKey(ms)];
+      if (bucket) {
+        bucket.orders += 1;
+        bucket.revenue += Number(o.codAmount || o.cod || 0);
+      }
+    });
+    const salesTrend = Object.values(salesByDay).map((d) => ({ ...d, revenue: round2(d.revenue) }));
+
+    // Member growth — cumulative member count by week, last 12 weeks.
+    const WEEKS = 12;
+    const weekKey = (ms) => {
+      const d = new Date(ms);
+      const day = d.getUTCDay() || 7;
+      d.setUTCDate(d.getUTCDate() - day + 1); // Monday of that ISO week
+      return d.toISOString().slice(0, 10);
+    };
+    const weekBuckets = [];
+    for (let i = WEEKS - 1; i >= 0; i--) weekBuckets.push(weekKey(now - i * 7 * 86400000));
+    const newByWeek = {};
+    weekBuckets.forEach((w) => (newByWeek[w] = 0));
+    let priorCumulative = 0;
+    db.prepare("SELECT joined_at FROM members ORDER BY joined_at ASC")
+      .all()
+      .forEach((m) => {
+        const ms = new Date(m.joined_at).getTime();
+        if (isNaN(ms) || ms > now) return;
+        const wk = weekKey(ms);
+        if (wk < weekBuckets[0]) priorCumulative += 1;
+        else if (newByWeek[wk] !== undefined) newByWeek[wk] += 1;
+      });
+    let running = priorCumulative;
+    const memberGrowth = weekBuckets.map((w) => {
+      running += newByWeek[w];
+      return { week: w, newMembers: newByWeek[w], cumulativeMembers: running };
+    });
+
+    // Payout trend — last 8 committed weekly runs.
+    const payoutTrend = db
+      .prepare(
+        "SELECT period_label, total_incoming_bv, total_outgoing_net, committed_at FROM payout_runs WHERE status = 'Committed' ORDER BY id DESC LIMIT 8"
+      )
+      .all()
+      .reverse();
+
+    // Inventory value by product category — best-effort name match against
+    // products (inventory.json has no category of its own; see
+    // decrementInventoryForOrder for the same substring-matching approach
+    // used elsewhere in this file for the same reason).
+    const inventory = readJson(INVENTORY_FILE);
+    const products = db.prepare("SELECT name, category, dp_price FROM products").all();
+    const valueByCategory = {};
+    inventory.forEach((item) => {
+      const match = products.find((p) => p.name && item.name && p.name.toLowerCase() === item.name.toLowerCase());
+      const category = (match && match.category) || "Uncategorized";
+      const value = (Number(item.stock) || 0) * (match ? Number(match.dp_price) || 0 : 0);
+      valueByCategory[category] = (valueByCategory[category] || 0) + value;
+    });
+    const inventoryValue = Object.entries(valueByCategory)
+      .map(([category, value]) => ({ category, value: round2(value) }))
+      .sort((a, b) => b.value - a.value);
+
+    res.json({ salesTrend, memberGrowth, payoutTrend, inventoryValue });
+  } catch (err) {
+    console.error("Dashboard charts error:", err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // =====================================================================
@@ -3360,6 +3604,7 @@ app.patch("/api/kyc-documents/:id", requireAccess("members"), (req, res) => {
     existing.member_code
   );
 
+  logActivity(req, `kyc_document_${status.toLowerCase()}`, "kyc_document", req.params.id, `${existing.doc_type} for ${existing.member_code}`);
   res.json(db.prepare("SELECT * FROM kyc_documents WHERE id = ?").get(req.params.id));
 });
 
@@ -3378,6 +3623,7 @@ app.post("/api/members/:code/manual-active", requireAccess("members"), (req, res
     req.params.code,
     note || null
   );
+  logActivity(req, "member_manual_active", "member", req.params.code, note || null);
   res.json(db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code));
 });
 
@@ -3394,6 +3640,7 @@ app.post("/api/members/:code/reset-status", requireAccess("members"), (req, res)
     req.params.code,
     note || null
   );
+  logActivity(req, "member_reset_status", "member", req.params.code, note || null);
   res.json(db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code));
 });
 
@@ -3414,6 +3661,7 @@ app.post("/api/members/:code/change-user", requireAccess("members"), (req, res) 
     req.params.code,
     JSON.stringify({ before, note: note || null })
   );
+  logActivity(req, "member_change_user", "member", req.params.code, `was ${before.name}${note ? ` — ${note}` : ""}`);
   res.json(db.prepare("SELECT * FROM members WHERE member_code = ?").get(req.params.code));
 });
 
@@ -3511,6 +3759,7 @@ app.patch("/api/fund-requests/:id", requireAccess("accounts"), (req, res) => {
     db.exec("ROLLBACK");
     return res.status(500).json({ error: err.message });
   }
+  logActivity(req, `fund_request_${status.toLowerCase()}`, "fund_request", existing.id, `₹${existing.amount} for ${existing.member_code}${process_note ? ` — ${process_note}` : ""}`);
   res.json(db.prepare("SELECT * FROM fund_requests WHERE id = ?").get(req.params.id));
 });
 
@@ -4549,6 +4798,35 @@ function aiTool_getOrderRiskFlags() {
   };
 }
 
+// Phase 31 — three more tools wrapping existing computed signals that
+// already power the Dashboard/D2C Inventory/Reports/Daily Briefing tabs
+// (Phase 24 demand forecasting, Phase 26 payout anomaly detection, Phase
+// 27 referral-propensity scoring) but weren't reachable from the "Ask
+// AIRX Ops" chat itself — so staff had to already know which tab to open
+// instead of just asking. Read-only wrappers, same as every tool above.
+function aiTool_getDemandForecast() {
+  const forecast = computeDemandForecast(readJson(ORDERS_FILE), readJson(INVENTORY_FILE));
+  return forecast.filter((f) => f.willStockOutSoon).slice(0, 15);
+}
+function aiTool_getPayoutAnomalies() {
+  const lastRun = db.prepare("SELECT period_label FROM payout_runs WHERE status = 'Committed' ORDER BY id DESC LIMIT 1").get();
+  if (!lastRun) return { message: "no committed payout run yet" };
+  const members = db
+    .prepare("SELECT member_code, net_amount FROM payouts WHERE period_label = ?")
+    .all(lastRun.period_label);
+  const historical = getHistoricalPayoutsByMember(members.map((m) => m.member_code), lastRun.period_label);
+  return { period_label: lastRun.period_label, anomalies: detectPayoutAnomalies(members, historical) };
+}
+function aiTool_getReferralCandidates() {
+  const orders = readJson(ORDERS_FILE);
+  const mobiles = [...new Set(orders.filter((o) => o.status === "delivered" && o.mobile).map((o) => o.mobile))];
+  return mobiles
+    .map((m) => computeReferralPropensity(m, orders))
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 10);
+}
+
 const AI_TOOLS = [
   { name: "get_low_stock", description: "Get D2C inventory items at or below their low-stock threshold.", parameters: { type: "object", properties: {} } },
   { name: "get_near_expiry", description: "Get inventory batches expiring within 60 days or already expired.", parameters: { type: "object", properties: {} } },
@@ -4556,6 +4834,9 @@ const AI_TOOLS = [
   { name: "get_orders_summary", description: "Get order counts by status and total sales value.", parameters: { type: "object", properties: {} } },
   { name: "get_staff_summary", description: "Get per-staff order counts, sales, delivered/pending breakdown.", parameters: { type: "object", properties: {} } },
   { name: "get_order_risk_flags", description: "Get orders that need staff attention before booking: pending too long past the configured threshold, high COD value still pending, and pending orders from customers with 2+ prior cancellations.", parameters: { type: "object", properties: {} } },
+  { name: "get_demand_forecast", description: "Get inventory items projected to stock out soon (within the restock lead time), based on real sales velocity, not just a static low-stock threshold.", parameters: { type: "object", properties: {} } },
+  { name: "get_payout_anomalies", description: "Get any unusually large payouts flagged (for review, not blocked) in the most recently committed weekly matching payout run.", parameters: { type: "object", properties: {} } },
+  { name: "get_referral_candidates", description: "Get the top delivered customers most worth proactively asking for a referral, ranked by an explainable propensity score.", parameters: { type: "object", properties: {} } },
 ];
 const AI_TOOL_IMPL = {
   get_low_stock: aiTool_getLowStock,
@@ -4564,6 +4845,9 @@ const AI_TOOL_IMPL = {
   get_orders_summary: aiTool_getOrdersSummary,
   get_staff_summary: aiTool_getStaffSummary,
   get_order_risk_flags: aiTool_getOrderRiskFlags,
+  get_demand_forecast: aiTool_getDemandForecast,
+  get_payout_anomalies: aiTool_getPayoutAnomalies,
+  get_referral_candidates: aiTool_getReferralCandidates,
 };
 
 app.post("/api/ai/ask", requireAccess("ai_assistant"), async (req, res) => {
@@ -4571,10 +4855,11 @@ app.post("/api/ai/ask", requireAccess("ai_assistant"), async (req, res) => {
   if (!question) return res.status(400).json({ error: "question is required" });
   try {
     const system = `You are the AIRX Ops internal system copilot for staff. You can call tools to look up live data
-about inventory, leads, orders, staff performance, and order-booking risk flags (pending too long, high COD value,
-repeat-cancellation customers). You never book, cancel, or message anyone yourself — booking stays a staff decision;
-you only surface what needs attention and why. Always call a tool rather than guessing when the question is about
-current data. Answer concisely, in plain language, with numbers where relevant.`;
+about inventory, leads, orders, staff performance, order-booking risk flags (pending too long, high COD value,
+repeat-cancellation customers), demand-forecast stock-out risk, payout anomalies from the latest committed run, and
+top referral-propensity candidates. You never book, cancel, message, pay out, or credit anyone yourself — those stay
+staff decisions; you only surface what needs attention and why. Always call a tool rather than guessing when the
+question is about current data. Answer concisely, in plain language, with numbers where relevant.`;
     let messages = [
       { role: "system", content: system },
       { role: "user", content: question },
@@ -4717,6 +5002,103 @@ app.get("/api/backup/export", requireAccess("user_management"), (req, res) => {
     console.error("Backup export error:", err);
     res.status(500).json({ error: "backup export failed" });
   }
+});
+
+// ---------------------------------------------------------------------
+// Phase 31 — per-module CSV export. /api/backup/export above already
+// covers "everything, as JSON" for a full backup, but staff/accountants
+// routinely need just one table as a spreadsheet they can open directly
+// (share with a CA, reconcile offline, paste into WhatsApp) — that had no
+// answer before this. One generic serializer + a small registry below
+// instead of a bespoke CSV route per module.
+// ---------------------------------------------------------------------
+function csvCell(v) {
+  if (v === null || v === undefined) return "";
+  const s = String(v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+function arrayToCsv(rows) {
+  if (!rows.length) return "";
+  const headers = Object.keys(rows[0]);
+  return [headers.join(","), ...rows.map((r) => headers.map((h) => csvCell(r[h])).join(","))].join("\n");
+}
+function sendCsv(res, filename, rows) {
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.send(arrayToCsv(rows));
+}
+const CSV_EXPORTS = {
+  members: {
+    module: "members",
+    getRows: () =>
+      db
+        .prepare(
+          `SELECT member_code, name, sponsor_code, placement_leg, mobile, email, kyc_status, status,
+                  legacy_package, likely_dummy, data_source, joined_at FROM members ORDER BY id DESC`
+        )
+        .all(),
+  },
+  orders: {
+    module: "orders",
+    getRows: () =>
+      readJson(ORDERS_FILE).map((o) => ({
+        id: o.id,
+        createdAt: o.createdAt,
+        name: o.name,
+        mobile: o.mobile,
+        product: o.product,
+        codAmount: o.codAmount || o.cod || 0,
+        status: o.status,
+        source: o.source || "manual",
+        staff: o.staff || "",
+        indiaPostBarcode: o.indiaPostBarcode || "",
+      })),
+  },
+  payouts: {
+    module: "payouts",
+    getRows: () =>
+      db
+        .prepare(
+          `SELECT payouts.period_label, payouts.member_code, members.name AS member_name, payouts.gross_amount,
+                  payouts.tds_amount, payouts.admin_charge, payouts.net_amount, payouts.status, payouts.created_at
+           FROM payouts JOIN members ON members.member_code = payouts.member_code ORDER BY payouts.id DESC`
+        )
+        .all(),
+  },
+  leads: {
+    module: "leads",
+    getRows: () =>
+      readJson(LEADS_FILE).map((l) => ({
+        name: l.name || "",
+        phone: l.phone || "",
+        status: l.status || "new",
+        product: l.product || "",
+        createdAt: l.createdAt || "",
+      })),
+  },
+  franchises: {
+    module: "franchises",
+    getRows: () =>
+      db
+        .prepare(
+          `SELECT franchise_code, franchise_name, parent_franchise_code, contact_name, contact_mobile,
+                  address, state, status, created_at FROM franchises ORDER BY franchise_name`
+        )
+        .all(),
+  },
+};
+app.get("/api/export/:type", (req, res, next) => {
+  const cfg = CSV_EXPORTS[req.params.type];
+  if (!cfg) return res.status(404).json({ error: `unknown export type "${req.params.type}"` });
+  requireAccess(cfg.module)(req, res, () => {
+    try {
+      const rows = cfg.getRows();
+      sendCsv(res, `airx-${req.params.type}-${new Date().toISOString().slice(0, 10)}.csv`, rows);
+    } catch (err) {
+      console.error(`CSV export error (${req.params.type}):`, err);
+      res.status(500).json({ error: "export failed" });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------
