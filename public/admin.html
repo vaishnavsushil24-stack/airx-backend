@@ -446,6 +446,25 @@ function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+// Short two-tone "new order" beep, generated on the fly (Web Audio API) —
+// no external audio file needed, matches this app's zero-extra-asset style.
+function playAlertBeep() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    [880, 1175].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.15, ctx.currentTime + i * 0.15);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + i * 0.15 + 0.14);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(ctx.currentTime + i * 0.15);
+      osc.stop(ctx.currentTime + i * 0.15 + 0.15);
+    });
+  } catch (e) { /* audio not available in this browser/context — silent alert still works via badge/toast */ }
+}
+
 // ---------- Dashboard ----------
 async function loadDashboard() {
   const el = document.getElementById('tab-dashboard');
@@ -1596,12 +1615,14 @@ async function loadFranchiseCommission() {
 }
 
 // ---------- Orders (D2C: Shopify + WhatsApp-sourced, India Post booking, WhatsApp automation) ----------
+let ordersPollTimer = null;
+let seenOrderIds = null; // null = not initialized yet this page-load (avoids a beep storm on first load)
 async function loadOrders() {
   const el = document.getElementById('tab-orders');
-  el.innerHTML = `<div class="panel"><h2>Orders <span class="muted" style="font-weight:normal">(Storefront + Shopify + WhatsApp-sourced — one list for all)</span></h2>
+  el.innerHTML = `<div class="panel"><h2>Orders <span class="muted" style="font-weight:normal">(Storefront + Shopify + WhatsApp-sourced — one list for all)</span> <span id="ordersNewBadge" class="badge" style="display:none"></span></h2>
     <div class="row">
       <button id="syncShopifyBtn">⟳ Sync from Shopify</button>
-      <span class="muted" id="autoSyncNote" style="font-size:11px">Auto-syncs every 5 minutes on its own too. Storefront (/shop.html) orders land here immediately, no sync needed.</span>
+      <span class="muted" id="autoSyncNote" style="font-size:11px">Auto-syncs every 5 minutes on its own too. Storefront (/shop.html) orders land here immediately, no sync needed. New orders also alert here live while this tab is open (badge + sound), and by WhatsApp per Alert Settings below.</span>
     </div>
     <div class="row" style="margin-top:8px">
       <input id="ord_search" placeholder="Search name / mobile / product…" style="flex:1;min-width:200px" />
@@ -1629,6 +1650,24 @@ async function loadOrders() {
         <input id="o_staff" placeholder="Booked by (staff name)" style="max-width:150px" />
         <input id="o_referredBy" placeholder="Referred by (mobile, optional)" style="max-width:170px" />
         <button id="addOrderBtn">+ Add order</button>
+      </div>
+    </details>
+    <details style="margin-top:8px"><summary style="cursor:pointer;color:var(--accent)">⚙️ Alert Settings — new order + stuck order reminders</summary>
+      <div style="margin-top:8px">
+        <p class="muted" style="margin:0 0 8px;font-size:12px">Every setting here can be changed any time — no code change needed. Add one staff WhatsApp number or several (comma/line separated); leave the list empty to turn WhatsApp alerts off without touching the toggles.</p>
+        <div class="field"><label>Staff WhatsApp number(s) for alerts</label>
+          <textarea id="as_numbers" placeholder="e.g. 919876543210, 919812345678" style="width:100%;min-height:44px"></textarea>
+        </div>
+        <div class="row" style="margin-top:8px;flex-wrap:wrap;align-items:center">
+          <label style="display:flex;align-items:center;gap:5px"><input type="checkbox" id="as_newOrderEnabled" /> WhatsApp staff the moment a new order lands</label>
+          <label style="display:flex;align-items:center;gap:5px"><input type="checkbox" id="as_stuckEnabled" /> Remind staff about orders stuck too long</label>
+        </div>
+        <div class="row" style="margin-top:8px;flex-wrap:wrap">
+          <div class="field"><label>"Stuck" threshold (hours)</label><input id="as_stuckHours" type="number" min="0.5" step="0.5" style="max-width:110px" /></div>
+          <div class="field"><label>High-COD flag threshold (₹)</label><input id="as_highCod" type="number" min="0" step="50" style="max-width:130px" /></div>
+        </div>
+        <div class="row" style="margin-top:8px"><button id="as_saveBtn">Save alert settings</button></div>
+        <div id="alertSettingsNote" class="muted" style="margin-top:6px;font-size:12px"></div>
       </div>
     </details>
     <div id="ordersTable" style="margin-top:10px"><div class="empty">Loading…</div></div>
@@ -1747,6 +1786,59 @@ async function loadOrders() {
     } catch (e) { toast('Failed: ' + e.message, 'error'); }
   });
   refresh().catch(e => { document.getElementById('ordersTable').innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; });
+
+  // ---- Alert Settings (new-order WhatsApp/dashboard alert + stuck-order reminder) ----
+  async function refreshAlertSettings() {
+    const s = await api('/api/settings/order-alerts');
+    document.getElementById('as_numbers').value = (s.staffWhatsappNumbers || []).join(', ');
+    document.getElementById('as_newOrderEnabled').checked = !!s.newOrderAlertEnabled;
+    document.getElementById('as_stuckEnabled').checked = !!s.stuckOrderReminderEnabled;
+    document.getElementById('as_stuckHours').value = s.stuckOrderHours;
+    document.getElementById('as_highCod').value = s.highCodAmountThreshold;
+    document.getElementById('alertSettingsNote').textContent = (s.staffWhatsappNumbers || []).length
+      ? `WhatsApp alerts go to ${s.staffWhatsappNumbers.length} number(s).`
+      : 'No staff WhatsApp number added yet — WhatsApp alerts stay off until one is added (dashboard badge/sound still works while this tab is open).';
+  }
+  document.getElementById('as_saveBtn').addEventListener('click', async () => {
+    try {
+      await api('/api/settings/order-alerts', { method: 'PATCH', body: JSON.stringify({
+        staffWhatsappNumbers: document.getElementById('as_numbers').value,
+        newOrderAlertEnabled: document.getElementById('as_newOrderEnabled').checked,
+        stuckOrderReminderEnabled: document.getElementById('as_stuckEnabled').checked,
+        stuckOrderHours: document.getElementById('as_stuckHours').value,
+        highCodAmountThreshold: document.getElementById('as_highCod').value,
+      }) });
+      toast('Alert settings saved', 'success');
+      refreshAlertSettings();
+    } catch (e) { toast('Failed: ' + e.message, 'error'); }
+  });
+  refreshAlertSettings().catch(e => { document.getElementById('alertSettingsNote').textContent = 'Failed to load: ' + e.message; });
+
+  // ---- Live new-order polling: dashboard badge + sound while this tab is open ----
+  if (ordersPollTimer) clearInterval(ordersPollTimer);
+  async function pollForNewOrders() {
+    let latest;
+    try { latest = await api('/api/orders'); } catch (e) { return; } // silent — background poll, don't spam errors
+    const pending = latest.filter(o => !o.indiaPostBarcode && o.status !== 'delivered' && o.status !== 'cancelled');
+    const badge = document.getElementById('ordersNewBadge');
+    if (badge) {
+      if (pending.length) { badge.textContent = `${pending.length} awaiting booking`; badge.style.display = ''; badge.className = 'badge blocked'; }
+      else { badge.style.display = 'none'; }
+    }
+    if (seenOrderIds === null) {
+      seenOrderIds = new Set(latest.map(o => o.id));
+    } else {
+      const freshOnes = latest.filter(o => !seenOrderIds.has(o.id));
+      if (freshOnes.length) {
+        playAlertBeep();
+        toast(`🛒 ${freshOnes.length} new order${freshOnes.length > 1 ? 's' : ''} just came in`, 'success');
+        seenOrderIds = new Set(latest.map(o => o.id));
+        if (document.getElementById('ordersTable')) { ordersCache = latest; render(); }
+      }
+    }
+  }
+  pollForNewOrders();
+  ordersPollTimer = setInterval(pollForNewOrders, 25000);
 
   // ---- Referral Bridge (Phase 17) ----
   async function refreshReferralSettings() {
@@ -1980,10 +2072,15 @@ async function loadAiAssistant() {
   const el = document.getElementById('tab-ai_assistant');
   el.innerHTML = `
     <div class="panel">
-      <h2>Ask AIRX Ops <span class="muted" style="font-weight:normal">(natural-language questions about live data — low stock, near-expiry, leads, orders, staff)</span></h2>
+      <h2>Ask AIRX Ops <span class="muted" style="font-weight:normal">(natural-language questions about live data — low stock, near-expiry, leads, orders, staff, order-booking risk)</span></h2>
       <div id="aiChatLog" style="max-height:340px;overflow-y:auto;margin-bottom:10px"></div>
+      <div class="row" style="flex-wrap:wrap;gap:6px;margin-bottom:8px">
+        <button class="secondary" data-ask="Which orders need attention right now — pending too long, high COD value, or repeat-cancellation customers?" style="padding:3px 8px;font-size:11px">⚠️ Orders needing attention</button>
+        <button class="secondary" data-ask="Which items are low on stock?" style="padding:3px 8px;font-size:11px">Low stock?</button>
+        <button class="secondary" data-ask="How is the team doing on order bookings this week?" style="padding:3px 8px;font-size:11px">Staff performance?</button>
+      </div>
       <div class="row">
-        <input id="aiChatInput" placeholder="e.g. 'which items are low on stock?' or 'how many leads came in this week?'" style="flex:1" />
+        <input id="aiChatInput" placeholder="e.g. 'which orders need attention?' or 'how many leads came in this week?'" style="flex:1" />
         <button id="aiChatSendBtn">Ask</button>
       </div>
     </div>
@@ -2050,6 +2147,10 @@ async function loadAiAssistant() {
   }
   document.getElementById('aiChatSendBtn').addEventListener('click', sendChat);
   document.getElementById('aiChatInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') sendChat(); });
+  document.querySelectorAll('[data-ask]').forEach(b => b.addEventListener('click', () => {
+    document.getElementById('aiChatInput').value = b.dataset.ask;
+    sendChat();
+  }));
 
   async function refreshKb() {
     const items = await api('/api/kb');
